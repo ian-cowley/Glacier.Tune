@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <LangVersion>preview</LangVersion>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <TieredPGO>true</TieredPGO>
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <NoWarn>$(NoWarn);CS1591;CS8981</NoWarn>
+
+    <!-- NuGet Package Properties -->
+    <PackageId>Glacier.Tune</PackageId>
+    <Version>1.0.0</Version>
+    <Authors>Ian Cowley</Authors>
+    <Company>Glacier High-Performance Ecosystem</Company>
+    <Description>Pure C# .NET 10 LLM fine-tuning, PEFT (LoRA / QLoRA), and model alignment engine. Direct GGUF zero-copy memory-mapping, zero-allocation Autograd backpropagation, and instant adapter fusion.</Description>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/ian-cowley/Glacier.Tune</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/ian-cowley/Glacier.Tune.git</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>llm;fine-tuning;lora;qlora;peft;gguf;qwen;deep-learning;csharp;net10;glacier</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Glacier.Tensor" Version="1.0.4" />
+    <PackageReference Include="Glacier.Inference" Version="1.1.0" />
+    <PackageReference Include="Glacier.Gpu" Version="1.0.5" />
+    <PackageReference Include="Glacier.Polaris" Version="1.0.14" />
+  </ItemGroup>
+</Project>
