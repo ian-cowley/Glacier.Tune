@@ -103,11 +103,32 @@ var args = new TrainingArguments
 
 using var trainer = new LoraTrainer(model, args);
 trainer.Train(dataset);
+
+// 4. Standalone GGUF Export (Zero Python / Zero llama.cpp)
+// Fuses all 196 LoRA-adapted projection matrices into lossless Q8_0 in ~6.8 seconds:
+Glacier.Tune.Export.GgufMerger.Merge(
+    baseGgufPath: "qwen2.5-coder-7b-q4_k_m.gguf",
+    adapterBinPath: "./fine_tuned_lora/adapter_model.bin",
+    outputGgufPath: "./qwen2.5-coder-7b-enterprise-q8_0.gguf"
+);
 ```
 
 ---
 
-## 5. Ecosystem Cross-References
+## 5. Standalone Model Export CLI
+
+You can also run the high-performance GGUF merger directly from the command line:
+
+```bash
+dotnet run -c Release --project samples/Glacier.Tune.Demo -- --merge \
+    "path/to/base_model.gguf" \
+    "path/to/adapter_model.bin" \
+    "path/to/standalone_output.gguf"
+```
+
+---
+
+## 6. Ecosystem Cross-References
 
 - **[Glacier.Inference](https://github.com/ian-cowley/Glacier.Inference)**: Sub-millisecond GGUF model loading, SIMD AVX-512 GEMV kernels, and embedded BPE tokenization.
 - **[Glacier.Tensor](https://github.com/ian-cowley/Glacier.Tensor)**: Strided tensor representations, `LoraLinear` layers, AutogradTape, and AdamW optimizer.

@@ -3,8 +3,26 @@ using System.Diagnostics;
 using System.IO;
 using Glacier.Tune.Config;
 using Glacier.Tune.Data;
+using Glacier.Tune.Export;
 using Glacier.Tune.Model;
 using Glacier.Tune.Trainer;
+
+if (args.Length > 0 && (args[0] == "--merge" || args[0] == "-m"))
+{
+    string baseModel = args.Length > 1 ? args[1] : @"D:\lmstudio\models\lmstudio-community\Qwen2.5-7B-Instruct-1M-GGUF\Qwen2.5-7B-Instruct-1M-Q4_K_M.gguf";
+    string adapterPath = args.Length > 2 ? args[2] : @"C:\Users\spuri\source\repos\PolarsPlus\Glacier.Tune\tune_output\adapter_model.bin";
+    string outModel = args.Length > 3 ? args[3] : @"D:\lmstudio\models\Local\Qwen2.5-Coder-7B-Enterprise-GGUF\qwen2.5-7b-glacier-enterprise-q8_0.gguf";
+
+    Console.ForegroundColor = ConsoleColor.Cyan;
+    Console.WriteLine("================================================================================");
+    Console.WriteLine("         GLACIER.TUNE: PURE C# .NET 10 GGUF STANDALONE ADAPTER MERGER           ");
+    Console.WriteLine("        Zero Python - Direct Native Memory SIMD Quantized Fusion                ");
+    Console.WriteLine("================================================================================\\n");
+    Console.ResetColor();
+
+    GgufMerger.Merge(baseModel, adapterPath, outModel);
+    return;
+}
 
 Console.ForegroundColor = ConsoleColor.Cyan;
 Console.WriteLine("================================================================================");
