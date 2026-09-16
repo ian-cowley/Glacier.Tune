@@ -15,4 +15,5 @@ public sealed class TrainingArguments
     public int SaveSteps { get; set; } = 15;
     public string OutputDir { get; set; } = "./output";
     public string LrSchedulerType { get; set; } = "cosine";
+    public int? MaxSteps { get; set; } = null;
 }

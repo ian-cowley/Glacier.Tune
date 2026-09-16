@@ -41,7 +41,8 @@ public sealed class LoraTrainer : IDisposable
     /// </summary>
     public void Train(ChatMlDataset dataset, Action<TrainingStepResult>? onStep = null)
     {
-        int totalSteps = _args.Epochs * ((dataset.Count + _args.GradientAccumulationSteps - 1) / _args.GradientAccumulationSteps);
+        int datasetSteps = (dataset.Count + _args.GradientAccumulationSteps - 1) / _args.GradientAccumulationSteps;
+        int totalSteps = _args.MaxSteps ?? (_args.Epochs * datasetSteps);
         int globalStep = 0;
 
         Console.ForegroundColor = ConsoleColor.Cyan;
@@ -52,13 +53,16 @@ public sealed class LoraTrainer : IDisposable
 
         var (trainable, total, pct) = _model.GetParameterStats();
         Console.WriteLine($"  Base Model Layers:    {_model.LayerCount} ({_model.HiddenDim} dim, {_model.FfnDim} ffn)");
-        Console.WriteLine($"  Base Model Params:    {total:N0} parameters (FROZEN)");
+        Console.WriteLine($"  Base Model Params:    {total:N0} parameters (FROZEN in unmanaged memory)");
         Console.WriteLine($"  Trainable Parameters: {trainable:N0} ({pct:F2}% trainable - {100.0 - pct:F2}% parameter reduction)");
         Console.WriteLine($"  Dataset Size:         {dataset.Count} examples across {_args.Epochs} epochs");
         Console.WriteLine($"  Gradient Accum Steps: {_args.GradientAccumulationSteps}");
         Console.WriteLine($"  Base Learning Rate:   {_args.LearningRate:E2} ({_args.LrSchedulerType} decay)\n");
 
         var swTotal = Stopwatch.StartNew();
+        var swGlobalStep = Stopwatch.StartNew();
+        int accumulatedTokens = 0;
+        float accumulatedLoss = 0f;
 
         for (int epoch = 1; epoch <= _args.Epochs; epoch++)
         {
@@ -70,11 +74,13 @@ public sealed class LoraTrainer : IDisposable
                 var example = dataset.Examples[i];
                 if (example.InputIds.Length < 2) continue;
 
-                var swStep = Stopwatch.StartNew();
+                accumCounter++;
+                Console.Write($"\r  [Epoch {epoch,2}/{_args.Epochs}] Step {globalStep + 1,4}/{totalSteps} | Microbatch {accumCounter}/{_args.GradientAccumulationSteps} (tokens: {example.InputIds.Length})...    ");
 
                 // Compute loss over example using LoRA projection adapters
                 float lossVal = TrainMicroBatch(example);
-                accumCounter++;
+                accumulatedLoss += lossVal;
+                accumulatedTokens += example.InputIds.Length;
 
                 if (accumCounter >= _args.GradientAccumulationSteps || i == dataset.Count - 1)
                 {
@@ -87,22 +93,34 @@ public sealed class LoraTrainer : IDisposable
                     // Execute optimizer step across all LoRA parameters
                     _optimizer.Step();
                     _optimizer.ZeroGrad();
-                    accumCounter = 0;
 
-                    swStep.Stop();
-                    double stepDurationMs = swStep.Elapsed.TotalMilliseconds;
-                    double tokensPerSec = example.InputIds.Length / (stepDurationMs / 1000.0);
+                    swGlobalStep.Stop();
+                    double stepDurationMs = swGlobalStep.Elapsed.TotalMilliseconds;
+                    double tokensPerSec = accumulatedTokens / (stepDurationMs / 1000.0);
+                    float avgLoss = accumulatedLoss / accumCounter;
 
-                    var result = new TrainingStepResult(globalStep, lossVal, stepDurationMs, tokensPerSec);
+                    var result = new TrainingStepResult(globalStep, avgLoss, stepDurationMs, tokensPerSec);
                     onStep?.Invoke(result);
 
-                    if (globalStep % _args.LoggingSteps == 0 || globalStep == 1)
+                    Console.WriteLine($"\r  [Epoch {epoch,2}/{_args.Epochs}] Step {globalStep,4}/{totalSteps} | " +
+                                      $"Loss: {avgLoss:F4} | LR: {currentLr:E2} | " +
+                                      $"Step Latency: {stepDurationMs:F1} ms | Speed: {tokensPerSec:N0} tokens/sec    ");
+
+                    accumCounter = 0;
+                    accumulatedLoss = 0f;
+                    accumulatedTokens = 0;
+                    swGlobalStep.Restart();
+
+                    if (_args.MaxSteps.HasValue && globalStep >= _args.MaxSteps.Value)
                     {
-                        Console.WriteLine($"  [Epoch {epoch,2}/{_args.Epochs}] Step {globalStep,4}/{totalSteps} | " +
-                                          $"Loss: {lossVal:F4} | LR: {currentLr:E2} | " +
-                                          $"Step Latency: {stepDurationMs:F1} ms | Speed: {tokensPerSec:N0} tokens/sec");
+                        break;
                     }
                 }
+            }
+
+            if (_args.MaxSteps.HasValue && globalStep >= _args.MaxSteps.Value)
+            {
+                break;
             }
         }
         swTotal.Stop();
@@ -119,30 +137,7 @@ public sealed class LoraTrainer : IDisposable
 
     private float TrainMicroBatch(TrainingExample example)
     {
-        using var tape = new AutogradTape();
-        foreach (var p in _model.TrainableParameters) tape.Watch(p);
-
-        // Simulate projection forward pass with LoRA
-        int tokens = Math.Min(example.InputIds.Length, 64);
-        using var dummyInput = TensorFloatExtensions.RandomUniform([tokens, _model.HiddenDim], -0.1f, 0.1f, seed: tokens);
-
-        float totalLoss = 0f;
-        int activeAdapters = 0;
-
-        foreach (var (name, lora) in _model.Adapters)
-        {
-            if (!name.Contains("blk.0.q_proj") && !name.Contains("blk.0.v_proj")) continue;
-
-            using var dummyTarget = TensorFloatExtensions.RandomUniform([tokens, lora.OutFeatures], -0.1f, 0.1f, seed: tokens + 1);
-            using var pred = lora.Forward(dummyInput);
-            var (loss, _) = LossFunctions.MSELoss(pred, dummyTarget);
-            totalLoss += loss;
-            activeAdapters++;
-
-            tape.Backward(pred);
-        }
-
-        return activeAdapters > 0 ? totalLoss / activeAdapters : 0f;
+        return _model.ForwardLossAndBackward(example.InputIds, example.Labels);
     }
 
     private static float ComputeCosineLr(int currentStep, int totalSteps, float baseLr, float warmupRatio)
