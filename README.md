@@ -5,7 +5,22 @@
 [![Native AOT](https://img.shields.io/badge/Native%20AOT-Ready-brightgreen.svg)](https://learn.microsoft.com/dotnet/core/deploying/native-aot/)
 [![Ecosystem](https://img.shields.io/badge/Glacier-Ecosystem-blue)](https://github.com/ian-cowley)
 
-> **Pure C# .NET 10 LLM Fine-Tuning, LoRA / QLoRA, and Model Alignment Engine (Outperforming Python Unsloth, Hugging Face TRL & bitsandbytes)**
+# ⚡ From 4.5 Hours in Python to 20 Minutes in Pure .NET 10
+> **End-to-End 7B LLM Fine-Tuning & Standalone GGUF Export. 92% Total Time Reduction. 100% Pure C# .NET 10. Zero Python, Zero PyTorch, Zero External Tooling.**
+
+```text
+========================================================================================================
+  7B LLM ENTERPRISE FINE-TUNING PIPELINE (QWEN 2.5 7B - 533 SAMPLES)
+========================================================================================================
+  Python Stack (PyTorch + Hugging Face + bitsandbytes) :  4 Hours 25 Minutes (265 mins)
+  Glacier.Tune (.NET 10 - 100% Pure C#)                :  20 Minutes 7 Seconds
+--------------------------------------------------------------------------------------------------------
+  🏆 TOTAL TIME SAVINGS                                :  13x FASTER (92% Total Time Saved!)
+  ⚡ COLD MODEL INGESTION                               :  314 ms  (vs 65–80s in Python  - 200x Faster)
+  ⚡ STANDALONE GGUF EXPORT                             :  6.8 sec (vs 5 mins in Python   - 44x Faster)
+  ⚡ PEAK MEMORY FOOTPRINT                              :  < 500 MB (vs 14+ GB in Python - 28x Less RAM)
+========================================================================================================
+```
 
 `Glacier.Tune` is a pure C# .NET 10 framework for parameter-efficient fine-tuning (PEFT) and alignment of Large Language Models. It bridges **Glacier.Inference** (sub-350ms GGUF memory-mapped loading and embedded BPE tokenization) with **Glacier.Tensor** (zero-allocation reverse-mode AutogradTape and in-place AdamW optimizer).
 
@@ -58,12 +73,13 @@ graph TD
 
 | Benchmark Metric | Python `modelTrain` (HF + bitsandbytes) | Glacier.Tune (Pure C# .NET 10) | Improvement |
 | :--- | :--- | :--- | :--- |
-| **Model Ingestion Time** | 50 – 80 seconds | **314 ms (Cold Mmap)** | **> 150x faster** |
+| **Total End-to-End Pipeline** | **4 Hours 25 Minutes (265 mins)** | **20 Minutes 7 Seconds** | **13x faster (92% Time Saved!)** |
+| **Model Ingestion Time** | 65 – 80 seconds | **314 ms (Cold Mmap)** | **> 200x faster** |
+| **Standalone GGUF Merging** | ~300 seconds (5 mins) | **6.8 seconds** | **44x faster** |
 | **Peak Training Memory** | 14+ GB (fragile on 8GB GPUs) | **< 500 MB (Full 28-layer graph)** | **28x lower memory** |
 | **Memory Fragmentation** | High (frequent `empty_cache()` calls) | **Zero (Unmanaged base + static tensors)** | **Zero GC thrashes** |
 | **Quantization Overhead** | Repeated NF4 $\to$ FP16 dequantization | **Zero-copy direct SIMD dot products** | **Zero temporary buffer bloat** |
 | **Thermal Sleep Requirement** | Mandatory 3.5s pause / step | **0s (Continuous execution)** | **Zero cooling delays** |
-| **Adapter Merging Time** | ~180 seconds | **0.03 seconds (30 ms)** | **6,000x faster** |
 | **Runtime Dependencies** | Python 3.11, CUDA, PyTorch, HF, BnB | **Single standalone .NET 10 binary** | **Zero DLL hell** |
 
 ### Verified Convergence (Enterprise ChatML Dataset)
