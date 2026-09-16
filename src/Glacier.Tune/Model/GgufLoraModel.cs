@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using Glacier.Inference.Gguf;
 using Glacier.Inference.Model;
@@ -217,11 +218,44 @@ public sealed unsafe class GgufLoraModel : IDisposable
         string configJson = JsonSerializer.Serialize(adapterConfig, new JsonSerializerOptions { WriteIndented = true });
         File.WriteAllText(Path.Combine(outputDir, "adapter_config.json"), configJson);
 
+        string binPath = Path.Combine(outputDir, "adapter_model.bin");
+        using (var fs = File.Create(binPath))
+        using (var bw = new BinaryWriter(fs))
+        {
+            // Magic 0x41524F4C ('LORA'), Version 1
+            bw.Write((uint)0x41524F4C);
+            bw.Write((uint)1);
+            bw.Write(_blocks.Count);
+            bw.Write(_config.Rank);
+            bw.Write(_config.Alpha);
+            bw.Write(_blocks.Count * 14); // 7 projections * 2 (A and B)
+
+            for (int l = 0; l < _blocks.Count; l++)
+            {
+                var b = _blocks[l];
+                WriteTensor(bw, $"blk.{l}.attn_q.lora_a.weight", b.QProj.AdapterA);
+                WriteTensor(bw, $"blk.{l}.attn_q.lora_b.weight", b.QProj.AdapterB);
+                WriteTensor(bw, $"blk.{l}.attn_k.lora_a.weight", b.KProj.AdapterA);
+                WriteTensor(bw, $"blk.{l}.attn_k.lora_b.weight", b.KProj.AdapterB);
+                WriteTensor(bw, $"blk.{l}.attn_v.lora_a.weight", b.VProj.AdapterA);
+                WriteTensor(bw, $"blk.{l}.attn_v.lora_b.weight", b.VProj.AdapterB);
+                WriteTensor(bw, $"blk.{l}.attn_output.lora_a.weight", b.OProj.AdapterA);
+                WriteTensor(bw, $"blk.{l}.attn_output.lora_b.weight", b.OProj.AdapterB);
+                WriteTensor(bw, $"blk.{l}.ffn_gate.lora_a.weight", b.GateProj.AdapterA);
+                WriteTensor(bw, $"blk.{l}.ffn_gate.lora_b.weight", b.GateProj.AdapterB);
+                WriteTensor(bw, $"blk.{l}.ffn_up.lora_a.weight", b.UpProj.AdapterA);
+                WriteTensor(bw, $"blk.{l}.ffn_up.lora_b.weight", b.UpProj.AdapterB);
+                WriteTensor(bw, $"blk.{l}.ffn_down.lora_a.weight", b.DownProj.AdapterA);
+                WriteTensor(bw, $"blk.{l}.ffn_down.lora_b.weight", b.DownProj.AdapterB);
+            }
+        }
+
         string manifestPath = Path.Combine(outputDir, "adapter_manifest.txt");
         using var writer = new StreamWriter(manifestPath);
         writer.WriteLine($"# Glacier.Tune LoRA Adapter Manifest");
         writer.WriteLine($"# Total Layers: {_blocks.Count}");
         writer.WriteLine($"# Total Trainable Parameters: {_trainableParameters.Count}");
+        writer.WriteLine($"# Binary Weights: adapter_model.bin");
         for (int l = 0; l < _blocks.Count; l++)
         {
             var b = _blocks[l];
@@ -233,6 +267,16 @@ public sealed unsafe class GgufLoraModel : IDisposable
             writer.WriteLine($"blk.{l}.up_proj: A=[{b.UpProj.AdapterA.Shape[0]},{b.UpProj.AdapterA.Shape[1]}], B=[{b.UpProj.AdapterB.Shape[0]},{b.UpProj.AdapterB.Shape[1]}]");
             writer.WriteLine($"blk.{l}.down_proj: A=[{b.DownProj.AdapterA.Shape[0]},{b.DownProj.AdapterA.Shape[1]}], B=[{b.DownProj.AdapterB.Shape[0]},{b.DownProj.AdapterB.Shape[1]}]");
         }
+    }
+
+    private static void WriteTensor(BinaryWriter bw, string name, Tensor<float> tensor)
+    {
+        bw.Write(name);
+        bw.Write(tensor.Shape[0]);
+        bw.Write(tensor.Shape[1]);
+        var span = tensor.AsSpan();
+        var byteSpan = MemoryMarshal.AsBytes(span);
+        bw.Write(byteSpan);
     }
 
     public void Dispose()

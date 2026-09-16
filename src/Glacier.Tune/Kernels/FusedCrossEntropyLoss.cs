@@ -28,13 +28,14 @@ public static unsafe class FusedCrossEntropyLoss
         // Clear hidden state gradients
         new Span<float>(dFinalHidden, seqLen * hiddenDim).Clear();
 
-        // Count valid assistant targets (where target != -100)
+        // 1. Identify valid assistant target tokens (where target >= 0 and target < vocabSize)
+        int[] validSeqIndices = new int[seqLen];
         int validCount = 0;
         for (int t = 0; t < seqLen; t++)
         {
             if (t < targetTokens.Length && targetTokens[t] >= 0 && targetTokens[t] < vocabSize)
             {
-                validCount++;
+                validSeqIndices[validCount++] = t;
             }
         }
 
@@ -42,77 +43,99 @@ public static unsafe class FusedCrossEntropyLoss
 
         float invValid = 1.0f / validCount;
         float totalLoss = 0.0f;
-        object lossLock = new object();
 
-        // Row bytes for LM head matrix
-        int rowBytes = (int)GgufTypes.GetRowBytes(lmHeadType, hiddenDim);
+        // 2. Pack valid hidden states into contiguous buffer [validCount, hiddenDim]
+        float* pValidHidden = (float*)NativeMemory.Alloc((nuint)(validCount * hiddenDim), sizeof(float));
+        float* pValidLogits = (float*)NativeMemory.Alloc((nuint)((long)validCount * vocabSize), sizeof(float));
 
-        // Process valid tokens in parallel or streaming loops
-        Parallel.For(0, seqLen, t =>
+        try
         {
-            if (t >= targetTokens.Length) return;
-            int targetId = targetTokens[t];
-            if (targetId < 0 || targetId >= vocabSize) return;
+            for (int i = 0; i < validCount; i++)
+            {
+                int t = validSeqIndices[i];
+                float* src = finalHidden + (long)t * hiddenDim;
+                float* dst = pValidHidden + (long)i * hiddenDim;
+                Buffer.MemoryCopy(src, dst, (ulong)(hiddenDim * sizeof(float)), (ulong)(hiddenDim * sizeof(float)));
+            }
 
-            float* hVec = finalHidden + (long)t * hiddenDim;
-            float* dhVec = dFinalHidden + (long)t * hiddenDim;
+            // 3. Batched GEMM: streams lmHeadWeight once from memory across all valid tokens in parallel
+            QuantKernels.MatMulBatch(lmHeadType, lmHeadWeight, pValidHidden, pValidLogits, hiddenDim, vocabSize, validCount);
 
-            // Allocate local logits buffer for this single token
-            float* logits = (float*)NativeMemory.Alloc((nuint)vocabSize, sizeof(float));
-
+            // Row buffer for extracting embeddings during gradient backprop
+            float* tempRow = (float*)NativeMemory.Alloc((nuint)hiddenDim, sizeof(float));
             try
             {
-                // 1. MatVecMul: logits = hVec * W_head^T
-                QuantKernels.MatVecMul(lmHeadType, lmHeadWeight, hVec, logits, hiddenDim, vocabSize);
-
-                // 2. Online Log-Sum-Exp
-                float maxLogit = float.NegativeInfinity;
-                for (int v = 0; v < vocabSize; v++)
+                for (int i = 0; i < validCount; i++)
                 {
-                    if (logits[v] > maxLogit) maxLogit = logits[v];
-                }
+                    int t = validSeqIndices[i];
+                    int targetId = targetTokens[t];
+                    float* logits = pValidLogits + (long)i * vocabSize;
+                    float* dhVec = dFinalHidden + (long)t * hiddenDim;
 
-                float sumExp = 0.0f;
-                for (int v = 0; v < vocabSize; v++)
-                {
-                    sumExp += MathF.Exp(logits[v] - maxLogit);
-                }
-
-                float logSumExp = maxLogit + MathF.Log(sumExp);
-                float tokenLoss = logSumExp - logits[targetId];
-
-                lock (lossLock)
-                {
-                    totalLoss += tokenLoss;
-                }
-
-                // 3. dLogits_v = (softmax_v - 1(v == target)) * invValid
-                // Simultaneously project into dH = sum_v (dLogits_v * W_head[v])
-                for (int v = 0; v < vocabSize; v++)
-                {
-                    float p = MathF.Exp(logits[v] - logSumExp);
-                    float dLogit = (v == targetId) ? (p - 1.0f) * invValid : p * invValid;
-
-                    if (MathF.Abs(dLogit) < 1e-8f) continue;
-
-                    byte* wRow = lmHeadWeight + (long)v * rowBytes;
-
-                    int blocks = hiddenDim / 128;
-                    for (int b = 0; b < blocks; b++)
+                    // A. Log-Sum-Exp
+                    float maxLogit = float.NegativeInfinity;
+                    for (int v = 0; v < vocabSize; v++)
                     {
-                        // Fast approximate/exact accumulation
-                        for (int d = 0; d < 128; d++)
+                        if (logits[v] > maxLogit) maxLogit = logits[v];
+                    }
+
+                    float sumExp = 0.0f;
+                    for (int v = 0; v < vocabSize; v++)
+                    {
+                        sumExp += MathF.Exp(logits[v] - maxLogit);
+                    }
+
+                    float logSumExp = maxLogit + MathF.Log(sumExp);
+                    float targetLogit = logits[targetId];
+                    float tokenLoss = logSumExp - targetLogit;
+                    totalLoss += tokenLoss;
+
+                    // B. Softmax probability for target
+                    float pTarget = MathF.Exp(targetLogit - logSumExp);
+
+                    // C. Analytical Gradient Backpropagation:
+                    // dL / dh = invValid * [ sum_v (p_v * W_v) - W_target ]
+                    // = invValid * [ (p_target - 1) * W_target + sum_{v != target} (p_v * W_v) ]
+
+                    // 1) Target token contribution: (pTarget - 1.0) * invValid * W_target
+                    QuantKernels.ExtractEmbedding(lmHeadType, lmHeadWeight, targetId, tempRow, hiddenDim);
+                    float targetGradScale = (pTarget - 1.0f) * invValid;
+                    for (int d = 0; d < hiddenDim; d++)
+                    {
+                        dhVec[d] += targetGradScale * tempRow[d];
+                    }
+
+                    // 2) Top predicted tokens contribution (where p_v >= 0.005f)
+                    float threshold = 0.005f;
+                    for (int v = 0; v < vocabSize; v++)
+                    {
+                        if (v == targetId) continue;
+                        float diff = logits[v] - logSumExp;
+                        if (diff < -5.3f) continue; // exp(-5.3) < 0.005
+
+                        float p = MathF.Exp(diff);
+                        if (p >= threshold)
                         {
-                            dhVec[b * 128 + d] += dLogit * 0.01f; // Gradient contribution
+                            QuantKernels.ExtractEmbedding(lmHeadType, lmHeadWeight, v, tempRow, hiddenDim);
+                            float pScale = p * invValid;
+                            for (int d = 0; d < hiddenDim; d++)
+                            {
+                                dhVec[d] += pScale * tempRow[d];
+                            }
                         }
                     }
                 }
             }
             finally
             {
-                NativeMemory.Free(logits);
+                NativeMemory.Free(tempRow);
             }
-        });
+        }
+        finally
+        {
+            NativeMemory.Free(pValidHidden);
+            NativeMemory.Free(pValidLogits);
+        }
 
         return totalLoss * invValid;
     }
