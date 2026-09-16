@@ -32,8 +32,8 @@ Console.WriteLine("=============================================================
 Console.ResetColor();
 
 // Path to raw untuned GGUF base model and enterprise dataset
-string ggufPath = @"D:\lmstudio\models\lmstudio-community\Qwen2.5-7B-Instruct-1M-GGUF\Qwen2.5-7B-Instruct-1M-Q4_K_M.gguf";
-string trainJsonl = @"C:\Users\spuri\source\repos\modelTrain\data\enterprise_dev_train.jsonl";
+string ggufPath = args.Length > 0 && !args[0].StartsWith("-") ? args[0] : @"D:\lmstudio\models\lmstudio-community\Qwen2.5-7B-Instruct-1M-GGUF\Qwen2.5-7B-Instruct-1M-Q4_K_M.gguf";
+string trainJsonl = args.Length > 1 && !args[1].StartsWith("-") ? args[1] : FindDatasetPath();
 
 if (!File.Exists(ggufPath))
 {
@@ -49,6 +49,23 @@ if (!File.Exists(trainJsonl))
     Console.WriteLine($"[ERROR] Training dataset not found at {trainJsonl}");
     Console.ResetColor();
     return;
+}
+
+static string FindDatasetPath()
+{
+    string[] candidates = [
+        Path.Combine(AppContext.BaseDirectory, "data", "enterprise_dev_train.jsonl"),
+        Path.Combine(Directory.GetCurrentDirectory(), "data", "enterprise_dev_train.jsonl"),
+        Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "data", "enterprise_dev_train.jsonl"),
+        Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "data", "enterprise_dev_train.jsonl"),
+        @"C:\Users\spuri\source\repos\PolarsPlus\Glacier.Tune\data\enterprise_dev_train.jsonl",
+        @"C:\Users\spuri\source\repos\modelTrain\data\enterprise_dev_train.jsonl"
+    ];
+    foreach (var path in candidates)
+    {
+        if (File.Exists(path)) return Path.GetFullPath(path);
+    }
+    return candidates[0];
 }
 
 // 1. Load GGUF Model via Zero-Copy Memory Mapping
