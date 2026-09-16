@@ -25,6 +25,7 @@ public sealed unsafe class GgufLoraModel : IDisposable
     private readonly ModelWeights _weights;
     private readonly BpeTokenizer _tokenizer;
     private readonly LoraConfig _config;
+    private readonly GpuTarget _target;
     private readonly List<TransformerBlock> _blocks = [];
     private readonly List<Tensor<float>> _trainableParameters = [];
     private bool _disposed;
@@ -33,6 +34,7 @@ public sealed unsafe class GgufLoraModel : IDisposable
     public ModelWeights Weights => _weights;
     public BpeTokenizer Tokenizer => _tokenizer;
     public LoraConfig Config => _config;
+    public GpuTarget Target => _target;
     public IReadOnlyList<TransformerBlock> Blocks => _blocks;
     public IReadOnlyList<Tensor<float>> TrainableParameters => _trainableParameters;
 
@@ -41,22 +43,42 @@ public sealed unsafe class GgufLoraModel : IDisposable
     public int FfnDim => _weights.FeedForwardLength;
     public int VocabSize => _weights.VocabSize;
 
-    private GgufLoraModel(GgufFile gguf, ModelWeights weights, BpeTokenizer tokenizer, LoraConfig config)
+    private GgufLoraModel(GgufFile gguf, ModelWeights weights, BpeTokenizer tokenizer, LoraConfig config, GpuTarget target = GpuTarget.Auto)
     {
         _gguf = gguf;
         _weights = weights;
         _tokenizer = tokenizer;
         _config = config;
+        _target = target;
 
         InitializeBlocks();
     }
 
-    public static GgufLoraModel Load(string ggufPath, LoraConfig? config = null)
+    public static GgufLoraModel Load(string ggufPath, LoraConfig? config = null, string? device = "auto")
     {
+        var target = ResolveTarget(device);
         var gguf = new GgufFile(ggufPath);
         var weights = new ModelWeights(gguf);
         var tokenizer = new BpeTokenizer(gguf);
-        return new GgufLoraModel(gguf, weights, tokenizer, config ?? new LoraConfig());
+        return new GgufLoraModel(gguf, weights, tokenizer, config ?? new LoraConfig(), target);
+    }
+
+    public static GpuTarget ResolveTarget(string? device)
+    {
+        if (string.IsNullOrEmpty(device) || device.Equals("auto", StringComparison.OrdinalIgnoreCase))
+        {
+            return GpuAccelerator.HasNvidiaGpu ? GpuTarget.Nvidia : GpuTarget.Auto;
+        }
+
+        return device.ToLowerInvariant() switch
+        {
+            "cuda" or "gpu" or "nvidia" => GpuTarget.Nvidia,
+            "tensorcore" => GpuTarget.NvidiaTensorCore,
+            "d3d12" or "directml" => GpuTarget.Direct3D12,
+            "vulkan" => GpuTarget.Vulkan,
+            "cpu" => GpuTarget.Cpu,
+            _ => GpuTarget.Auto
+        };
     }
 
     private void InitializeBlocks()
@@ -75,7 +97,8 @@ public sealed unsafe class GgufLoraModel : IDisposable
                 headDim: headDim,
                 ropeFreqBase: _weights.RopeFreqBase,
                 rmsNormEps: _weights.RmsNormEps,
-                config: _config);
+                config: _config,
+                target: _target);
 
             _blocks.Add(block);
             _trainableParameters.AddRange(block.TrainableParameters);

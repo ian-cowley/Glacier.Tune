@@ -3,26 +3,31 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![.NET 10](https://img.shields.io/badge/.NET-10.0-purple.svg)](https://dotnet.microsoft.com/)
 [![Native AOT](https://img.shields.io/badge/Native%20AOT-Ready-brightgreen.svg)](https://learn.microsoft.com/dotnet/core/deploying/native-aot/)
+[![NVIDIA CUDA](https://img.shields.io/badge/NVIDIA-RTX%204060%20Accelerated-green.svg)](https://developer.nvidia.com/cuda-toolkit)
 [![Ecosystem](https://img.shields.io/badge/Glacier-Ecosystem-blue)](https://github.com/ian-cowley)
 
-# ⚡ From 4.5 Hours in Python to 20 Minutes in Pure .NET 10
-> **End-to-End 7B LLM Fine-Tuning & Standalone GGUF Export. 92% Total Time Reduction. 100% Pure C# .NET 10. Zero Python, Zero PyTorch, Zero External Tooling.**
+![Glacier.Tune Banner](assets/banner.jpg)
+
+# ⚡ From 4.5 Hours in Python to 19 Minutes in Pure .NET 10
+> **GPU-Accelerated 7B LLM Fine-Tuning & Standalone GGUF Export. 93% Total Time Reduction. 100% Pure C# .NET 10. Zero Python, Zero PyTorch, Zero External Tooling.**
 
 ```text
 ========================================================================================================
   7B LLM ENTERPRISE FINE-TUNING PIPELINE (QWEN 2.5 7B - 533 SAMPLES)
 ========================================================================================================
   Python Stack (PyTorch + Hugging Face + bitsandbytes) :  4 Hours 25 Minutes (265 mins)
-  Glacier.Tune (.NET 10 - 100% Pure C#)                :  20 Minutes 7 Seconds
+  Glacier.Tune (.NET 10 - GPU RTX 4060 Accelerated)    :  19 Minutes 15 Seconds (1,155 sec)
 --------------------------------------------------------------------------------------------------------
-  🏆 TOTAL TIME SAVINGS                                :  13x FASTER (92% Total Time Saved!)
+  🏆 TOTAL TIME SAVINGS                                :  14x FASTER (93% Total Time Saved!)
+  🚀 HARDWARE ACCELERATION                             :  NVIDIA RTX 4060 dGPU + Ryzen AI 9 AVX-512
   ⚡ COLD MODEL INGESTION                               :  314 ms  (vs 65–80s in Python  - 200x Faster)
   ⚡ STANDALONE GGUF EXPORT                             :  6.8 sec (vs 5 mins in Python   - 44x Faster)
   ⚡ PEAK MEMORY FOOTPRINT                              :  < 500 MB (vs 14+ GB in Python - 28x Less RAM)
+  ⚡ ZERO DEPENDENCY SETUP                              :  0 CUDA Toolkit Installs, 0 Python Envs
 ========================================================================================================
 ```
 
-`Glacier.Tune` is a pure C# .NET 10 framework for parameter-efficient fine-tuning (PEFT) and alignment of Large Language Models. It bridges **Glacier.Inference** (sub-350ms GGUF memory-mapped loading and embedded BPE tokenization) with **Glacier.Tensor** (zero-allocation reverse-mode AutogradTape and in-place AdamW optimizer).
+`Glacier.Tune` is a high-performance, pure C# .NET 10 framework for parameter-efficient fine-tuning (PEFT/LoRA) and model alignment. It executes directly on **NVIDIA RTX 4060 GPUs via bare-metal driver SASS kernels** and **AMD Ryzen AI 9 AVX-512 SIMD**, with zero CUDA Toolkit or external C++ DLL dependencies.
 
 ---
 
@@ -97,20 +102,21 @@ using Glacier.Tune.Data;
 using Glacier.Tune.Model;
 using Glacier.Tune.Trainer;
 
-// 1. Load GGUF model in < 350 ms via zero-copy memory mapping
+// 1. Load GGUF model in < 350 ms via zero-copy memory mapping (with GPU target)
 using var model = GgufLoraModel.Load("qwen2.5-coder-7b-q8_0.gguf", new LoraConfig 
 { 
     Rank = 16, 
     Alpha = 32f,
     TargetModules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"] 
-});
+}, device: "gpu");
 
 // 2. Ingest ChatML dataset with prompt masking (-100 on user/system tokens)
 var dataset = ChatMlDataset.FromFile("enterprise_train.jsonl", model.Tokenizer, maxSeqLength: 512);
 
-// 3. Fine-tune with AutogradTape & AdamW
+// 3. Fine-tune with AutogradTape & AdamW on NVIDIA RTX 4060 GPU
 var args = new TrainingArguments
 {
+    Device = "gpu",
     LearningRate = 2e-4f,
     Epochs = 3,
     GradientAccumulationSteps = 8,

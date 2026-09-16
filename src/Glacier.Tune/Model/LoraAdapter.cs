@@ -22,6 +22,7 @@ public sealed unsafe class LoraAdapter : IDisposable
     private readonly Tensor<float> _adapterA; // [InFeatures, Rank]
     private readonly Tensor<float> _adapterB; // [Rank, OutFeatures]
     private readonly List<Tensor<float>> _trainableParameters;
+    private readonly GpuTarget _target;
     private bool _disposed;
 
     public int InFeatures => _inFeatures;
@@ -31,13 +32,15 @@ public sealed unsafe class LoraAdapter : IDisposable
     public Tensor<float> AdapterA => _adapterA;
     public Tensor<float> AdapterB => _adapterB;
     public IReadOnlyList<Tensor<float>> TrainableParameters => _trainableParameters;
+    public GpuTarget Target => _target;
 
-    public LoraAdapter(int inFeatures, int outFeatures, int rank = 16, float alpha = 32f, int? seed = null)
+    public LoraAdapter(int inFeatures, int outFeatures, int rank = 16, float alpha = 32f, int? seed = null, GpuTarget target = GpuTarget.Auto)
     {
         _inFeatures = inFeatures;
         _outFeatures = outFeatures;
         _rank = rank;
         _scaling = alpha / rank;
+        _target = target;
 
         // Gaussian init std = 1 / sqrt(inFeatures)
         float stdA = 1.0f / MathF.Sqrt(inFeatures);
@@ -78,8 +81,8 @@ public sealed unsafe class LoraAdapter : IDisposable
         }
 
         // 3. LoRA adapter: output += (alpha / r) * (X * A) * B
-        using var lowRank = TensorOps.MatMul(x, _adapterA);
-        using var delta = TensorOps.MatMul(lowRank, _adapterB);
+        using var lowRank = TensorOps.MatMul(x, _adapterA, _target);
+        using var delta = TensorOps.MatMul(lowRank, _adapterB, _target);
         using var scaledDelta = TensorOps.Scale(delta, _scaling);
 
         var outSpan = output.AsSpan();
@@ -97,11 +100,11 @@ public sealed unsafe class LoraAdapter : IDisposable
     public void Backward(Tensor<float> dY, Tensor<float> x, Tensor<float>? dXInput = null)
     {
         // lowRank = X * A  [seqLen, rank]
-        using var lowRank = TensorOps.MatMul(x, _adapterA);
+        using var lowRank = TensorOps.MatMul(x, _adapterA, _target);
 
         // dB += scaling * lowRank^T * dY  [rank, outFeatures]
         using var lowRankT = lowRank.Transpose();
-        using var deltaB = TensorOps.MatMul(lowRankT, dY);
+        using var deltaB = TensorOps.MatMul(lowRankT, dY, _target);
         using var scaledDeltaB = TensorOps.Scale(deltaB, _scaling);
 
         var bGradSpan = _adapterB.Grad!.AsSpan();
@@ -113,11 +116,11 @@ public sealed unsafe class LoraAdapter : IDisposable
 
         // dLowRank = dY * B^T  [seqLen, rank]
         using var bT = _adapterB.Transpose();
-        using var dLowRank = TensorOps.MatMul(dY, bT);
+        using var dLowRank = TensorOps.MatMul(dY, bT, _target);
 
         // dA += scaling * X^T * dLowRank  [inFeatures, rank]
         using var inT = x.Transpose();
-        using var deltaA = TensorOps.MatMul(inT, dLowRank);
+        using var deltaA = TensorOps.MatMul(inT, dLowRank, _target);
         using var scaledDeltaA = TensorOps.Scale(deltaA, _scaling);
 
         var aGradSpan = _adapterA.Grad!.AsSpan();
@@ -131,7 +134,7 @@ public sealed unsafe class LoraAdapter : IDisposable
         if (dXInput != null)
         {
             using var aT = _adapterA.Transpose();
-            using var dX_lora = TensorOps.MatMul(dLowRank, aT);
+            using var dX_lora = TensorOps.MatMul(dLowRank, aT, _target);
             using var dX_scaled = TensorOps.Scale(dX_lora, _scaling);
 
             var dXSpan = dXInput.AsSpan();

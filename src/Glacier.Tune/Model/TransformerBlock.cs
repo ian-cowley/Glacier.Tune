@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Threading.Tasks;
 using Glacier.Inference.Model;
 using Glacier.Tensor.Compute;
 using Glacier.Tensor.Core;
@@ -91,7 +92,8 @@ public sealed unsafe class TransformerBlock : IDisposable
         int headDim,
         float ropeFreqBase,
         float rmsNormEps,
-        LoraConfig config)
+        LoraConfig config,
+        GpuTarget target = GpuTarget.Auto)
     {
         _layerIndex = layerIndex;
         _weights = weights;
@@ -107,15 +109,15 @@ public sealed unsafe class TransformerBlock : IDisposable
         int qDim = _nHeadsQ * _headDim;
         int kvDim = _nHeadsKv * _headDim;
 
-        // Initialize LoRA adapters wrapping base weights
-        _qProj = new LoraAdapter(_hiddenDim, qDim, config.Rank, config.Alpha, config.Seed);
-        _kProj = new LoraAdapter(_hiddenDim, kvDim, config.Rank, config.Alpha, config.Seed);
-        _vProj = new LoraAdapter(_hiddenDim, kvDim, config.Rank, config.Alpha, config.Seed);
-        _oProj = new LoraAdapter(qDim, _hiddenDim, config.Rank, config.Alpha, config.Seed);
+        // Initialize LoRA adapters wrapping base weights with target hardware accelerator
+        _qProj = new LoraAdapter(_hiddenDim, qDim, config.Rank, config.Alpha, config.Seed, target);
+        _kProj = new LoraAdapter(_hiddenDim, kvDim, config.Rank, config.Alpha, config.Seed, target);
+        _vProj = new LoraAdapter(_hiddenDim, kvDim, config.Rank, config.Alpha, config.Seed, target);
+        _oProj = new LoraAdapter(qDim, _hiddenDim, config.Rank, config.Alpha, config.Seed, target);
 
-        _gateProj = new LoraAdapter(_hiddenDim, _ffnDim, config.Rank, config.Alpha, config.Seed);
-        _upProj = new LoraAdapter(_hiddenDim, _ffnDim, config.Rank, config.Alpha, config.Seed);
-        _downProj = new LoraAdapter(_ffnDim, _hiddenDim, config.Rank, config.Alpha, config.Seed);
+        _gateProj = new LoraAdapter(_hiddenDim, _ffnDim, config.Rank, config.Alpha, config.Seed, target);
+        _upProj = new LoraAdapter(_hiddenDim, _ffnDim, config.Rank, config.Alpha, config.Seed, target);
+        _downProj = new LoraAdapter(_ffnDim, _hiddenDim, config.Rank, config.Alpha, config.Seed, target);
 
         RegisterAdapter(_qProj);
         RegisterAdapter(_kProj);
@@ -155,9 +157,11 @@ public sealed unsafe class TransformerBlock : IDisposable
         var k = new Tensor<float>(seqLen, kvDim);
         var v = new Tensor<float>(seqLen, kvDim);
 
-        _qProj.Forward(_weights.QType, _weights.QWeight, _weights.QBias, norm1X, q, seqLen);
-        _kProj.Forward(_weights.KType, _weights.KWeight, _weights.KBias, norm1X, k, seqLen);
-        _vProj.Forward(_weights.VType, _weights.VWeight, _weights.VBias, norm1X, v, seqLen);
+        Parallel.Invoke(
+            () => _qProj.Forward(_weights.QType, _weights.QWeight, _weights.QBias, norm1X, q, seqLen),
+            () => _kProj.Forward(_weights.KType, _weights.KWeight, _weights.KBias, norm1X, k, seqLen),
+            () => _vProj.Forward(_weights.VType, _weights.VWeight, _weights.VBias, norm1X, v, seqLen)
+        );
 
         // 3. RoPE on Q and K
         RoPEKernel.ForwardSequence(
@@ -217,8 +221,10 @@ public sealed unsafe class TransformerBlock : IDisposable
         // 7. SwiGLU FFN: Hidden = SiLU(Gate) * Up
         var gate = new Tensor<float>(seqLen, _ffnDim);
         var up = new Tensor<float>(seqLen, _ffnDim);
-        _gateProj.Forward(_weights.FfnGateType, _weights.FfnGateWeight, null, norm2X, gate, seqLen);
-        _upProj.Forward(_weights.FfnUpType, _weights.FfnUpWeight, null, norm2X, up, seqLen);
+        Parallel.Invoke(
+            () => _gateProj.Forward(_weights.FfnGateType, _weights.FfnGateWeight, null, norm2X, gate, seqLen),
+            () => _upProj.Forward(_weights.FfnUpType, _weights.FfnUpWeight, null, norm2X, up, seqLen)
+        );
 
         var hidden = new Tensor<float>(seqLen, _ffnDim);
         SwiGluKernel.Forward(
@@ -284,9 +290,13 @@ public sealed unsafe class TransformerBlock : IDisposable
             seqLen * _ffnDim);
 
         // Gate & Up projections backward -> dNorm2X
-        using var dNorm2X = new Tensor<float>(seqLen, _hiddenDim);
-        _gateProj.Backward(dGate, state.Norm2X!, dNorm2X);
-        _upProj.Backward(dUp, state.Norm2X!, dNorm2X);
+        using var dNorm2X_Gate = new Tensor<float>(seqLen, _hiddenDim);
+        using var dNorm2X_Up = new Tensor<float>(seqLen, _hiddenDim);
+        Parallel.Invoke(
+            () => _gateProj.Backward(dGate, state.Norm2X!, dNorm2X_Gate),
+            () => _upProj.Backward(dUp, state.Norm2X!, dNorm2X_Up)
+        );
+        using var dNorm2X = TensorOps.Add(dNorm2X_Gate, dNorm2X_Up);
 
         // RMSNorm2 backward -> dX1_norm
         using var dX1_norm = new Tensor<float>(seqLen, _hiddenDim);
@@ -326,10 +336,16 @@ public sealed unsafe class TransformerBlock : IDisposable
             seqLen, _nHeadsQ, _nHeadsKv, _headDim, _ropeFreqBase);
 
         // Q, K, V projections backward -> dNorm1X
-        using var dNorm1X = new Tensor<float>(seqLen, _hiddenDim);
-        _qProj.Backward(dQ, state.Norm1X!, dNorm1X);
-        _kProj.Backward(dK, state.Norm1X!, dNorm1X);
-        _vProj.Backward(dV, state.Norm1X!, dNorm1X);
+        using var dNorm1X_Q = new Tensor<float>(seqLen, _hiddenDim);
+        using var dNorm1X_K = new Tensor<float>(seqLen, _hiddenDim);
+        using var dNorm1X_V = new Tensor<float>(seqLen, _hiddenDim);
+        Parallel.Invoke(
+            () => _qProj.Backward(dQ, state.Norm1X!, dNorm1X_Q),
+            () => _kProj.Backward(dK, state.Norm1X!, dNorm1X_K),
+            () => _vProj.Backward(dV, state.Norm1X!, dNorm1X_V)
+        );
+        using var dNorm1X_QK = TensorOps.Add(dNorm1X_Q, dNorm1X_K);
+        using var dNorm1X = TensorOps.Add(dNorm1X_QK, dNorm1X_V);
 
         // RMSNorm1 backward -> dX_norm
         using var dX_norm = new Tensor<float>(seqLen, _hiddenDim);

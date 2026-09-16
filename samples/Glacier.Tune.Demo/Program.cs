@@ -31,6 +31,24 @@ Console.WriteLine("          Instant GGUF Zero-Copy Memory Mapping & LoRA Backpr
 Console.WriteLine("================================================================================\n");
 Console.ResetColor();
 
+// Determine device target: --device <dev>, --gpu, --cpu, or auto
+string device = "auto";
+for (int i = 0; i < args.Length; i++)
+{
+    if ((args[i] == "--device" || args[i] == "-d") && i + 1 < args.Length)
+    {
+        device = args[i + 1];
+    }
+    else if (args[i] == "--gpu" || args[i] == "-g")
+    {
+        device = "gpu";
+    }
+    else if (args[i] == "--cpu" || args[i] == "-c")
+    {
+        device = "cpu";
+    }
+}
+
 // Path to raw untuned GGUF base model and enterprise dataset
 string ggufPath = args.Length > 0 && !args[0].StartsWith("-") ? args[0] : @"D:\lmstudio\models\lmstudio-community\Qwen2.5-7B-Instruct-1M-GGUF\Qwen2.5-7B-Instruct-1M-Q4_K_M.gguf";
 string trainJsonl = args.Length > 1 && !args[1].StartsWith("-") ? args[1] : FindDatasetPath();
@@ -69,9 +87,9 @@ static string FindDatasetPath()
 }
 
 // 1. Load GGUF Model via Zero-Copy Memory Mapping
-Console.WriteLine("[1/4] Loading Raw Untuned Qwen 2.5 7B Base Model via Memory-Mapped GGUF...");
+Console.WriteLine($"[1/4] Loading Raw Untuned Qwen 2.5 7B Base Model (Target Device: {device.ToUpperInvariant()})...");
 var swMmf = Stopwatch.StartNew();
-using var model = GgufLoraModel.Load(ggufPath, new LoraConfig { Rank = 16, Alpha = 32f });
+using var model = GgufLoraModel.Load(ggufPath, new LoraConfig { Rank = 16, Alpha = 32f }, device: device);
 swMmf.Stop();
 
 Console.ForegroundColor = ConsoleColor.Green;
@@ -106,6 +124,7 @@ var trainingArgs = new TrainingArguments
     GradientAccumulationSteps = 2,
     MaxSteps = 10,
     LoggingSteps = 1,
+    Device = device,
     OutputDir = outputDir
 };
 

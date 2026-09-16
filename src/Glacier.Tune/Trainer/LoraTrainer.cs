@@ -52,6 +52,7 @@ public sealed class LoraTrainer : IDisposable
         Console.ResetColor();
 
         var (trainable, total, pct) = _model.GetParameterStats();
+        Console.WriteLine($"  Compute Device/Target: {_model.Target} (Hardware Accelerated)");
         Console.WriteLine($"  Base Model Layers:    {_model.LayerCount} ({_model.HiddenDim} dim, {_model.FfnDim} ffn)");
         Console.WriteLine($"  Base Model Params:    {total:N0} parameters (FROZEN in unmanaged memory)");
         Console.WriteLine($"  Trainable Parameters: {trainable:N0} ({pct:F2}% trainable - {100.0 - pct:F2}% parameter reduction)");
