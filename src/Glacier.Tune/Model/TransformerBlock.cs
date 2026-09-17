@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Threading.Tasks;
 using Glacier.Inference.Model;
 using Glacier.Tensor.Compute;
@@ -134,12 +135,29 @@ public sealed unsafe class TransformerBlock : IDisposable
     }
 
     /// <summary>
+    /// Binds VRAM pointers for frozen base weights to all LoRA adapters in this block.
+    /// </summary>
+    public void ConnectGpuWeights(Glacier.Tune.Gpu.GpuLoraEngine engine)
+    {
+        _qProj.SetGpuBaseWeights(engine.GetQ(_layerIndex), engine.GetQBias(_layerIndex));
+        _kProj.SetGpuBaseWeights(engine.GetK(_layerIndex), engine.GetKBias(_layerIndex));
+        _vProj.SetGpuBaseWeights(engine.GetV(_layerIndex), engine.GetVBias(_layerIndex));
+        _oProj.SetGpuBaseWeights(engine.GetAttnOut(_layerIndex));
+        _gateProj.SetGpuBaseWeights(engine.GetGate(_layerIndex));
+        _upProj.SetGpuBaseWeights(engine.GetUp(_layerIndex));
+        _downProj.SetGpuBaseWeights(engine.GetDown(_layerIndex));
+    }
+
+    /// <summary>
     /// Forward pass through the transformer block.
     /// If saveActivations is true, captures intermediate state required for backpropagation.
     /// </summary>
     public Tensor<float> Forward(Tensor<float> x, int seqLen, bool saveActivations, out BlockActivationState? state)
     {
         state = saveActivations ? new BlockActivationState() : null;
+
+        Stopwatch? swDbg = _layerIndex == 0 && saveActivations ? Stopwatch.StartNew() : null;
+        long tNorm1 = 0, tQkv = 0, tRope = 0, tAttn = 0, tO = 0, tNorm2 = 0, tGateUp = 0, tSwiglu = 0, tDown = 0;
 
         // 1. Attention Pre-RMSNorm: norm1X = RMSNorm(x, attn_norm)
         var norm1X = new Tensor<float>(seqLen, _hiddenDim);
@@ -148,6 +166,7 @@ public sealed unsafe class TransformerBlock : IDisposable
             ElementwiseKernels.RMSNorm(x, wNorm1, norm1X, _rmsNormEps);
         }
         if (state != null) state.Norm1X = norm1X;
+        if (swDbg is not null) { tNorm1 = swDbg.ElapsedMilliseconds; swDbg.Restart(); }
 
         // 2. Linear Projections Q, K, V with base weights + LoRA
         int qDim = _nHeadsQ * _headDim;
@@ -157,41 +176,56 @@ public sealed unsafe class TransformerBlock : IDisposable
         var k = new Tensor<float>(seqLen, kvDim);
         var v = new Tensor<float>(seqLen, kvDim);
 
-        Parallel.Invoke(
-            () => _qProj.Forward(_weights.QType, _weights.QWeight, _weights.QBias, norm1X, q, seqLen),
-            () => _kProj.Forward(_weights.KType, _weights.KWeight, _weights.KBias, norm1X, k, seqLen),
-            () => _vProj.Forward(_weights.VType, _weights.VWeight, _weights.VBias, norm1X, v, seqLen)
-        );
+        if (Glacier.Tune.Gpu.GpuLoraEngine.Current != null)
+        {
+            Glacier.Tune.Gpu.GpuLoraEngine.Current.ForwardQKV(
+                _layerIndex, norm1X, q, k, v, _qProj, _kProj, _vProj, seqLen);
+        }
+        else
+        {
+            Parallel.Invoke(
+                () => _qProj.Forward(_weights.QType, _weights.QWeight, _weights.QBias, norm1X, q, seqLen),
+                () => _kProj.Forward(_weights.KType, _weights.KWeight, _weights.KBias, norm1X, k, seqLen),
+                () => _vProj.Forward(_weights.VType, _weights.VWeight, _weights.VBias, norm1X, v, seqLen)
+            );
+        }
+        if (swDbg is not null) { tQkv = swDbg.ElapsedMilliseconds; swDbg.Restart(); }
 
-        // 3. RoPE on Q and K
-        RoPEKernel.ForwardSequence(
-            (float*)q.DataPointer, (float*)k.DataPointer,
-            seqLen, _nHeadsQ, _nHeadsKv, _headDim, _ropeFreqBase);
+        // 3 & 4. RoPE + Causal Multi-Head GQA Attention
+        var attnOut = new Tensor<float>(seqLen, qDim);
+        var attnProbs = state != null ? new Tensor<float>(_nHeadsQ, seqLen, seqLen) : null;
+
+        if (Glacier.Tune.Gpu.GpuLoraEngine.Current != null)
+        {
+            Glacier.Tune.Gpu.GpuLoraEngine.Current.ForwardAttention(
+                _layerIndex, q, k, v, attnOut, attnProbs,
+                seqLen, _nHeadsQ, _nHeadsKv, _headDim, _ropeFreqBase);
+        }
+        else
+        {
+            RoPEKernel.ForwardSequence(
+                (float*)q.DataPointer, (float*)k.DataPointer,
+                seqLen, _nHeadsQ, _nHeadsKv, _headDim, _ropeFreqBase);
+
+            attnProbs ??= new Tensor<float>(_nHeadsQ, seqLen, seqLen);
+            CausalAttentionKernel.Forward(
+                (float*)q.DataPointer, (float*)k.DataPointer, (float*)v.DataPointer,
+                (float*)attnOut.DataPointer, (float*)attnProbs.DataPointer,
+                seqLen, _nHeadsQ, _nHeadsKv, _headDim);
+        }
+        if (swDbg is not null) { tAttn = swDbg.ElapsedMilliseconds; swDbg.Restart(); }
 
         if (state != null)
         {
             state.Q = q;
             state.K = k;
             state.V = v;
-        }
-
-        // 4. Causal Multi-Head GQA Attention
-        var attnOut = new Tensor<float>(seqLen, qDim);
-        var attnProbs = new Tensor<float>(_nHeadsQ, seqLen, seqLen);
-
-        CausalAttentionKernel.Forward(
-            (float*)q.DataPointer, (float*)k.DataPointer, (float*)v.DataPointer,
-            (float*)attnOut.DataPointer, (float*)attnProbs.DataPointer,
-            seqLen, _nHeadsQ, _nHeadsKv, _headDim);
-
-        if (state != null)
-        {
-            state.AttnProbs = attnProbs;
+            state.AttnProbs = attnProbs!;
             state.AttnOut = attnOut;
         }
         else
         {
-            attnProbs.Dispose();
+            attnProbs?.Dispose();
         }
 
         // 5. Output projection + Residual: x1 = x + OProj(attnOut)
@@ -200,6 +234,7 @@ public sealed unsafe class TransformerBlock : IDisposable
         var x1 = TensorOps.Add(x, projOut);
         projOut.Dispose();
         if (state != null) state.X1 = x1;
+        if (swDbg is not null) { tO = swDbg.ElapsedMilliseconds; swDbg.Restart(); }
 
         if (!saveActivations)
         {
@@ -217,42 +252,68 @@ public sealed unsafe class TransformerBlock : IDisposable
             ElementwiseKernels.RMSNorm(x1, wNorm2, norm2X, _rmsNormEps);
         }
         if (state != null) state.Norm2X = norm2X;
+        if (swDbg is not null) { tNorm2 = swDbg.ElapsedMilliseconds; swDbg.Restart(); }
 
-        // 7. SwiGLU FFN: Hidden = SiLU(Gate) * Up
-        var gate = new Tensor<float>(seqLen, _ffnDim);
-        var up = new Tensor<float>(seqLen, _ffnDim);
-        Parallel.Invoke(
-            () => _gateProj.Forward(_weights.FfnGateType, _weights.FfnGateWeight, null, norm2X, gate, seqLen),
-            () => _upProj.Forward(_weights.FfnUpType, _weights.FfnUpWeight, null, norm2X, up, seqLen)
-        );
-
-        var hidden = new Tensor<float>(seqLen, _ffnDim);
-        SwiGluKernel.Forward(
-            (float*)gate.DataPointer, (float*)up.DataPointer,
-            (float*)hidden.DataPointer, seqLen * _ffnDim);
+        // 7 & 8. Fused SwiGLU FFN & Down Projection in VRAM
+        var downOut = new Tensor<float>(seqLen, _hiddenDim);
+        Tensor<float>? gate = null;
+        Tensor<float>? up = null;
+        Tensor<float>? hidden = null;
 
         if (state != null)
         {
+            gate = new Tensor<float>(seqLen, _ffnDim);
+            up = new Tensor<float>(seqLen, _ffnDim);
+            hidden = new Tensor<float>(seqLen, _ffnDim);
             state.Gate = gate;
             state.Up = up;
             state.Hidden = hidden;
         }
+
+        if (Glacier.Tune.Gpu.GpuLoraEngine.Current != null)
+        {
+            Glacier.Tune.Gpu.GpuLoraEngine.Current.ForwardFfn(
+                _layerIndex, norm2X, gate, up, hidden, downOut,
+                _gateProj, _upProj, _downProj, seqLen);
+        }
         else
         {
-            gate.Dispose();
-            up.Dispose();
+            gate ??= new Tensor<float>(seqLen, _ffnDim);
+            up ??= new Tensor<float>(seqLen, _ffnDim);
+            hidden ??= new Tensor<float>(seqLen, _ffnDim);
+
+            Parallel.Invoke(
+                () => _gateProj.Forward(_weights.FfnGateType, _weights.FfnGateWeight, null, norm2X, gate, seqLen),
+                () => _upProj.Forward(_weights.FfnUpType, _weights.FfnUpWeight, null, norm2X, up, seqLen)
+            );
+
+            SwiGluKernel.Forward(
+                (float*)gate.DataPointer, (float*)up.DataPointer,
+                (float*)hidden.DataPointer, seqLen * _ffnDim);
+
+            _downProj.Forward(_weights.FfnDownType, _weights.FfnDownWeight, null, hidden, downOut, seqLen);
+
+            if (state == null)
+            {
+                gate.Dispose();
+                up.Dispose();
+                hidden.Dispose();
+            }
         }
 
-        // 8. Down projection + Residual: out = x1 + DownProj(hidden)
-        var downOut = new Tensor<float>(seqLen, _hiddenDim);
-        _downProj.Forward(_weights.FfnDownType, _weights.FfnDownWeight, null, hidden, downOut, seqLen);
         var output = TensorOps.Add(x1, downOut);
         downOut.Dispose();
+
+        if (swDbg is not null)
+        {
+            tDown = swDbg.ElapsedMilliseconds;
+            Console.WriteLine($"\n      [LAYER 0 FWD BREAKDOWN] Norm1: {tNorm1}ms | QKV: {tQkv}ms | RoPE: {tRope}ms | Attn: {tAttn}ms | O: {tO}ms | Norm2: {tNorm2}ms | FFN(Gate/Up/SwiGLU/Down): {tDown}ms");
+        }
 
         if (!saveActivations)
         {
             x1.Dispose();
-            hidden.Dispose();
+            hidden?.Dispose();
             norm2X.Dispose();
         }
 
@@ -270,6 +331,9 @@ public sealed unsafe class TransformerBlock : IDisposable
         Tensor<float> xInput,
         int seqLen)
     {
+        Stopwatch? swDbg = _layerIndex == 0 ? Stopwatch.StartNew() : null;
+        long tDownBwd = 0, tSwigluBwd = 0, tGateUpBwd = 0, tNorm2Bwd = 0, tOBwd = 0, tAttnBwd = 0, tRopeBwd = 0, tQkvBwd = 0, tNorm1Bwd = 0;
+
         // -------------------------------------------------------------
         // A. FFN Backward Pass
         // -------------------------------------------------------------
@@ -277,6 +341,7 @@ public sealed unsafe class TransformerBlock : IDisposable
         // and returns gradient contribution to Hidden
         using var dHidden = new Tensor<float>(seqLen, _ffnDim);
         _downProj.Backward(dOutput, state.Hidden!, dHidden);
+        if (swDbg is not null) { tDownBwd = swDbg.ElapsedMilliseconds; swDbg.Restart(); }
 
         // SwiGLU backward: dGate, dUp
         using var dGate = new Tensor<float>(seqLen, _ffnDim);
@@ -288,6 +353,7 @@ public sealed unsafe class TransformerBlock : IDisposable
             (float*)dGate.DataPointer,
             (float*)dUp.DataPointer,
             seqLen * _ffnDim);
+        if (swDbg is not null) { tSwigluBwd = swDbg.ElapsedMilliseconds; swDbg.Restart(); }
 
         // Gate & Up projections backward -> dNorm2X
         using var dNorm2X_Gate = new Tensor<float>(seqLen, _hiddenDim);
@@ -297,6 +363,7 @@ public sealed unsafe class TransformerBlock : IDisposable
             () => _upProj.Backward(dUp, state.Norm2X!, dNorm2X_Up)
         );
         using var dNorm2X = TensorOps.Add(dNorm2X_Gate, dNorm2X_Up);
+        if (swDbg is not null) { tGateUpBwd = swDbg.ElapsedMilliseconds; swDbg.Restart(); }
 
         // RMSNorm2 backward -> dX1_norm
         using var dX1_norm = new Tensor<float>(seqLen, _hiddenDim);
@@ -304,6 +371,7 @@ public sealed unsafe class TransformerBlock : IDisposable
         {
             ElementwiseKernels.RMSNormBackward(dNorm2X, state.X1!, wNorm2, dX1_norm, null, _rmsNormEps);
         }
+        if (swDbg is not null) { tNorm2Bwd = swDbg.ElapsedMilliseconds; swDbg.Restart(); }
 
         // Residual connection: dX1 = dOutput + dX1_norm
         var dX1 = TensorOps.Add(dOutput, dX1_norm);
@@ -317,23 +385,35 @@ public sealed unsafe class TransformerBlock : IDisposable
         // OProj backward: dAttnOut = dX1 * W_o^T
         using var dAttnOut = new Tensor<float>(seqLen, qDim);
         _oProj.Backward(dX1, state.AttnOut!, dAttnOut);
+        if (swDbg is not null) { tOBwd = swDbg.ElapsedMilliseconds; swDbg.Restart(); }
 
-        // Causal Attention backward -> dQ, dK, dV
+        // Causal Attention & RoPE backward -> dQ, dK, dV
         using var dQ = new Tensor<float>(seqLen, qDim);
         using var dK = new Tensor<float>(seqLen, kvDim);
         using var dV = new Tensor<float>(seqLen, kvDim);
 
-        CausalAttentionKernel.Backward(
-            (float*)dAttnOut.DataPointer,
-            (float*)state.Q!.DataPointer, (float*)state.K!.DataPointer, (float*)state.V!.DataPointer,
-            (float*)state.AttnProbs!.DataPointer,
-            (float*)dQ.DataPointer, (float*)dK.DataPointer, (float*)dV.DataPointer,
-            seqLen, _nHeadsQ, _nHeadsKv, _headDim);
+        if (Glacier.Tune.Gpu.GpuLoraEngine.Current != null)
+        {
+            Glacier.Tune.Gpu.GpuLoraEngine.Current.BackwardAttention(
+                _layerIndex, dAttnOut,
+                state.Q!, state.K!, state.V!, state.AttnProbs!,
+                dQ, dK, dV,
+                seqLen, _nHeadsQ, _nHeadsKv, _headDim, _ropeFreqBase);
+        }
+        else
+        {
+            CausalAttentionKernel.Backward(
+                (float*)dAttnOut.DataPointer,
+                (float*)state.Q!.DataPointer, (float*)state.K!.DataPointer, (float*)state.V!.DataPointer,
+                (float*)state.AttnProbs!.DataPointer,
+                (float*)dQ.DataPointer, (float*)dK.DataPointer, (float*)dV.DataPointer,
+                seqLen, _nHeadsQ, _nHeadsKv, _headDim);
 
-        // RoPE backward (inverse rotation)
-        RoPEKernel.BackwardSequence(
-            (float*)dQ.DataPointer, (float*)dK.DataPointer,
-            seqLen, _nHeadsQ, _nHeadsKv, _headDim, _ropeFreqBase);
+            RoPEKernel.BackwardSequence(
+                (float*)dQ.DataPointer, (float*)dK.DataPointer,
+                seqLen, _nHeadsQ, _nHeadsKv, _headDim, _ropeFreqBase);
+        }
+        if (swDbg is not null) { tAttnBwd = swDbg.ElapsedMilliseconds; swDbg.Restart(); }
 
         // Q, K, V projections backward -> dNorm1X
         using var dNorm1X_Q = new Tensor<float>(seqLen, _hiddenDim);
@@ -346,12 +426,18 @@ public sealed unsafe class TransformerBlock : IDisposable
         );
         using var dNorm1X_QK = TensorOps.Add(dNorm1X_Q, dNorm1X_K);
         using var dNorm1X = TensorOps.Add(dNorm1X_QK, dNorm1X_V);
+        if (swDbg is not null) { tQkvBwd = swDbg.ElapsedMilliseconds; swDbg.Restart(); }
 
         // RMSNorm1 backward -> dX_norm
         using var dX_norm = new Tensor<float>(seqLen, _hiddenDim);
         using (var wNorm1 = Tensor<float>.FromSpan(new ReadOnlySpan<float>(_weights.AttnNormWeight, _hiddenDim), [_hiddenDim]))
         {
             ElementwiseKernels.RMSNormBackward(dNorm1X, xInput, wNorm1, dX_norm, null, _rmsNormEps);
+        }
+        if (swDbg is not null)
+        {
+            tNorm1Bwd = swDbg.ElapsedMilliseconds;
+            Console.WriteLine($"      [LAYER 0 BWD BREAKDOWN] Down: {tDownBwd}ms | SwiGLU: {tSwigluBwd}ms | GateUp: {tGateUpBwd}ms | Norm2: {tNorm2Bwd}ms | O: {tOBwd}ms | Attn: {tAttnBwd}ms | RoPE: {tRopeBwd}ms | QKV: {tQkvBwd}ms | Norm1: {tNorm1Bwd}ms");
         }
 
         // Residual connection: dXInput = dX1 + dX_norm

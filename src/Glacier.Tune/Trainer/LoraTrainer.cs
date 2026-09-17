@@ -138,7 +138,7 @@ public sealed class LoraTrainer : IDisposable
 
     private float TrainMicroBatch(TrainingExample example)
     {
-        return _model.ForwardLossAndBackward(example.InputIds, example.Labels);
+        return _model.ForwardLossAndBackward(example.InputIds, example.Labels, _args.CheckpointActivations);
     }
 
     private static float ComputeCosineLr(int currentStep, int totalSteps, float baseLr, float warmupRatio)

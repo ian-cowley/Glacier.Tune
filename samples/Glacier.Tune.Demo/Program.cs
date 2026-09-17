@@ -33,11 +33,19 @@ Console.ResetColor();
 
 // Determine device target: --device <dev>, --gpu, --cpu, or auto
 string device = "auto";
+int maxSteps = 3;
+string? userGguf = null;
+string? userJsonl = null;
+
 for (int i = 0; i < args.Length; i++)
 {
     if ((args[i] == "--device" || args[i] == "-d") && i + 1 < args.Length)
     {
-        device = args[i + 1];
+        device = args[++i];
+    }
+    else if ((args[i] == "--steps" || args[i] == "-s" || args[i] == "--max-steps") && i + 1 < args.Length)
+    {
+        maxSteps = int.Parse(args[++i]);
     }
     else if (args[i] == "--gpu" || args[i] == "-g")
     {
@@ -47,11 +55,16 @@ for (int i = 0; i < args.Length; i++)
     {
         device = "cpu";
     }
+    else if (!args[i].StartsWith("-"))
+    {
+        if (userGguf == null) userGguf = args[i];
+        else if (userJsonl == null) userJsonl = args[i];
+    }
 }
 
 // Path to raw untuned GGUF base model and enterprise dataset
-string ggufPath = args.Length > 0 && !args[0].StartsWith("-") ? args[0] : @"D:\lmstudio\models\lmstudio-community\Qwen2.5-7B-Instruct-1M-GGUF\Qwen2.5-7B-Instruct-1M-Q4_K_M.gguf";
-string trainJsonl = args.Length > 1 && !args[1].StartsWith("-") ? args[1] : FindDatasetPath();
+string ggufPath = userGguf ?? @"D:\lmstudio\models\lmstudio-community\Qwen2.5-7B-Instruct-1M-GGUF\Qwen2.5-7B-Instruct-1M-Q4_K_M.gguf";
+string trainJsonl = userJsonl ?? FindDatasetPath();
 
 if (!File.Exists(ggufPath))
 {
@@ -122,7 +135,7 @@ var trainingArgs = new TrainingArguments
     Epochs = 1,
     BatchSize = 1,
     GradientAccumulationSteps = 2,
-    MaxSteps = 10,
+    MaxSteps = maxSteps,
     LoggingSteps = 1,
     Device = device,
     OutputDir = outputDir

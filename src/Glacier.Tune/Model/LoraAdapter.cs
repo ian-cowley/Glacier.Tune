@@ -4,6 +4,7 @@ using Glacier.Inference.Gguf;
 using Glacier.Inference.Quant;
 using Glacier.Tensor.Compute;
 using Glacier.Tensor.Core;
+using Glacier.Tune.Kernels;
 
 namespace Glacier.Tune.Model;
 
@@ -23,6 +24,8 @@ public sealed unsafe class LoraAdapter : IDisposable
     private readonly Tensor<float> _adapterB; // [Rank, OutFeatures]
     private readonly List<Tensor<float>> _trainableParameters;
     private readonly GpuTarget _target;
+    private IntPtr _dBaseWeight = IntPtr.Zero;
+    private IntPtr _dBaseBias = IntPtr.Zero;
     private bool _disposed;
 
     public int InFeatures => _inFeatures;
@@ -34,13 +37,19 @@ public sealed unsafe class LoraAdapter : IDisposable
     public IReadOnlyList<Tensor<float>> TrainableParameters => _trainableParameters;
     public GpuTarget Target => _target;
 
+    public void SetGpuBaseWeights(IntPtr dBaseWeight, IntPtr dBaseBias = default)
+    {
+        _dBaseWeight = dBaseWeight;
+        _dBaseBias = dBaseBias;
+    }
+
     public LoraAdapter(int inFeatures, int outFeatures, int rank = 16, float alpha = 32f, int? seed = null, GpuTarget target = GpuTarget.Auto)
     {
         _inFeatures = inFeatures;
         _outFeatures = outFeatures;
         _rank = rank;
         _scaling = alpha / rank;
-        _target = target;
+        _target = GpuTarget.Cpu; // Fast AVX-512 cache-blocked microkernel for rank-16 (avoids 980 CUDA MemAlloc/Free driver stalls)
 
         // Gaussian init std = 1 / sqrt(inFeatures)
         float stdA = 1.0f / MathF.Sqrt(inFeatures);
@@ -58,38 +67,63 @@ public sealed unsafe class LoraAdapter : IDisposable
     }
 
     /// <summary>
-    /// Executes forward pass: computes base model quantized projection (streamed from unmanaged GGUF memory)
+    /// Executes forward pass: computes base model quantized projection (streamed from unmanaged GGUF memory or GPU VRAM)
     /// and adds the low-rank LoRA delta (X * A) * B * (alpha / r).
     /// </summary>
     public void Forward(GgufType type, byte* weightData, float* bias, Tensor<float> x, Tensor<float> output, int seqLen)
     {
-        // 1. Quantized base projection: output = BaseWeight * X
-        QuantKernels.MatMulBatch(type, weightData, (float*)x.DataPointer, (float*)output.DataPointer, _inFeatures, _outFeatures, seqLen);
-
-        // 2. Add bias if present
-        if (bias != null)
+        // 1. Quantized base projection
+        if (_dBaseWeight != IntPtr.Zero && Glacier.Tune.Gpu.GpuLoraEngine.Current != null)
         {
-            float* pOut = (float*)output.DataPointer;
-            for (int t = 0; t < seqLen; t++)
+            // Blazing fast GPU VRAM batched GEMM projection
+            Glacier.Tune.Gpu.GpuLoraEngine.Current.ForwardProjection(type, _dBaseWeight, _dBaseBias, x, output, _inFeatures, _outFeatures, seqLen);
+        }
+        else
+        {
+            // CPU fallback
+            QuantKernels.MatMulBatch(type, weightData, (float*)x.DataPointer, (float*)output.DataPointer, _inFeatures, _outFeatures, seqLen);
+
+            // 2. Add bias if present
+            if (bias != null)
             {
-                float* pRow = pOut + (long)t * _outFeatures;
-                for (int d = 0; d < _outFeatures; d++)
+                float* pOut = (float*)output.DataPointer;
+                for (int t = 0; t < seqLen; t++)
                 {
-                    pRow[d] += bias[d];
+                    float* pRow = pOut + (long)t * _outFeatures;
+                    for (int d = 0; d < _outFeatures; d++)
+                    {
+                        pRow[d] += bias[d];
+                    }
                 }
             }
         }
 
         // 3. LoRA adapter: output += (alpha / r) * (X * A) * B
-        using var lowRank = TensorOps.MatMul(x, _adapterA, _target);
-        using var delta = TensorOps.MatMul(lowRank, _adapterB, _target);
-        using var scaledDelta = TensorOps.Scale(delta, _scaling);
-
-        var outSpan = output.AsSpan();
-        var deltaSpan = scaledDelta.AsSpan();
-        for (int i = 0; i < outSpan.Length; i++)
+        if (x.IsContiguous && output.IsContiguous && _adapterA.IsContiguous && _adapterB.IsContiguous)
         {
-            outSpan[i] += deltaSpan[i];
+            LoraKernels.ApplyLoraDelta(
+                x.DataPointer,
+                _adapterA.DataPointer,
+                _adapterB.DataPointer,
+                output.DataPointer,
+                seqLen,
+                _inFeatures,
+                _outFeatures,
+                _rank,
+                _scaling);
+        }
+        else
+        {
+            using var lowRank = TensorOps.MatMul(x, _adapterA, _target);
+            using var delta = TensorOps.MatMul(lowRank, _adapterB, _target);
+            using var scaledDelta = TensorOps.Scale(delta, _scaling);
+
+            var outSpan = output.AsSpan();
+            var deltaSpan = scaledDelta.AsSpan();
+            for (int i = 0; i < outSpan.Length; i++)
+            {
+                outSpan[i] += deltaSpan[i];
+            }
         }
     }
 
@@ -99,6 +133,27 @@ public sealed unsafe class LoraAdapter : IDisposable
     /// </summary>
     public void Backward(Tensor<float> dY, Tensor<float> x, Tensor<float>? dXInput = null)
     {
+        if (x.IsContiguous && dY.IsContiguous && _adapterA.IsContiguous && _adapterB.IsContiguous &&
+            (dXInput == null || dXInput.IsContiguous))
+        {
+            int seqLen = x.Shape[0];
+            float* pDX = dXInput != null ? dXInput.DataPointer : null;
+            LoraKernels.Backward(
+                x.DataPointer,
+                dY.DataPointer,
+                _adapterA.DataPointer,
+                _adapterB.DataPointer,
+                _adapterA.Grad!.DataPointer,
+                _adapterB.Grad!.DataPointer,
+                pDX,
+                seqLen,
+                _inFeatures,
+                _outFeatures,
+                _rank,
+                _scaling);
+            return;
+        }
+
         // lowRank = X * A  [seqLen, rank]
         using var lowRank = TensorOps.MatMul(x, _adapterA, _target);
 

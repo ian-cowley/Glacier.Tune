@@ -17,4 +17,5 @@ public sealed class TrainingArguments
     public string LrSchedulerType { get; set; } = "cosine";
     public string Device { get; set; } = "auto";
     public int? MaxSteps { get; set; } = null;
+    public bool CheckpointActivations { get; set; } = false;
 }

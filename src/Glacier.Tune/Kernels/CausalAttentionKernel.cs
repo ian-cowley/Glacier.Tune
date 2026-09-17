@@ -87,73 +87,108 @@ public static unsafe class CausalAttentionKernel
         new Span<float>(dk, seqLen * nHeadsKv * headDim).Clear();
         new Span<float>(dv, seqLen * nHeadsKv * headDim).Clear();
 
-        // Lock/reduction array for GQA shared KV heads
-        object[] kvLocks = new object[nHeadsKv];
-        for (int i = 0; i < nHeadsKv; i++) kvLocks[i] = new object();
+        // Allocate lock-free per-head accumulation workspace
+        // Each Q-head accumulates into its own isolated slice [seqLen, headDim] with ZERO lock contention
+        long perHeadKvElements = (long)seqLen * headDim;
+        nuint workspaceBytes = (nuint)(nHeadsQ * perHeadKvElements * sizeof(float));
+        float* dkWorkspace = (float*)System.Runtime.InteropServices.NativeMemory.AllocZeroed(workspaceBytes);
+        float* dvWorkspace = (float*)System.Runtime.InteropServices.NativeMemory.AllocZeroed(workspaceBytes);
 
-        Parallel.For(0, nHeadsQ, h =>
+        try
         {
-            int kvH = h / gqaRatio;
-            float* probsHead = attnProbsStorage + (long)h * seqLen * seqLen;
-
-            // Temporary per-thread buffers
-            Span<float> dpRow = stackalloc float[seqLen];
-            Span<float> dsRow = stackalloc float[seqLen];
-
-            for (int i = 0; i < seqLen; i++)
+            Parallel.For(0, nHeadsQ, h =>
             {
-                float* dOutVec = dOutput + ((long)i * nHeadsQ + h) * headDim;
-                float* pRow = probsHead + (long)i * seqLen;
+                int kvH = h / gqaRatio;
+                float* probsHead = attnProbsStorage + (long)h * seqLen * seqLen;
+                float* headDk = dkWorkspace + (long)h * perHeadKvElements;
+                float* headDv = dvWorkspace + (long)h * perHeadKvElements;
 
-                // 1. dP = dOut * V^T (only for j <= i)
-                float dotPdP = 0.0f;
-                for (int j = 0; j <= i; j++)
-                {
-                    float* vVec = v + ((long)j * nHeadsKv + kvH) * headDim;
-                    float dp = 0.0f;
-                    for (int d = 0; d < headDim; d++) dp += dOutVec[d] * vVec[d];
-                    dpRow[j] = dp;
-                    dotPdP += pRow[j] * dp;
-                }
+                // Temporary per-thread buffers
+                Span<float> dpRow = stackalloc float[seqLen];
+                Span<float> dsRow = stackalloc float[seqLen];
 
-                // 2. Softmax backward: dS = P * (dP - dot(P, dP)) * scale
-                for (int j = 0; j <= i; j++)
+                for (int i = 0; i < seqLen; i++)
                 {
-                    dsRow[j] = pRow[j] * (dpRow[j] - dotPdP) * scale;
-                }
+                    float* dOutVec = dOutput + ((long)i * nHeadsQ + h) * headDim;
+                    float* pRow = probsHead + (long)i * seqLen;
 
-                // 3. dQ += dS * K
-                float* dqVec = dq + ((long)i * nHeadsQ + h) * headDim;
-                for (int j = 0; j <= i; j++)
-                {
-                    float ds = dsRow[j];
-                    float* kVec = k + ((long)j * nHeadsKv + kvH) * headDim;
-                    for (int d = 0; d < headDim; d++)
+                    // 1. dP = dOut * V^T (only for j <= i)
+                    float dotPdP = 0.0f;
+                    for (int j = 0; j <= i; j++)
                     {
-                        dqVec[d] += ds * kVec[d];
+                        float* vVec = v + ((long)j * nHeadsKv + kvH) * headDim;
+                        float dp = 0.0f;
+                        for (int d = 0; d < headDim; d++) dp += dOutVec[d] * vVec[d];
+                        dpRow[j] = dp;
+                        dotPdP += pRow[j] * dp;
                     }
-                }
 
-                // 4. dK and dV accumulations (thread-safe on shared KV heads)
-                lock (kvLocks[kvH])
-                {
+                    // 2. Softmax backward: dS = P * (dP - dot(P, dP)) * scale
+                    for (int j = 0; j <= i; j++)
+                    {
+                        dsRow[j] = pRow[j] * (dpRow[j] - dotPdP) * scale;
+                    }
+
+                    // 3. dQ += dS * K
+                    float* dqVec = dq + ((long)i * nHeadsQ + h) * headDim;
+                    for (int j = 0; j <= i; j++)
+                    {
+                        float ds = dsRow[j];
+                        float* kVec = k + ((long)j * nHeadsKv + kvH) * headDim;
+                        for (int d = 0; d < headDim; d++)
+                        {
+                            dqVec[d] += ds * kVec[d];
+                        }
+                    }
+
+                    // 4. dK and dV accumulations into isolated per-head buffer (100% LOCK-FREE)
                     for (int j = 0; j <= i; j++)
                     {
                         float ds = dsRow[j];
                         float pVal = pRow[j];
 
-                        float* dkVec = dk + ((long)j * nHeadsKv + kvH) * headDim;
-                        float* dvVec = dv + ((long)j * nHeadsKv + kvH) * headDim;
+                        float* headDkVec = headDk + (long)j * headDim;
+                        float* headDvVec = headDv + (long)j * headDim;
                         float* qVec = q + ((long)i * nHeadsQ + h) * headDim;
 
                         for (int d = 0; d < headDim; d++)
                         {
-                            dkVec[d] += ds * qVec[d];
-                            dvVec[d] += pVal * dOutVec[d];
+                            headDkVec[d] += ds * qVec[d];
+                            headDvVec[d] += pVal * dOutVec[d];
                         }
                     }
                 }
-            }
-        });
+            });
+
+            // 5. Parallel lock-free reduction across Q-heads for each KV head
+            Parallel.For(0, nHeadsKv, kvH =>
+            {
+                int startH = kvH * gqaRatio;
+                int endH = startH + gqaRatio;
+
+                for (int j = 0; j < seqLen; j++)
+                {
+                    float* dstK = dk + ((long)j * nHeadsKv + kvH) * headDim;
+                    float* dstV = dv + ((long)j * nHeadsKv + kvH) * headDim;
+
+                    for (int h = startH; h < endH; h++)
+                    {
+                        float* srcK = dkWorkspace + ((long)h * seqLen + j) * headDim;
+                        float* srcV = dvWorkspace + ((long)h * seqLen + j) * headDim;
+
+                        for (int d = 0; d < headDim; d++)
+                        {
+                            dstK[d] += srcK[d];
+                            dstV[d] += srcV[d];
+                        }
+                    }
+                }
+            });
+        }
+        finally
+        {
+            System.Runtime.InteropServices.NativeMemory.Free(dkWorkspace);
+            System.Runtime.InteropServices.NativeMemory.Free(dvWorkspace);
+        }
     }
 }

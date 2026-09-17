@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text.Json;
@@ -26,6 +27,7 @@ public sealed unsafe class GgufLoraModel : IDisposable
     private readonly BpeTokenizer _tokenizer;
     private readonly LoraConfig _config;
     private readonly GpuTarget _target;
+    private readonly Glacier.Tune.Gpu.GpuLoraEngine? _gpuEngine;
     private readonly List<TransformerBlock> _blocks = [];
     private readonly List<Tensor<float>> _trainableParameters = [];
     private bool _disposed;
@@ -52,6 +54,25 @@ public sealed unsafe class GgufLoraModel : IDisposable
         _target = target;
 
         InitializeBlocks();
+
+        if ((target is GpuTarget.Nvidia or GpuTarget.NvidiaTensorCore or GpuTarget.Auto) && Glacier.Inference.Gpu.GpuContext.IsSupported)
+        {
+            try
+            {
+                _gpuEngine = new Glacier.Tune.Gpu.GpuLoraEngine(weights);
+                for (int l = 0; l < _blocks.Count; l++)
+                {
+                    _blocks[l].ConnectGpuWeights(_gpuEngine);
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine($"[GPU WARNING] Failed to initialize GPU VRAM base engine ({ex.Message}). Falling back to CPU memory-mapped base execution.");
+                Console.ResetColor();
+                _gpuEngine = null;
+            }
+        }
     }
 
     public static GgufLoraModel Load(string ggufPath, LoraConfig? config = null, string? device = "auto")
@@ -110,7 +131,7 @@ public sealed unsafe class GgufLoraModel : IDisposable
     /// computes online fused cross-entropy loss against target labels, and backpropagates through
     /// all 28 layers to accumulate exact gradients into all LoRA adapters.
     /// </summary>
-    public float ForwardLossAndBackward(int[] inputTokens, int[] targetTokens)
+    public unsafe float ForwardLossAndBackward(int[] inputTokens, int[] targetTokens, bool checkpointActivations = false)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
@@ -127,16 +148,18 @@ public sealed unsafe class GgufLoraModel : IDisposable
             QuantKernels.ExtractEmbedding(_weights.EmbdType, _weights.EmbdWeight, token, dest, HiddenDim);
         }
 
-        // 2. Forward pass through all layers with Activation Checkpointing
-        // Only layer inputs X_l are preserved (205 MB for 28 layers at seq 512)
+        // 2. Forward pass through all layers
+        var swFwd = Stopwatch.StartNew();
         var layerInputs = new Tensor<float>[LayerCount];
+        var layerStates = new BlockActivationState?[LayerCount];
         Tensor<float> currentX = x0;
 
         for (int l = 0; l < LayerCount; l++)
         {
             layerInputs[l] = currentX;
-            currentX = _blocks[l].Forward(currentX, seqLen, saveActivations: false, out _);
+            currentX = _blocks[l].Forward(currentX, seqLen, saveActivations: !checkpointActivations, out layerStates[l]);
         }
+        swFwd.Stop();
 
         Tensor<float> xFinalLayer = currentX;
 
@@ -148,6 +171,7 @@ public sealed unsafe class GgufLoraModel : IDisposable
         }
 
         // 4. Fused Cross-Entropy Loss & Output Gradient (dXFinalNorm)
+        var swLoss = Stopwatch.StartNew();
         using var dFinalNormOut = new Tensor<float>(seqLen, HiddenDim);
         float loss = FusedCrossEntropyLoss.ComputeLossAndGradients(
             (float*)finalNormOut.DataPointer,
@@ -159,6 +183,7 @@ public sealed unsafe class GgufLoraModel : IDisposable
             seqLen,
             HiddenDim,
             VocabSize);
+        swLoss.Stop();
 
         // 5. Final Output RMSNorm Backward -> dXFinalLayer
         using var dXFinalLayer = new Tensor<float>(seqLen, HiddenDim);
@@ -167,20 +192,33 @@ public sealed unsafe class GgufLoraModel : IDisposable
             ElementwiseKernels.RMSNormBackward(dFinalNormOut, xFinalLayer, wFinalNorm, dXFinalLayer, null, _weights.RmsNormEps);
         }
 
-        // 6. Reverse-Mode Backpropagation with Activation Checkpointing
-        // Recomputes layer l activations on the fly and immediately disposes them
+        // 6. Reverse-Mode Backpropagation
+        var swRecompute = new Stopwatch();
+        var swBwd = new Stopwatch();
         Tensor<float> currentDX = dXFinalLayer;
 
         for (int l = LayerCount - 1; l >= 0; l--)
         {
             var xIn = layerInputs[l];
+            BlockActivationState state;
 
-            // Recompute layer l forward pass with activations saved
-            using var recomputedOut = _blocks[l].Forward(xIn, seqLen, saveActivations: true, out var state);
+            if (checkpointActivations)
+            {
+                swRecompute.Start();
+                using var recomputedOut = _blocks[l].Forward(xIn, seqLen, saveActivations: true, out var st);
+                swRecompute.Stop();
+                state = st!;
+            }
+            else
+            {
+                state = layerStates[l]!;
+            }
 
             // Backpropagate through layer l, updating adapters and computing dXIn
-            var dXPrev = _blocks[l].Backward(currentDX, state!, xIn, seqLen);
-            state!.Dispose();
+            swBwd.Start();
+            var dXPrev = _blocks[l].Backward(currentDX, state, xIn, seqLen);
+            swBwd.Stop();
+            state.Dispose();
 
             if (!ReferenceEquals(currentDX, dXFinalLayer))
             {
@@ -188,6 +226,8 @@ public sealed unsafe class GgufLoraModel : IDisposable
             }
             currentDX = dXPrev;
         }
+
+        Console.WriteLine($"\n    [PROFILE] Fwd: {swFwd.ElapsedMilliseconds} ms | Loss: {swLoss.ElapsedMilliseconds} ms | Recompute: {(checkpointActivations ? swRecompute.ElapsedMilliseconds : 0)} ms | Bwd: {swBwd.ElapsedMilliseconds} ms");
 
         // Cleanup activation checkpoints
         for (int l = 0; l < LayerCount; l++)
@@ -307,6 +347,7 @@ public sealed unsafe class GgufLoraModel : IDisposable
         if (!_disposed)
         {
             _disposed = true;
+            _gpuEngine?.Dispose();
             foreach (var b in _blocks) b.Dispose();
             _blocks.Clear();
             _trainableParameters.Clear();

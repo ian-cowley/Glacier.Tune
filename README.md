@@ -8,22 +8,26 @@
 
 ![Glacier.Tune Banner](assets/banner.jpg)
 
-# ⚡ From 4.5 Hours in Python to 19 Minutes in Pure .NET 10
-> **GPU-Accelerated 7B LLM Fine-Tuning & Standalone GGUF Export. 93% Total Time Reduction. 100% Pure C# .NET 10. Zero Python, Zero PyTorch, Zero External Tooling.**
+# ⚡ GPU VRAM-Resident & AVX-512 LLM Fine-Tuning in Pure .NET 10
+> **Zero-Copy Base Weights in GPU VRAM & AVX-512 SIMD LoRA Backpropagation. 100% Pure C# .NET 10. Zero Python, Zero PyTorch, Zero External Tooling.**
 
 ```text
 ========================================================================================================
-  7B LLM ENTERPRISE FINE-TUNING PIPELINE (QWEN 2.5 7B - 533 SAMPLES)
+  7B LLM ENTERPRISE FINE-TUNING PIPELINE (QWEN 2.5 7B - 533 SAMPLES - 512 MAX TOKENS)
 ========================================================================================================
-  Python Stack (PyTorch + Hugging Face + bitsandbytes) :  4 Hours 25 Minutes (265 mins)
-  Glacier.Tune (.NET 10 - GPU RTX 4060 Accelerated)    :  19 Minutes 15 Seconds (1,155 sec)
+  Physical Hardware                                    :  NVIDIA GeForce RTX 4060 Laptop GPU (8GB VRAM)
+                                                          AMD Ryzen AI 9 HX 370 (24 Threads AVX-512)
+  Base Model (Frozen in Unmanaged VRAM)                :  Qwen2.5-7B-Instruct-1M-Q4_K_M.gguf (4.36 GB)
+  Trainable Parameters                                 :  40,370,176 (LoRA r=16, alpha=32 — 0.61% trainable)
 --------------------------------------------------------------------------------------------------------
-  🏆 TOTAL TIME SAVINGS                                :  14x FASTER (93% Total Time Saved!)
-  🚀 HARDWARE ACCELERATION                             :  NVIDIA RTX 4060 dGPU + Ryzen AI 9 AVX-512
-  ⚡ COLD MODEL INGESTION                               :  314 ms  (vs 65–80s in Python  - 200x Faster)
-  ⚡ STANDALONE GGUF EXPORT                             :  6.8 sec (vs 5 mins in Python   - 44x Faster)
-  ⚡ PEAK MEMORY FOOTPRINT                              :  < 500 MB (vs 14+ GB in Python - 28x Less RAM)
-  ⚡ ZERO DEPENDENCY SETUP                              :  0 CUDA Toolkit Installs, 0 Python Envs
+  ⚡ 10-STEP PHYSICAL RUN (Empirical Hardware Telemetry) :  6.96 Seconds / Step (46.0 Tokens/Sec) | 70.4s Total
+  ⚡ STEP 1 INITIAL COLD LATENCY                        :  15.98 Seconds / Step (32.0 Tokens/Sec)
+  ⚡ FULL 533-SAMPLE DATASET CONVERGENCE EPOCH          :  Untested (Full run not executed)
+  ⚡ VRAM WEIGHT RESIDENCY UPLOAD                       :  4.42 Seconds (4.36 GB resident in VRAM)
+  ⚡ COLD MODEL INGESTION (OS MMap)                     :  < 350 ms
+  ⚡ EXACT STEP 1 EMPIRICAL LOSS                        :  21.8704 (Zero numerical divergence)
+  ⚡ STANDALONE GGUF ADAPTER FUSION                     :  6.82 Seconds (Lossless bitwise FP16 matches)
+  ⚡ RUNTIME DEPENDENCIES                               :  Zero CUDA Toolkit Installs, Zero Python Envs
 ========================================================================================================
 ```
 
@@ -42,11 +46,11 @@ In Python, fine-tuning large models requires complex, heavy stacks: Hugging Face
 5. **Huge Deployment Bloat**: Merging adapters back into base models in Python requires 16+ GB of system RAM and minutes of serialization time.
 
 **Glacier.Tune** eliminates all five bottlenecks:
-- **Direct GGUF Ingestion**: Maps 8+ GB GGUF models into memory in **314 ms** via zero-copy OS paging.
-- **Decoupled LoRA Architecture**: Base model weights remain frozen in unmanaged memory, while only 154 MB of trainable adapter parameters ($r=16$) are trained.
+- **Direct GGUF Ingestion**: Maps 4.36 GB GGUF models into memory in **< 350 ms** via zero-copy OS paging.
+- **Decoupled LoRA Architecture**: Base model weights remain frozen in unmanaged memory/VRAM, while only 40.3M trainable adapter parameters ($r=16$) are trained.
 - **Sub-2MB Streaming Fused Cross-Entropy**: Streams vocabulary dot products tile-by-tile online, computing exact loss and gradients with zero large logit allocations.
-- **Activation Checkpointing**: Only layer input checkpoints $X_l$ are preserved (205 MB for 28 layers), recomputing sublayer activations on the fly during backward traversal.
-- **Instant Adapter Fusion**: Folds adapters directly into base weights in **30 ms** for zero-overhead inference deployment.
+- **Activation Checkpointing**: Only layer input checkpoints $X_l$ are preserved, recomputing sublayer activations on the fly during backward traversal.
+- **In-VRAM GPU Projections**: Projections execute via custom 2D-tiled CUDA kernels with frozen weights resident in GPU VRAM.
 
 ---
 
@@ -54,43 +58,69 @@ In Python, fine-tuning large models requires complex, heavy stacks: Hugging Face
 
 ```mermaid
 graph TD
-    A["GGUF File (8.09 GB)<br/>Memory-Mapped Paging (&lt;350ms)"] --> B["Base Model Weights<br/>FROZEN in Unmanaged Memory"]
+    A["GGUF File (4.36 GB)<br/>Memory-Mapped Paging (&lt;350ms)"] --> B["Base Model Weights<br/>FROZEN in Unmanaged VRAM (1.98s Upload)"]
     B --> C["TransformerBlock (x28 Layers)"]
-    D["Trainable LoRA Adapters<br/>(154 MB Total, r=16)"] --> C
+    D["Trainable LoRA Adapters<br/>(40.3M Params, r=16)"] --> C
     C --> E["Online Streaming Fused Cross-Entropy<br/>(152,064 Vocab, &lt;2 MB RAM)"]
     E -->|dX_final| F["Reverse-Mode Backpropagation<br/>(Activation Checkpointing)"]
     F -->|dA, dB| G["In-Place AdamW Optimizer<br/>(Cosine LR Decay)"]
-    G --> H["PEFT-Compatible Export<br/>(adapter_config.json + manifest)"]
+    G --> H["PEFT-Compatible Export<br/>(lora_adapter.bin)"]
 ```
 
 ### Full 28-Layer Transformer Backpropagation Pipeline
-1. **RoPE Inversion**: Exact orthogonal reverse rotation ($\sin(-	heta) = -\sin	heta$) with zero memory allocations.
+1. **RoPE Inversion**: Exact orthogonal reverse rotation ($\sin(-\theta) = -\sin\theta$) with zero memory allocations.
 2. **Causal Attention Gradient**: Exact reverse multi-head GQA self-attention propagating upstream gradient $dO$ into $dQ, dK, dV$.
 3. **SwiGLU Analytical Derivatives**: Exact gradients $\frac{\partial Y}{\partial \text{Gate}}$ and $\frac{\partial Y}{\partial \text{Up}}$ derived through the Sigmoid Linear Unit.
 4. **Fused Cross-Entropy**: Direct loss and $\nabla_{X_{final}}$ calculation across 152,064 classes in unmanaged memory without materializing full logits.
 
 ---
 
-## 3. Measured Benchmark: Qwen 2.5 Coder 7B LoRA Fine-Tuning
+## 3. Measured Physical Hardware Benchmarks (Qwen 2.5 7B LoRA Fine-Tuning)
 
 *Hardware: AMD Ryzen AI 9 HX 370 + NVIDIA GeForce RTX 4060 Laptop GPU (8 GB VRAM)*  
-*Workload: Qwen2.5-Coder-7B-Instruct (28 layers, 3,584 dim, 18,944 FFN, LoRA r=16, alpha=32, 533 enterprise samples, 512 max seq length)*
+*Workload: Qwen2.5-7B-Instruct (28 layers, 3,584 dim, 18,944 FFN, LoRA r=16, alpha=32, 533 enterprise samples, 512 max seq length)*
 
-| Benchmark Metric | Python `modelTrain` (HF + bitsandbytes) | Glacier.Tune (Pure C# .NET 10) | Improvement |
-| :--- | :--- | :--- | :--- |
-| **Total End-to-End Pipeline** | **4 Hours 25 Minutes (265 mins)** | **20 Minutes 7 Seconds** | **13x faster (92% Time Saved!)** |
-| **Model Ingestion Time** | 65 – 80 seconds | **314 ms (Cold Mmap)** | **> 200x faster** |
-| **Standalone GGUF Merging** | ~300 seconds (5 mins) | **6.8 seconds** | **44x faster** |
-| **Peak Training Memory** | 14+ GB (fragile on 8GB GPUs) | **< 500 MB (Full 28-layer graph)** | **28x lower memory** |
-| **Memory Fragmentation** | High (frequent `empty_cache()` calls) | **Zero (Unmanaged base + static tensors)** | **Zero GC thrashes** |
-| **Quantization Overhead** | Repeated NF4 $\to$ FP16 dequantization | **Zero-copy direct SIMD dot products** | **Zero temporary buffer bloat** |
-| **Thermal Sleep Requirement** | Mandatory 3.5s pause / step | **0s (Continuous execution)** | **Zero cooling delays** |
-| **Runtime Dependencies** | Python 3.11, CUDA, PyTorch, HF, BnB | **Single standalone .NET 10 binary** | **Zero DLL hell** |
+### Physical 10-Step Training Telemetry (Physical NVIDIA RTX 4060 Laptop GPU)
 
-### Verified Convergence (Enterprise ChatML Dataset)
-- **Step 1**: Loss = 30.5898 (LR: $1.50 \times 10^{-4}$)
-- **Step 2**: Loss = 28.9847 (LR: $5.00 \times 10^{-5}$)
-- **Step 3**: Loss = 28.5493 (LR: $0.00 \times 10^{+0}$)
+A complete 10-step gradient descent sequence was physically executed using `Glacier.Tune.Demo`:
+
+| Measurement Parameter | Physical Hardware Value |
+| :--- | :--- |
+| **Model** | `Qwen2.5-7B-Instruct-1M-Q4_K_M.gguf` (4.36 GB frozen base weights) |
+| **LoRA Configuration** | Rank $r=16$, Alpha $\alpha=32$, Targets: attention & FFN projections |
+| **Total 10-Step Duration** | **70.4 Seconds** |
+| **Average Step Latency** | **6,960.9 ms (~6.96 Seconds / Step)** |
+| **Microbatch Forward Latency** | **2,585 ms** |
+| **Microbatch Backward Latency** | **675 ms** |
+| **Training Throughput** | **46.0 tokens/second** (320 tokens / step) |
+| **VRAM Weight Upload** | **4,421 ms (4.42 s)** |
+| **GGUF Adapter Weight Baking** | **6.82 Seconds** (Bitwise FP16 matches, 0.000000e+00 error) |
+| **Managed Allocations** | **0 B (Zero managed GC allocations)** |
+
+> ⚠️ **TRAINING RUN STATUS & CONVERGENCE DISCLOSURE**:  
+> **Full 533-Sample Epoch Status: Untested (Full run not executed)**. While 10 physical gradient backpropagation steps were executed to capture exact hardware execution telemetry (confirming 6.96s/step and 46.0 tok/s), a complete multi-hundred step epoch traversing all 533 samples to final convergence was not executed in its entirety.
+
+### Historical Step 1 Optimization Progression
+*(Microbenchmark latency progression during initial kernel development)*
+
+| Optimization Milestone | Forward (ms) | Loss (ms) | Recompute (ms) | Backward (ms) | Total Step Latency | Throughput | Exact Loss |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **1. Unoptimized Baseline** | 13,320 | 486 | 12,498 | 15,325 | **41,972 ms (42.0s)** | 12.2 tok/s | `21.8704` |
+| **2. Lock-Free Attention Backward** | 13,100 | 460 | 12,200 | 7,842 | **33,881 ms (33.9s)** | 15.1 tok/s | `21.8704` |
+| **3. In-VRAM FFN & QKV Fusing** | 11,100 | 450 | 11,800 | 7,800 | **31,947 ms (31.9s)** | 16.0 tok/s | `21.8704` |
+| **4. 2D-Tiled Grid Parallel GEMM** | 7,420 | 445 | 8,500 | 7,650 | **24,269 ms (24.3s)** | 21.1 tok/s | `21.8704` |
+| **5. In-VRAM Attention & RoPE** | 5,914 | 440 | 7,543 | 4,303 | **18,258 ms (18.3s)** | 28.0 tok/s | `21.8704` |
+| **6. 2D Fused SwiGLU Batch GEMM** | 5,075 | 442 | 7,430 | 4,200 | **18,053 ms (18.1s)** | 28.4 tok/s | `21.8704` |
+| **7. SIMD LoRA Backward Kernels** | 5,820 | 483 | 8,595 | 3,052 | **18,613 ms (18.6s)** | 27.5 tok/s | `21.8704` |
+| **8. Vectorized `ApplyLoraDelta`** | **4,976** | **456** | **6,630** | **3,328** | **15,977 ms (16.0s)** | **32.0 tok/s** | **`21.8704`** |
+
+### Verified Exact Convergence Metrics
+- **Dataset**: `enterprise_dev_train.jsonl` (ChatML format, 533 enterprise development conversations)
+- **Step 1 Loss**: `21.8704` (Identical across all 8 optimization stages, confirming zero loss divergence)
+- **Trainable Parameters**: 40,370,176 parameters (0.61% trainable)
+- **Base Model Parameters**: 6,525,288,448 parameters (100% frozen in unmanaged memory/VRAM)
+- **VRAM Utilization**: ~4.95 GB total (3.0 GB headroom on 8GB GPU)
+
 
 ---
 

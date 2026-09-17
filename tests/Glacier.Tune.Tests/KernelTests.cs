@@ -129,4 +129,149 @@ public unsafe class KernelTests
             }
         }
     }
+
+    [Fact]
+    public void LoraKernels_Backward_MatchesOriginal()
+    {
+        int seqLen = 8;
+        int inFeatures = 32;
+        int outFeatures = 24;
+        int rank = 16;
+        float alpha = 32.0f;
+        float scaling = alpha / rank;
+
+        var x = new Glacier.Tensor.Core.Tensor<float>(seqLen, inFeatures);
+        var dY = new Glacier.Tensor.Core.Tensor<float>(seqLen, outFeatures);
+        var adapterOrig = new Glacier.Tune.Model.LoraAdapter(inFeatures, outFeatures, rank, alpha);
+
+        var rng = new Random(42);
+        for (int i = 0; i < x.ElementCount; i++) x.DataPointer[i] = (float)(rng.NextDouble() * 2.0 - 1.0);
+        for (int i = 0; i < dY.ElementCount; i++) dY.DataPointer[i] = (float)(rng.NextDouble() * 2.0 - 1.0);
+
+        var dXOrig = new Glacier.Tensor.Core.Tensor<float>(seqLen, inFeatures);
+        var dXFast = new Glacier.Tensor.Core.Tensor<float>(seqLen, inFeatures);
+
+        // Run original
+        adapterOrig.Backward(dY, x, dXOrig);
+
+        // Run fast
+        var gradA_Fast = new float[inFeatures * rank];
+        var gradB_Fast = new float[rank * outFeatures];
+
+        fixed (float* pGradA = gradA_Fast, pGradB = gradB_Fast)
+        {
+            LoraKernels.Backward(
+                x.DataPointer,
+                dY.DataPointer,
+                adapterOrig.AdapterA.DataPointer,
+                adapterOrig.AdapterB.DataPointer,
+                pGradA,
+                pGradB,
+                dXFast.DataPointer,
+                seqLen,
+                inFeatures,
+                outFeatures,
+                rank,
+                scaling);
+        }
+
+        // Compare GradB
+        var gradBSpanOrig = adapterOrig.AdapterB.Grad!.AsSpan();
+        for (int i = 0; i < gradBSpanOrig.Length; i++)
+        {
+            Assert.True(Math.Abs(gradBSpanOrig[i] - gradB_Fast[i]) < 1e-4f,
+                $"GradB mismatch at {i}: orig={gradBSpanOrig[i]}, fast={gradB_Fast[i]}");
+        }
+
+        // Compare GradA
+        var gradASpanOrig = adapterOrig.AdapterA.Grad!.AsSpan();
+        for (int i = 0; i < gradASpanOrig.Length; i++)
+        {
+            Assert.True(Math.Abs(gradASpanOrig[i] - gradA_Fast[i]) < 1e-4f,
+                $"GradA mismatch at {i}: orig={gradASpanOrig[i]}, fast={gradA_Fast[i]}");
+        }
+
+        // Compare dX
+        var dXSpanOrig = dXOrig.AsSpan();
+        var dXSpanFast = dXFast.AsSpan();
+        for (int i = 0; i < dXSpanOrig.Length; i++)
+        {
+            Assert.True(Math.Abs(dXSpanOrig[i] - dXSpanFast[i]) < 1e-4f,
+                $"dX mismatch at {i}: orig={dXSpanOrig[i]}, fast={dXSpanFast[i]}");
+        }
+    }
+
+    [Fact]
+    public void FusedCrossEntropyLoss_ComputesExactGradient_WithAutogradParity()
+    {
+        const int seqLen = 4;
+        const int hiddenDim = 16;
+        const int vocabSize = 32;
+
+        float[] finalHidden = new float[seqLen * hiddenDim];
+        float[] dFinalHidden = new float[seqLen * hiddenDim];
+        float[] lmHead = new float[vocabSize * hiddenDim];
+        int[] inputTokens = [1, 2, 3, 4];
+        int[] targetTokens = [5, 10, 15, 20];
+
+        var rng = new Random(1234);
+        for (int i = 0; i < finalHidden.Length; i++) finalHidden[i] = (float)(rng.NextDouble() * 0.5 - 0.25);
+        for (int i = 0; i < lmHead.Length; i++) lmHead[i] = (float)(rng.NextDouble() * 0.5 - 0.25);
+
+        // Ground-truth full softmax gradient calculation
+        float[] expectedGrad = new float[seqLen * hiddenDim];
+        for (int t = 0; t < seqLen; t++)
+        {
+            float[] logits = new float[vocabSize];
+            float maxLogit = float.NegativeInfinity;
+            for (int v = 0; v < vocabSize; v++)
+            {
+                float dot = 0f;
+                for (int d = 0; d < hiddenDim; d++)
+                {
+                    dot += finalHidden[t * hiddenDim + d] * lmHead[v * hiddenDim + d];
+                }
+                logits[v] = dot;
+                if (dot > maxLogit) maxLogit = dot;
+            }
+
+            float sumExp = 0f;
+            for (int v = 0; v < vocabSize; v++) sumExp += MathF.Exp(logits[v] - maxLogit);
+            float logSumExp = maxLogit + MathF.Log(sumExp);
+
+            int target = targetTokens[t];
+            for (int v = 0; v < vocabSize; v++)
+            {
+                float p = MathF.Exp(logits[v] - logSumExp);
+                float gradP = (p - (v == target ? 1.0f : 0.0f)) / seqLen;
+                for (int d = 0; d < hiddenDim; d++)
+                {
+                    expectedGrad[t * hiddenDim + d] += gradP * lmHead[v * hiddenDim + d];
+                }
+            }
+        }
+
+        fixed (float* pHidden = finalHidden, pDH = dFinalHidden, pLmHead = lmHead)
+        {
+            float loss = FusedCrossEntropyLoss.ComputeLossAndGradients(
+                pHidden,
+                inputTokens,
+                targetTokens,
+                Glacier.Inference.Gguf.GgufType.F32,
+                (byte*)pLmHead,
+                pDH,
+                seqLen,
+                hiddenDim,
+                vocabSize);
+
+            Assert.True(loss > 0f, "Loss should be positive");
+        }
+
+        for (int i = 0; i < expectedGrad.Length; i++)
+        {
+            Assert.True(Math.Abs(expectedGrad[i] - dFinalHidden[i]) < 1e-5f,
+                $"Gradient mismatch at index {i}: expected {expectedGrad[i]}, actual {dFinalHidden[i]}");
+        }
+    }
 }
+
