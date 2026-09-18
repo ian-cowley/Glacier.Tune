@@ -157,7 +157,7 @@ public sealed unsafe class TransformerBlock : IDisposable
         state = saveActivations ? new BlockActivationState() : null;
 
         Stopwatch? swDbg = _layerIndex == 0 && saveActivations ? Stopwatch.StartNew() : null;
-        long tNorm1 = 0, tQkv = 0, tRope = 0, tAttn = 0, tO = 0, tNorm2 = 0, tGateUp = 0, tSwiglu = 0, tDown = 0;
+        long tNorm1 = 0, tQkv = 0, tRope = 0, tAttn = 0, tO = 0, tNorm2 = 0, tDown = 0;
 
         // 1. Attention Pre-RMSNorm: norm1X = RMSNorm(x, attn_norm)
         var norm1X = new Tensor<float>(seqLen, _hiddenDim);
@@ -329,8 +329,11 @@ public sealed unsafe class TransformerBlock : IDisposable
         Tensor<float> dOutput,
         BlockActivationState state,
         Tensor<float> xInput,
-        int seqLen)
+        int seqLen,
+        AutogradScratchWorkspace? workspace = null)
     {
+        var ws = workspace ?? AutogradScratchWorkspace.GetOrCreate(seqLen, _hiddenDim, _ffnDim, _nHeadsQ, _nHeadsKv, _headDim);
+
         Stopwatch? swDbg = _layerIndex == 0 ? Stopwatch.StartNew() : null;
         long tDownBwd = 0, tSwigluBwd = 0, tGateUpBwd = 0, tNorm2Bwd = 0, tOBwd = 0, tAttnBwd = 0, tRopeBwd = 0, tQkvBwd = 0, tNorm1Bwd = 0;
 
@@ -339,13 +342,13 @@ public sealed unsafe class TransformerBlock : IDisposable
         // -------------------------------------------------------------
         // Down projection backward: accumulates adapter gradients into DownProj
         // and returns gradient contribution to Hidden
-        using var dHidden = new Tensor<float>(seqLen, _ffnDim);
+        using var dHidden = AutogradScratchWorkspace.Wrap(ws.FfnScratchA, seqLen, _ffnDim);
         _downProj.Backward(dOutput, state.Hidden!, dHidden);
         if (swDbg is not null) { tDownBwd = swDbg.ElapsedMilliseconds; swDbg.Restart(); }
 
         // SwiGLU backward: dGate, dUp
-        using var dGate = new Tensor<float>(seqLen, _ffnDim);
-        using var dUp = new Tensor<float>(seqLen, _ffnDim);
+        using var dGate = AutogradScratchWorkspace.Wrap(ws.FfnScratchB, seqLen, _ffnDim);
+        using var dUp = AutogradScratchWorkspace.Wrap(ws.FfnScratchC, seqLen, _ffnDim);
         SwiGluKernel.Backward(
             (float*)dHidden.DataPointer,
             (float*)state.Gate!.DataPointer,
@@ -356,17 +359,18 @@ public sealed unsafe class TransformerBlock : IDisposable
         if (swDbg is not null) { tSwigluBwd = swDbg.ElapsedMilliseconds; swDbg.Restart(); }
 
         // Gate & Up projections backward -> dNorm2X
-        using var dNorm2X_Gate = new Tensor<float>(seqLen, _hiddenDim);
-        using var dNorm2X_Up = new Tensor<float>(seqLen, _hiddenDim);
+        using var dNorm2X_Gate = AutogradScratchWorkspace.Wrap(ws.HiddenScratchA, seqLen, _hiddenDim);
+        using var dNorm2X_Up = AutogradScratchWorkspace.Wrap(ws.HiddenScratchB, seqLen, _hiddenDim);
         Parallel.Invoke(
             () => _gateProj.Backward(dGate, state.Norm2X!, dNorm2X_Gate),
             () => _upProj.Backward(dUp, state.Norm2X!, dNorm2X_Up)
         );
-        using var dNorm2X = TensorOps.Add(dNorm2X_Gate, dNorm2X_Up);
+        using var dNorm2X = AutogradScratchWorkspace.Wrap(ws.HiddenScratchC, seqLen, _hiddenDim);
+        ElementwiseKernels.Add(dNorm2X_Gate, dNorm2X_Up, dNorm2X);
         if (swDbg is not null) { tGateUpBwd = swDbg.ElapsedMilliseconds; swDbg.Restart(); }
 
         // RMSNorm2 backward -> dX1_norm
-        using var dX1_norm = new Tensor<float>(seqLen, _hiddenDim);
+        using var dX1_norm = AutogradScratchWorkspace.Wrap(ws.HiddenScratchD, seqLen, _hiddenDim);
         using (var wNorm2 = Tensor<float>.FromSpan(new ReadOnlySpan<float>(_weights.FfnNormWeight, _hiddenDim), [_hiddenDim]))
         {
             ElementwiseKernels.RMSNormBackward(dNorm2X, state.X1!, wNorm2, dX1_norm, null, _rmsNormEps);
@@ -383,14 +387,14 @@ public sealed unsafe class TransformerBlock : IDisposable
         int kvDim = _nHeadsKv * _headDim;
 
         // OProj backward: dAttnOut = dX1 * W_o^T
-        using var dAttnOut = new Tensor<float>(seqLen, qDim);
+        using var dAttnOut = AutogradScratchWorkspace.Wrap(ws.QDimScratchA, seqLen, qDim);
         _oProj.Backward(dX1, state.AttnOut!, dAttnOut);
         if (swDbg is not null) { tOBwd = swDbg.ElapsedMilliseconds; swDbg.Restart(); }
 
         // Causal Attention & RoPE backward -> dQ, dK, dV
-        using var dQ = new Tensor<float>(seqLen, qDim);
-        using var dK = new Tensor<float>(seqLen, kvDim);
-        using var dV = new Tensor<float>(seqLen, kvDim);
+        using var dQ = AutogradScratchWorkspace.Wrap(ws.QDimScratchB, seqLen, qDim);
+        using var dK = AutogradScratchWorkspace.Wrap(ws.KvDimScratchA, seqLen, kvDim);
+        using var dV = AutogradScratchWorkspace.Wrap(ws.KvDimScratchB, seqLen, kvDim);
 
         if (Glacier.Tune.Gpu.GpuLoraEngine.Current != null)
         {
@@ -416,20 +420,21 @@ public sealed unsafe class TransformerBlock : IDisposable
         if (swDbg is not null) { tAttnBwd = swDbg.ElapsedMilliseconds; swDbg.Restart(); }
 
         // Q, K, V projections backward -> dNorm1X
-        using var dNorm1X_Q = new Tensor<float>(seqLen, _hiddenDim);
-        using var dNorm1X_K = new Tensor<float>(seqLen, _hiddenDim);
-        using var dNorm1X_V = new Tensor<float>(seqLen, _hiddenDim);
+        using var dNorm1X_Q = AutogradScratchWorkspace.Wrap(ws.HiddenScratchA, seqLen, _hiddenDim);
+        using var dNorm1X_K = AutogradScratchWorkspace.Wrap(ws.HiddenScratchB, seqLen, _hiddenDim);
+        using var dNorm1X_V = AutogradScratchWorkspace.Wrap(ws.HiddenScratchC, seqLen, _hiddenDim);
         Parallel.Invoke(
             () => _qProj.Backward(dQ, state.Norm1X!, dNorm1X_Q),
             () => _kProj.Backward(dK, state.Norm1X!, dNorm1X_K),
             () => _vProj.Backward(dV, state.Norm1X!, dNorm1X_V)
         );
-        using var dNorm1X_QK = TensorOps.Add(dNorm1X_Q, dNorm1X_K);
-        using var dNorm1X = TensorOps.Add(dNorm1X_QK, dNorm1X_V);
+        using var dNorm1X = AutogradScratchWorkspace.Wrap(ws.HiddenScratchD, seqLen, _hiddenDim);
+        ElementwiseKernels.Add(dNorm1X_Q, dNorm1X_K, dNorm1X);
+        ElementwiseKernels.Add(dNorm1X, dNorm1X_V, dNorm1X);
         if (swDbg is not null) { tQkvBwd = swDbg.ElapsedMilliseconds; swDbg.Restart(); }
 
         // RMSNorm1 backward -> dX_norm
-        using var dX_norm = new Tensor<float>(seqLen, _hiddenDim);
+        using var dX_norm = AutogradScratchWorkspace.Wrap(ws.HiddenScratchE, seqLen, _hiddenDim);
         using (var wNorm1 = Tensor<float>.FromSpan(new ReadOnlySpan<float>(_weights.AttnNormWeight, _hiddenDim), [_hiddenDim]))
         {
             ElementwiseKernels.RMSNormBackward(dNorm1X, xInput, wNorm1, dX_norm, null, _rmsNormEps);
