@@ -189,6 +189,14 @@ dotnet run -c Release --project samples/Glacier.Tune.Demo -- --merge \
 
 ---
 
+## 🆕 What's New in v1.0.5
+
+- **`AutogradScratchWorkspace`** — eliminates 26 GB/step gradient buffer allocation churn by reusing a single pre-allocated scratch arena across all backward passes.
+- **2D tiled softmax** — peak activation memory reduced from **622 MB → 16 KB** per forward pass via tiled online softmax that computes in O(1) extra memory.
+- **15 tests** passing (100 %).
+
+---
+
 ## License
 
 Licensed under the [MIT License](LICENSE). Copyright (c) 2026 Ian Cowley.
