@@ -114,7 +114,7 @@ public sealed unsafe class GpuLoraEngine : IDisposable
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnSwiglu, _module, "swiglu_kernel"), "ModuleGetFunction(swiglu_kernel)");
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnSwigluBwd, _module, "swiglu_bwd_kernel"), "ModuleGetFunction(swiglu_bwd_kernel)");
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnVecAdd, _module, "vec_add_kernel"), "ModuleGetFunction(vec_add_kernel)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRopeBatch, _module, "rope_batch_kernel"), "ModuleGetFunction(rope_batch_kernel)");
+        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRopeBatch, _module, "rope_batch"), "ModuleGetFunction(rope_batch)");
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttnTrainFwd, _module, "attention_causal_gqa_train_fwd"), "ModuleGetFunction(attention_causal_gqa_train_fwd)");
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttnTrainBwdDqDs, _module, "attention_causal_gqa_train_bwd_dq_ds"), "ModuleGetFunction(attention_causal_gqa_train_bwd_dq_ds)");
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttnTrainBwdDkDv, _module, "attention_causal_gqa_train_bwd_dk_dv"), "ModuleGetFunction(attention_causal_gqa_train_bwd_dk_dv)");
@@ -698,31 +698,35 @@ public sealed unsafe class GpuLoraEngine : IDisposable
         }
     }
 
-    public void LaunchRopeBatch(IntPtr dQ, IntPtr dK, int nHeadsQ, int nHeadsKv, int headDim, int seqLen, float freqBase, float invSign = 1.0f)
+    public void LaunchRopeBatch(IntPtr dQ, IntPtr dK, int nHeadsQ, int nHeadsKv, int headDim, int seqLen, float freqBase, float freqScale = 1.0f)
     {
         int halfDim = headDim / 2;
         int totalHalf = (nHeadsQ + nHeadsKv) * halfDim;
+        int totalAll = totalHalf * seqLen;
         uint blockSize = 256;
-        uint gridX = (uint)((totalHalf + 255) / 256);
-        uint gridY = (uint)seqLen;
+        uint gridSize = (uint)((totalAll + (int)blockSize - 1) / (int)blockSize);
 
-        void** pArgs = stackalloc void*[8];
+        int startPos = 0;
+        int batchSize = seqLen;
+
+        void** pArgs = stackalloc void*[9];
         pArgs[0] = &dQ;
         pArgs[1] = &dK;
         pArgs[2] = &nHeadsQ;
         pArgs[3] = &nHeadsKv;
         pArgs[4] = &headDim;
-        pArgs[5] = &seqLen;
-        pArgs[6] = &freqBase;
-        pArgs[7] = &invSign;
+        pArgs[5] = &startPos;
+        pArgs[6] = &batchSize;
+        pArgs[7] = &freqBase;
+        pArgs[8] = &freqScale;
 
         CuDriver.Check(CuDriver.LaunchKernel(
             _fnRopeBatch,
-            gridX, gridY, 1,
+            gridSize, 1, 1,
             blockSize, 1, 1,
             0, IntPtr.Zero,
             (IntPtr)pArgs,
-            IntPtr.Zero), "LaunchKernel(rope_batch_kernel)");
+            IntPtr.Zero), "LaunchKernel(rope_batch)");
     }
 
     public void LaunchAttnTrainFwd(
