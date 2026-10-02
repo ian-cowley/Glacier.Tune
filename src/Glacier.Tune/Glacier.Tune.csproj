@@ -32,24 +32,24 @@
     <ProjectReference Include="..\..\..\Glacier.Inference\src\Glacier.Inference\Glacier.Inference.csproj" />
   </ItemGroup>
   <ItemGroup Condition="!Exists('..\..\..\Glacier.Inference\src\Glacier.Inference\Glacier.Inference.csproj')">
-    <PackageReference Include="Glacier.Inference" Version="1.2.2" />
+    <PackageReference Include="Glacier.Inference" Version="1.2.3" />
   </ItemGroup>
 
   <ItemGroup Condition="Exists('..\..\..\Glacier.Tensor\src\Glacier.Tensor\Glacier.Tensor.csproj')">
     <ProjectReference Include="..\..\..\Glacier.Tensor\src\Glacier.Tensor\Glacier.Tensor.csproj" />
   </ItemGroup>
   <ItemGroup Condition="!Exists('..\..\..\Glacier.Tensor\src\Glacier.Tensor\Glacier.Tensor.csproj')">
-    <PackageReference Include="Glacier.Tensor" Version="1.0.7" />
+    <PackageReference Include="Glacier.Tensor" Version="1.0.9" />
   </ItemGroup>
 
   <ItemGroup Condition="Exists('..\..\..\Glacier.Gpu\src\Glacier.Gpu\Glacier.Gpu.csproj')">
     <ProjectReference Include="..\..\..\Glacier.Gpu\src\Glacier.Gpu\Glacier.Gpu.csproj" />
   </ItemGroup>
   <ItemGroup Condition="!Exists('..\..\..\Glacier.Gpu\src\Glacier.Gpu\Glacier.Gpu.csproj')">
-    <PackageReference Include="Glacier.Gpu" Version="1.0.7" />
+    <PackageReference Include="Glacier.Gpu" Version="1.0.8" />
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Glacier.Polaris" Version="1.0.17" />
+    <PackageReference Include="Glacier.Polaris" Version="1.0.19" />
   </ItemGroup>
 </Project>
