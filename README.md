@@ -189,6 +189,15 @@ dotnet run -c Release --project samples/Glacier.Tune.Demo -- --merge \
 
 ---
 
+## 🆕 What's New in v1.0.6
+
+- **Zero-Dependency Pluggable Logging (`GlacierDiagnostics`)** — Ambient logging subsystem (`LogLevel`, `IGlacierLogger`, `ConsoleGlacierLogger`, `DelegateGlacierLogger`, `NullGlacierLogger`) eliminating all 30 hardcoded `Console.*` calls across core library classes.
+- **`GpuLoraEngine` Modularization** — Partitioned monolithic 962-line class into 4 cohesive partial classes (`GpuLoraEngine.cs`, `GpuLoraEngine.Forward.cs`, `GpuLoraEngine.Backward.cs`, and `GpuLoraEngine.Memory.cs`), with all source files strictly $\le 414$ lines.
+- **`Glacier.Tune.Benchmarks` Microbenchmark Suite** — BenchmarkDotNet suite profiling hot LoRA training kernels (`LoraKernels`, `FusedCrossEntropyLoss`, `RoPEKernel`, `SwiGluKernel`).
+- **22 unit tests** passing (100% green).
+
+---
+
 ## 🆕 What's New in v1.0.5
 
 - **`AutogradScratchWorkspace`** — eliminates 26 GB/step gradient buffer allocation churn by reusing a single pre-allocated scratch arena across all backward passes.
