@@ -8,4 +8,7 @@
   <Folder Name="/tests/">
     <Project Path="tests/Glacier.Tune.Tests/Glacier.Tune.Tests.csproj" />
   </Folder>
+  <Folder Name="/benchmarks/">
+    <Project Path="benchmarks/Glacier.Tune.Benchmarks/Glacier.Tune.Benchmarks.csproj" />
+  </Folder>
 </Solution>

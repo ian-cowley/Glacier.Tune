@@ -6,6 +6,7 @@ using Glacier.Inference.Model;
 using Glacier.Tensor.Compute;
 using Glacier.Tensor.Core;
 using Glacier.Tune.Config;
+using Glacier.Tune.Diagnostics;
 using Glacier.Tune.Kernels;
 
 namespace Glacier.Tune.Model;
@@ -307,7 +308,7 @@ public sealed unsafe class TransformerBlock : IDisposable
         if (swDbg is not null)
         {
             tDown = swDbg.ElapsedMilliseconds;
-            Console.WriteLine($"\n      [LAYER 0 FWD BREAKDOWN] Norm1: {tNorm1}ms | QKV: {tQkv}ms | RoPE: {tRope}ms | Attn: {tAttn}ms | O: {tO}ms | Norm2: {tNorm2}ms | FFN(Gate/Up/SwiGLU/Down): {tDown}ms");
+            GlacierDiagnostics.LogDebug($"[LAYER 0 FWD BREAKDOWN] Norm1: {tNorm1}ms | QKV: {tQkv}ms | RoPE: {tRope}ms | Attn: {tAttn}ms | O: {tO}ms | Norm2: {tNorm2}ms | FFN(Gate/Up/SwiGLU/Down): {tDown}ms");
         }
 
         if (!saveActivations)
@@ -442,7 +443,7 @@ public sealed unsafe class TransformerBlock : IDisposable
         if (swDbg is not null)
         {
             tNorm1Bwd = swDbg.ElapsedMilliseconds;
-            Console.WriteLine($"      [LAYER 0 BWD BREAKDOWN] Down: {tDownBwd}ms | SwiGLU: {tSwigluBwd}ms | GateUp: {tGateUpBwd}ms | Norm2: {tNorm2Bwd}ms | O: {tOBwd}ms | Attn: {tAttnBwd}ms | RoPE: {tRopeBwd}ms | QKV: {tQkvBwd}ms | Norm1: {tNorm1Bwd}ms");
+            GlacierDiagnostics.LogDebug($"[LAYER 0 BWD BREAKDOWN] Down: {tDownBwd}ms | SwiGLU: {tSwigluBwd}ms | GateUp: {tGateUpBwd}ms | Norm2: {tNorm2Bwd}ms | O: {tOBwd}ms | Attn: {tAttnBwd}ms | RoPE: {tRopeBwd}ms | QKV: {tQkvBwd}ms | Norm1: {tNorm1Bwd}ms");
         }
 
         // Residual connection: dXInput = dX1 + dX_norm

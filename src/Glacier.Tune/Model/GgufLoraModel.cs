@@ -11,6 +11,7 @@ using Glacier.Inference.Tokenizer;
 using Glacier.Tensor.Compute;
 using Glacier.Tensor.Core;
 using Glacier.Tune.Config;
+using Glacier.Tune.Diagnostics;
 using Glacier.Tune.Kernels;
 
 namespace Glacier.Tune.Model;
@@ -67,9 +68,7 @@ public sealed unsafe class GgufLoraModel : IDisposable
             }
             catch (Exception ex)
             {
-                Console.ForegroundColor = ConsoleColor.Yellow;
-                Console.WriteLine($"[GPU WARNING] Failed to initialize GPU VRAM base engine ({ex.Message}). Falling back to CPU memory-mapped base execution.");
-                Console.ResetColor();
+                GlacierDiagnostics.LogWarning($"[GPU WARNING] Failed to initialize GPU VRAM base engine ({ex.Message}). Falling back to CPU memory-mapped base execution.", ex);
                 _gpuEngine = null;
             }
         }
@@ -227,7 +226,7 @@ public sealed unsafe class GgufLoraModel : IDisposable
             currentDX = dXPrev;
         }
 
-        Console.WriteLine($"\n    [PROFILE] Fwd: {swFwd.ElapsedMilliseconds} ms | Loss: {swLoss.ElapsedMilliseconds} ms | Recompute: {(checkpointActivations ? swRecompute.ElapsedMilliseconds : 0)} ms | Bwd: {swBwd.ElapsedMilliseconds} ms");
+        GlacierDiagnostics.LogDebug($"[PROFILE] Fwd: {swFwd.ElapsedMilliseconds} ms | Loss: {swLoss.ElapsedMilliseconds} ms | Recompute: {(checkpointActivations ? swRecompute.ElapsedMilliseconds : 0)} ms | Bwd: {swBwd.ElapsedMilliseconds} ms");
 
         // Cleanup activation checkpoints
         for (int l = 0; l < LayerCount; l++)

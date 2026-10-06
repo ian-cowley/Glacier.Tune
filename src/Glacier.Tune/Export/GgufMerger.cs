@@ -12,6 +12,7 @@ using System.Threading.Tasks;
 using Glacier.Inference.Gguf;
 using Glacier.Inference.Model;
 using Glacier.Inference.Quant;
+using Glacier.Tune.Diagnostics;
 
 /// <summary>
 /// High-performance standalone GGUF model merger.
@@ -34,7 +35,7 @@ public static unsafe class GgufMerger
     /// </summary>
     public static void Merge(string baseGgufPath, string adapterBinPath, string outputGgufPath, MergeOptions? options = null)
     {
-        var progress = options?.ProgressCallback ?? Console.WriteLine;
+        var progress = options?.ProgressCallback ?? (msg => GlacierDiagnostics.LogInformation(msg));
 
         if (!File.Exists(baseGgufPath))
             throw new FileNotFoundException($"Base GGUF model not found: {baseGgufPath}");
