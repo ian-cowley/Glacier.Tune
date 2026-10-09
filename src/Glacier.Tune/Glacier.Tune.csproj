@@ -32,7 +32,7 @@
     <ProjectReference Include="..\..\..\Glacier.Inference\src\Glacier.Inference\Glacier.Inference.csproj" />
   </ItemGroup>
   <ItemGroup Condition="!Exists('..\..\..\Glacier.Inference\src\Glacier.Inference\Glacier.Inference.csproj')">
-    <PackageReference Include="Glacier.Inference" Version="1.2.3" />
+    <PackageReference Include="Glacier.Inference" Version="1.2.19" />
   </ItemGroup>
 
   <ItemGroup Condition="Exists('..\..\..\Glacier.Tensor\src\Glacier.Tensor\Glacier.Tensor.csproj')">
@@ -50,6 +50,6 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Glacier.Polaris" Version="1.0.19" />
+    <PackageReference Include="Glacier.Polaris" Version="1.0.20" />
   </ItemGroup>
 </Project>
