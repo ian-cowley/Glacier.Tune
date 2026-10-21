@@ -33,10 +33,20 @@ public sealed class ChatMlDataset
         {
             if (string.IsNullOrWhiteSpace(line)) continue;
 
-            ChatConversation? conv;
+            ChatConversation? conv = null;
             try
             {
-                conv = JsonSerializer.Deserialize<ChatConversation>(line);
+                using var doc = JsonDocument.Parse(line);
+                if (doc.RootElement.TryGetProperty("messages", out var messagesElem) && messagesElem.ValueKind == JsonValueKind.Array)
+                {
+                    conv = new ChatConversation();
+                    foreach (var item in messagesElem.EnumerateArray())
+                    {
+                        string role = item.TryGetProperty("role", out var r) ? (r.GetString() ?? "") : "";
+                        string content = item.TryGetProperty("content", out var c) ? (c.GetString() ?? "") : "";
+                        conv.Messages.Add(new ChatMessage { Role = role, Content = content });
+                    }
+                }
             }
             catch
             {
@@ -79,6 +89,17 @@ public sealed class ChatMlDataset
             if (inputIds.Count >= maxSeqLength) break;
         }
 
-        return new TrainingExample(inputIds.ToArray(), labels.ToArray());
+        // Causal Language Modeling shift: token at position t predicts token at position t + 1
+        var shiftedLabels = new int[labels.Count];
+        for (int i = 0; i < labels.Count - 1; i++)
+        {
+            shiftedLabels[i] = labels[i + 1];
+        }
+        if (labels.Count > 0)
+        {
+            shiftedLabels[labels.Count - 1] = IgnoreIndex;
+        }
+
+        return new TrainingExample(inputIds.ToArray(), shiftedLabels);
     }
 }

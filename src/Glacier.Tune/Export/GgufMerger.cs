@@ -15,10 +15,48 @@ using Glacier.Inference.Quant;
 using Glacier.Tune.Diagnostics;
 
 /// <summary>
+/// Target quantization representation for adapted LoRA projections.
+/// </summary>
+public enum TargetQuantization
+{
+    /// <summary>
+    /// Auto-select quantization based on base tensor type (defaults to Q4_K for Q4_K/Q6_K).
+    /// </summary>
+    Auto,
+
+    /// <summary>
+    /// Super-block 4-bit k-quantization (256 weights in 144 bytes, 4.5 bpw).
+    /// </summary>
+    Q4_K,
+
+    /// <summary>
+    /// Standard 4-bit quantization (32 weights in 18 bytes, 4.5 bpw).
+    /// </summary>
+    Q4_0,
+
+    /// <summary>
+    /// Standard 8-bit quantization (32 weights in 34 bytes, 8.5 bpw).
+    /// </summary>
+    Q8_0
+}
+
+/// <summary>
+/// Result metadata of GGUF LoRA model merge.
+/// </summary>
+public sealed class MergeResult
+{
+    public string OutputPath { get; init; } = string.Empty;
+    public long OutputSizeBytes { get; init; }
+    public int AdaptedTensorCount { get; init; }
+    public int PreservedTensorCount { get; init; }
+    public TimeSpan Elapsed { get; init; }
+}
+
+/// <summary>
 /// High-performance standalone GGUF model merger.
 /// Fuses trained LoRA low-rank delta adapters directly into base model GGUF weights,
-/// converting adapted layers into lossless Q8_0 quantized representations while preserving
-/// non-adapted layers, tokenizer vocabulary, and all GGUF metadata intact.
+/// converting adapted layers into lossless Q8_0 or compact Q4_K/Q4_0 quantized representations
+/// while preserving non-adapted layers, tokenizer vocabulary, and all GGUF metadata intact.
 /// 100% pure C# .NET 10 with AVX-512/AVX2 multithreading.
 /// </summary>
 public static unsafe class GgufMerger
@@ -27,15 +65,17 @@ public static unsafe class GgufMerger
     {
         public Action<string>? ProgressCallback { get; init; }
         public int MaxDegreeOfParallelism { get; init; } = Environment.ProcessorCount;
+        public TargetQuantization TargetQuantization { get; init; } = TargetQuantization.Auto;
     }
 
     /// <summary>
     /// Merges binary LoRA adapter weights directly into a base GGUF model and writes
     /// a standalone, production-ready GGUF model file.
     /// </summary>
-    public static void Merge(string baseGgufPath, string adapterBinPath, string outputGgufPath, MergeOptions? options = null)
+    public static MergeResult Merge(string baseGgufPath, string adapterBinPath, string outputGgufPath, MergeOptions? options = null)
     {
         var progress = options?.ProgressCallback ?? (msg => GlacierDiagnostics.LogInformation(msg));
+        var targetQuant = options?.TargetQuantization ?? TargetQuantization.Auto;
 
         if (!File.Exists(baseGgufPath))
             throw new FileNotFoundException($"Base GGUF model not found: {baseGgufPath}");
@@ -109,11 +149,11 @@ public static unsafe class GgufMerger
             if (isAdapted)
             {
                 adaptedCount++;
-                newType = GgufType.Q8_0;
                 int inDim = (int)t.Dimensions[0];
                 int outDim = (int)t.Dimensions[1];
-                int q8RowBytes = (inDim / 32) * 34;
-                newSize = (ulong)outDim * (ulong)q8RowBytes;
+                newType = ResolveTargetType(targetQuant, t.Type, inDim);
+                int rowBytes = GetRowByteSize(newType, inDim);
+                newSize = (ulong)outDim * (ulong)rowBytes;
             }
             else
             {
@@ -135,7 +175,7 @@ public static unsafe class GgufMerger
             currentPayloadOffset += newSize;
         }
 
-        progress($"  Adapted Projections: {adaptedCount} (fused into lossless Q8_0)");
+        progress($"  Adapted Projections: {adaptedCount} (fused into target {targetQuant})");
         progress($"  Non-Adapted Tensors: {nonAdaptedCount} (preserved bit-exact)");
         progress($"  Header End Offset:   {totalHeaderBytes:N0} bytes");
         progress($"  Tensor Data Offset:  {tensorDataOffset:N0} bytes (aligned to {baseGguf.Alignment} bytes)");
@@ -207,7 +247,7 @@ public static unsafe class GgufMerger
             }
             else
             {
-                // Adapted projection: multithreaded dequantize + LoRA delta fusion + Q8_0 quantize
+                // Adapted projection: multithreaded dequantize + LoRA delta fusion + target quantize
                 TryGetLoraProjection(t.Name, out int layer, out LoraProjection proj);
                 if (layer != lastReportedLayer)
                 {
@@ -217,8 +257,9 @@ public static unsafe class GgufMerger
 
                 int inDim = (int)t.Dimensions[0];
                 int outDim = (int)t.Dimensions[1];
-                int q8RowBytes = (inDim / 32) * 34;
-                ulong totalTensorBytes = (ulong)outDim * (ulong)q8RowBytes;
+                GgufType targetType = newTypes[i];
+                int rowBytes = GetRowByteSize(targetType, inDim);
+                ulong totalTensorBytes = (ulong)outDim * (ulong)rowBytes;
 
                 byte* pDst = (byte*)NativeMemory.Alloc((nuint)totalTensorBytes);
                 try
@@ -283,16 +324,29 @@ public static unsafe class GgufMerger
                                     }
                                 }
 
-                                // 4. Quantize fused row to Q8_0 blocks
-                                byte* dstRow = curDst + (long)r * q8RowBytes;
-                                QuantizeRowQ8_0(rowFloats, (BlockQ8_0*)dstRow, inDim);
+                                // 4. Quantize fused row to target blocks
+                                byte* dstRow = curDst + (long)r * rowBytes;
+                                switch (targetType)
+                                {
+                                    case GgufType.Q4_K:
+                                        QuantizeRowQ4_K(rowFloats, (BlockQ4_K*)dstRow, inDim);
+                                        break;
+                                    case GgufType.Q4_0:
+                                        QuantizeRowQ4_0(rowFloats, (BlockQ4_0*)dstRow, inDim);
+                                        break;
+                                    case GgufType.Q8_0:
+                                        QuantizeRowQ8_0(rowFloats, (BlockQ8_0*)dstRow, inDim);
+                                        break;
+                                    default:
+                                        throw new NotSupportedException($"Unsupported target quantization: {targetType}");
+                                }
                             }
                             return rowArr;
                         },
                         rowArr => ArrayPool<float>.Shared.Return(rowArr));
                     }
 
-                    // Write fused Q8_0 tensor bytes
+                    // Write fused tensor bytes
                     byte* pWrite = pDst;
                     ulong remaining = totalTensorBytes;
                     byte[] streamBuf = new byte[Math.Min(16 * 1024 * 1024, (int)Math.Min((ulong)int.MaxValue, remaining))];
@@ -320,6 +374,15 @@ public static unsafe class GgufMerger
         progress($"  Output Path: {outputGgufPath}");
         progress($"  Final Size:  {finalLength:N0} bytes ({finalLength / (1024.0 * 1024.0 * 1024.0):F2} GB)");
         progress($"  Time Taken:  {sw.Elapsed.TotalMinutes:F2} min ({sw.Elapsed.TotalSeconds:F1} s)");
+
+        return new MergeResult
+        {
+            OutputPath = outputGgufPath,
+            OutputSizeBytes = finalLength,
+            AdaptedTensorCount = adaptedCount,
+            PreservedTensorCount = nonAdaptedCount,
+            Elapsed = sw.Elapsed
+        };
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -354,6 +417,238 @@ public static unsafe class GgufMerger
                 int q = (int)MathF.Round(blockSrc[i] * invScale);
                 blockDst->Qs[i] = (sbyte)Math.Clamp(q, -128, 127);
             }
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static GgufType ResolveTargetType(TargetQuantization target, GgufType baseType, int inDim)
+    {
+        GgufType resolved = target switch
+        {
+            TargetQuantization.Q4_K => GgufType.Q4_K,
+            TargetQuantization.Q4_0 => GgufType.Q4_0,
+            TargetQuantization.Q8_0 => GgufType.Q8_0,
+            TargetQuantization.Auto => baseType switch
+            {
+                GgufType.Q4_0 => GgufType.Q4_0,
+                GgufType.Q8_0 => GgufType.Q8_0,
+                _ => GgufType.Q4_K
+            },
+            _ => GgufType.Q4_K
+        };
+
+        if (resolved == GgufType.Q4_K && inDim % 256 != 0)
+        {
+            resolved = GgufType.Q4_0;
+        }
+
+        return resolved;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static int GetRowByteSize(GgufType type, int inDim)
+    {
+        return type switch
+        {
+            GgufType.Q4_K => (inDim / 256) * sizeof(BlockQ4_K),
+            GgufType.Q4_0 => (inDim / 32) * sizeof(BlockQ4_0),
+            GgufType.Q8_0 => (inDim / 32) * sizeof(BlockQ8_0),
+            _ => throw new NotSupportedException($"Target quantization type {type} is not supported for LoRA fusion.")
+        };
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void QuantizeRowQ4_0(float* src, BlockQ4_0* dst, int n)
+    {
+        int numBlocks = n / 32;
+        for (int b = 0; b < numBlocks; b++)
+        {
+            float* blockSrc = src + b * 32;
+            BlockQ4_0* blockDst = dst + b;
+
+            float amax = 0.0f;
+            float max = 0.0f;
+            for (int i = 0; i < 32; i++)
+            {
+                float v = blockSrc[i];
+                float abs = MathF.Abs(v);
+                if (abs > amax)
+                {
+                    amax = abs;
+                    max = v;
+                }
+            }
+
+            if (amax == 0.0f)
+            {
+                blockDst->Delta = (Half)0f;
+                for (int l = 0; l < 16; l++)
+                {
+                    blockDst->Qs[l] = 0x88;
+                }
+                continue;
+            }
+
+            float d = max / -8.0f;
+            float id = d != 0f ? 1.0f / d : 0.0f;
+            blockDst->Delta = (Half)d;
+
+            for (int l = 0; l < 16; l++)
+            {
+                float x0 = blockSrc[l] * id;
+                float x1 = blockSrc[l + 16] * id;
+                int q0 = Math.Clamp((int)MathF.Round(x0) + 8, 0, 15);
+                int q1 = Math.Clamp((int)MathF.Round(x1) + 8, 0, 15);
+                blockDst->Qs[l] = (byte)(q0 | (q1 << 4));
+            }
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void DequantizeRowQ4_0(BlockQ4_0* src, float* dst, int n)
+    {
+        int numBlocks = n / 32;
+        for (int b = 0; b < numBlocks; b++)
+        {
+            float d = (float)src[b].Delta;
+            for (int l = 0; l < 16; l++)
+            {
+                byte v = src[b].Qs[l];
+                dst[b * 32 + l] = ((v & 0x0F) - 8) * d;
+                dst[b * 32 + l + 16] = ((v >> 4) - 8) * d;
+            }
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void QuantizeRowQ4_K(float* src, BlockQ4_K* dst, int n)
+    {
+        int numSuperBlocks = n / 256;
+        float* subScale = stackalloc float[8];
+        float* subMin = stackalloc float[8];
+        byte* sc = stackalloc byte[8];
+        byte* m = stackalloc byte[8];
+        byte* L = stackalloc byte[256];
+
+        for (int sb = 0; sb < numSuperBlocks; sb++)
+        {
+            float* sbSrc = src + sb * 256;
+            BlockQ4_K* sbDst = dst + sb;
+
+            float maxScale = 0f;
+            float maxMin = 0f;
+
+            for (int ib = 0; ib < 8; ib++)
+            {
+                float* bSrc = sbSrc + ib * 32;
+                float bMin = bSrc[0];
+                float bMax = bSrc[0];
+                for (int i = 1; i < 32; i++)
+                {
+                    float v = bSrc[i];
+                    if (v < bMin) bMin = v;
+                    if (v > bMax) bMax = v;
+                }
+
+                if (bMin > 0f) bMin = 0f;
+                float range = bMax - bMin;
+                float scale = range / 15.0f;
+                subScale[ib] = scale;
+                if (scale > maxScale) maxScale = scale;
+
+                float minOffset = -bMin;
+                subMin[ib] = minOffset;
+                if (minOffset > maxMin) maxMin = minOffset;
+            }
+
+            float invScale = maxScale > 0f ? 63.0f / maxScale : 0f;
+            float invMin = maxMin > 0f ? 63.0f / maxMin : 0f;
+
+            for (int ib = 0; ib < 8; ib++)
+            {
+                int scQuant = (int)MathF.Round(subScale[ib] * invScale);
+                sc[ib] = (byte)Math.Clamp(scQuant, 0, 63);
+
+                int mQuant = (int)MathF.Round(subMin[ib] * invMin);
+                m[ib] = (byte)Math.Clamp(mQuant, 0, 63);
+            }
+
+            // Pack 8 6-bit scales and 8 6-bit mins into Scales[12]
+            new Span<byte>(sbDst->Scales, 12).Clear();
+            for (int j = 0; j < 8; j++)
+            {
+                SetScaleMinK4(j, sbDst->Scales, sc[j], m[j]);
+            }
+
+            sbDst->Delta = (Half)(maxScale / 63.0f);
+            sbDst->DeltaMin = (Half)(maxMin / 63.0f);
+
+            float dSuper = (float)sbDst->Delta;
+            float dminSuper = (float)sbDst->DeltaMin;
+
+            for (int ib = 0; ib < 8; ib++)
+            {
+                float d = dSuper * sc[ib];
+                float dm = dminSuper * m[ib];
+                float invD = d > 0f ? 1.0f / d : 0f;
+
+                float* bSrc = sbSrc + ib * 32;
+                byte* bL = L + ib * 32;
+
+                for (int i = 0; i < 32; i++)
+                {
+                    int q = invD > 0f ? (int)MathF.Round((bSrc[i] + dm) * invD) : 0;
+                    bL[i] = (byte)Math.Clamp(q, 0, 15);
+                }
+            }
+
+            // Pack 256 4-bit quants into 128 bytes (pairs of 32-element sub-blocks)
+            byte* qDst = sbDst->Qs;
+            for (int g = 0; g < 256; g += 64)
+            {
+                for (int l = 0; l < 32; l++)
+                {
+                    qDst[l] = (byte)(L[g + l] | (L[g + l + 32] << 4));
+                }
+                qDst += 32;
+            }
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void DequantizeRowQ4_K(BlockQ4_K* src, float* dst, int n)
+    {
+        QuantKernels.DequantizeQ4_K(src, dst, n);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void SetScaleMinK4(int j, byte* scales, byte sc, byte m)
+    {
+        if (j < 4)
+        {
+            scales[j] = (byte)((scales[j] & 0xC0) | (sc & 0x3F));
+            scales[j + 4] = (byte)((scales[j + 4] & 0xC0) | (m & 0x3F));
+        }
+        else
+        {
+            scales[j + 4] = (byte)((sc & 0x0F) | ((m & 0x0F) << 4));
+            scales[j - 4] = (byte)((scales[j - 4] & 0x3F) | ((sc >> 4) << 6));
+            scales[j]     = (byte)((scales[j] & 0x3F)     | ((m >> 4) << 6));
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void GetScaleMinK4(int j, byte* q, out byte d, out byte m)
+    {
+        if (j < 4)
+        {
+            d = (byte)(q[j] & 63);
+            m = (byte)(q[j + 4] & 63);
+        }
+        else
+        {
+            d = (byte)((q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4));
+            m = (byte)((q[j + 4] >> 4)   | ((q[j] >> 6) << 4));
         }
     }
 

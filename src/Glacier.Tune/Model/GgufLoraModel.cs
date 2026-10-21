@@ -31,6 +31,7 @@ public sealed unsafe class GgufLoraModel : IDisposable
     private readonly Glacier.Tune.Gpu.GpuLoraEngine? _gpuEngine;
     private readonly List<TransformerBlock> _blocks = [];
     private readonly List<Tensor<float>> _trainableParameters = [];
+    private readonly Tensor<float> _wFinalNorm;
     private bool _disposed;
 
     public GgufFile Gguf => _gguf;
@@ -53,6 +54,7 @@ public sealed unsafe class GgufLoraModel : IDisposable
         _tokenizer = tokenizer;
         _config = config;
         _target = target;
+        _wFinalNorm = Tensor<float>.FromSpan(new ReadOnlySpan<float>(_weights.OutNormWeight, _weights.EmbeddingLength), [_weights.EmbeddingLength]);
 
         InitializeBlocks();
 
@@ -103,7 +105,7 @@ public sealed unsafe class GgufLoraModel : IDisposable
 
     private void InitializeBlocks()
     {
-        int headDim = _weights.HeadCount > 0 ? _weights.EmbeddingLength / _weights.HeadCount : 128;
+        int headDim = _weights.HeadDim;
 
         for (int l = 0; l < _weights.BlockCount; l++)
         {
@@ -164,10 +166,7 @@ public sealed unsafe class GgufLoraModel : IDisposable
 
         // 3. Final Output RMSNorm: normOut = RMSNorm(xFinalLayer, out_norm)
         using var finalNormOut = new Tensor<float>(seqLen, HiddenDim);
-        using (var wFinalNorm = Tensor<float>.FromSpan(new ReadOnlySpan<float>(_weights.OutNormWeight, HiddenDim), [HiddenDim]))
-        {
-            ElementwiseKernels.RMSNorm(xFinalLayer, wFinalNorm, finalNormOut, _weights.RmsNormEps);
-        }
+        ElementwiseKernels.RMSNorm(xFinalLayer, _wFinalNorm, finalNormOut, _weights.RmsNormEps);
 
         // 4. Fused Cross-Entropy Loss & Output Gradient (dXFinalNorm)
         var swLoss = Stopwatch.StartNew();
@@ -186,10 +185,7 @@ public sealed unsafe class GgufLoraModel : IDisposable
 
         // 5. Final Output RMSNorm Backward -> dXFinalLayer
         using var dXFinalLayer = new Tensor<float>(seqLen, HiddenDim);
-        using (var wFinalNorm = Tensor<float>.FromSpan(new ReadOnlySpan<float>(_weights.OutNormWeight, HiddenDim), [HiddenDim]))
-        {
-            ElementwiseKernels.RMSNormBackward(dFinalNormOut, xFinalLayer, wFinalNorm, dXFinalLayer, null, _weights.RmsNormEps);
-        }
+        ElementwiseKernels.RMSNormBackward(dFinalNormOut, xFinalLayer, _wFinalNorm, dXFinalLayer, null, _weights.RmsNormEps);
 
         // 6. Reverse-Mode Backpropagation
         var swRecompute = new Stopwatch();
@@ -249,7 +245,7 @@ public sealed unsafe class GgufLoraModel : IDisposable
             trainable += count;
         }
 
-        int headDim = _weights.HeadCount > 0 ? _weights.EmbeddingLength / _weights.HeadCount : 128;
+        int headDim = _weights.HeadDim;
 
         long totalBase = (long)_weights.BlockCount * (
             ((long)_weights.EmbeddingLength * _weights.EmbeddingLength * 2) +
@@ -261,26 +257,43 @@ public sealed unsafe class GgufLoraModel : IDisposable
         return (trainable, totalBase, pct);
     }
 
-    public void SaveAdapter(string outputDir)
+    public void SaveAdapter(string outputDirOrPath)
     {
-        Directory.CreateDirectory(outputDir);
-
-        var adapterConfig = new Dictionary<string, object>
+        string outputDir;
+        string binPath;
+        if (outputDirOrPath.EndsWith(".bin", StringComparison.OrdinalIgnoreCase))
         {
-            ["base_model_name_or_path"] = _gguf.Architecture,
-            ["r"] = _config.Rank,
-            ["lora_alpha"] = _config.Alpha,
-            ["lora_dropout"] = _config.Dropout,
-            ["target_modules"] = _config.TargetModules,
-            ["bias"] = _config.Bias,
-            ["peft_type"] = "LORA",
-            ["task_type"] = "CAUSAL_LM"
-        };
+            outputDir = Path.GetDirectoryName(outputDirOrPath) ?? ".";
+            binPath = outputDirOrPath;
+        }
+        else
+        {
+            outputDir = outputDirOrPath;
+            binPath = Path.Combine(outputDir, "adapter_model.bin");
+        }
 
-        string configJson = JsonSerializer.Serialize(adapterConfig, new JsonSerializerOptions { WriteIndented = true });
+        if (!string.IsNullOrEmpty(outputDir))
+        {
+            Directory.CreateDirectory(outputDir);
+        }
+
+        string targetModulesJson = string.Join("\",\n    \"", _config.TargetModules);
+        string configJson = $$"""
+{
+  "base_model_name_or_path": "{{_gguf.Architecture}}",
+  "r": {{_config.Rank}},
+  "lora_alpha": {{_config.Alpha}},
+  "lora_dropout": {{_config.Dropout}},
+  "target_modules": [
+    "{{targetModulesJson}}"
+  ],
+  "bias": "{{_config.Bias}}",
+  "peft_type": "LORA",
+  "task_type": "CAUSAL_LM"
+}
+""";
         File.WriteAllText(Path.Combine(outputDir, "adapter_config.json"), configJson);
 
-        string binPath = Path.Combine(outputDir, "adapter_model.bin");
         using (var fs = File.Create(binPath))
         using (var bw = new BinaryWriter(fs))
         {
@@ -331,6 +344,114 @@ public sealed unsafe class GgufLoraModel : IDisposable
         }
     }
 
+    /// <summary>
+    /// Loads saved LoRA adapter weights from an adapter binary file (or directory containing adapter_model.bin)
+    /// into all transformer blocks for training resumption or evaluation.
+    /// Supports all 7 linear projections (Wq, Wk, Wv, Wo, Wgate, Wup, Wdown).
+    /// </summary>
+    public void LoadAdapter(string adapterFilePath)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        string binPath;
+        if (File.Exists(adapterFilePath))
+        {
+            binPath = adapterFilePath;
+        }
+        else if (Directory.Exists(adapterFilePath) && File.Exists(Path.Combine(adapterFilePath, "adapter_model.bin")))
+        {
+            binPath = Path.Combine(adapterFilePath, "adapter_model.bin");
+        }
+        else
+        {
+            throw new FileNotFoundException($"LoRA adapter file not found: {adapterFilePath}");
+        }
+
+        using var fs = File.OpenRead(binPath);
+        using var br = new BinaryReader(fs);
+
+        uint magic = br.ReadUInt32();
+        if (magic != 0x41524F4C)
+            throw new InvalidDataException($"Invalid LoRA magic header: 0x{magic:X8} (expected 0x41524F4C 'LORA')");
+
+        uint version = br.ReadUInt32();
+        if (version != 1)
+            throw new InvalidDataException($"Unsupported LoRA adapter version: {version}");
+
+        int layerCount = br.ReadInt32();
+        int rank = br.ReadInt32();
+        float alpha = br.ReadSingle();
+        int tensorCount = br.ReadInt32();
+
+        int loadedCount = 0;
+
+        for (int t = 0; t < tensorCount; t++)
+        {
+            string name = br.ReadString();
+            int dim0 = br.ReadInt32();
+            int dim1 = br.ReadInt32();
+            long byteCount = (long)dim0 * dim1 * sizeof(float);
+
+            Tensor<float>? targetTensor = FindTargetTensor(name, dim0, dim1);
+            if (targetTensor != null)
+            {
+                var span = targetTensor.AsSpan();
+                var byteSpan = MemoryMarshal.AsBytes(span);
+                fs.ReadExactly(byteSpan);
+                loadedCount++;
+            }
+            else
+            {
+                // Unrecognized or dimension-mismatched tensor; seek past it
+                fs.Seek(byteCount, SeekOrigin.Current);
+            }
+        }
+
+        GlacierDiagnostics.LogInformation($"[LORA] Successfully loaded {loadedCount}/{tensorCount} adapter tensors across {Math.Min(layerCount, _blocks.Count)} layers (rank={rank}, alpha={alpha}).");
+    }
+
+    private Tensor<float>? FindTargetTensor(string name, int dim0, int dim1)
+    {
+        // Name format: blk.{l}.{proj}.{matrix}.weight
+        // e.g. blk.0.attn_q.lora_a.weight or blk.0.q_proj.lora_a.weight
+        var parts = name.Split('.');
+        if (parts.Length >= 5 && parts[0] == "blk" && int.TryParse(parts[1], out int layerIdx) && layerIdx < _blocks.Count)
+        {
+            var b = _blocks[layerIdx];
+            string proj = parts[2];
+            string matrix = parts[3];
+
+            LoraAdapter? adapter = proj switch
+            {
+                "attn_q" or "q_proj" => b.QProj,
+                "attn_k" or "k_proj" => b.KProj,
+                "attn_v" or "v_proj" => b.VProj,
+                "attn_output" or "o_proj" => b.OProj,
+                "ffn_gate" or "gate_proj" => b.GateProj,
+                "ffn_up" or "up_proj" => b.UpProj,
+                "ffn_down" or "down_proj" => b.DownProj,
+                _ => null
+            };
+
+            if (adapter != null)
+            {
+                Tensor<float>? tensor = matrix switch
+                {
+                    "lora_a" => adapter.AdapterA,
+                    "lora_b" => adapter.AdapterB,
+                    _ => null
+                };
+
+                if (tensor != null && tensor.Shape[0] == dim0 && tensor.Shape[1] == dim1)
+                {
+                    return tensor;
+                }
+            }
+        }
+
+        return null;
+    }
+
     private static void WriteTensor(BinaryWriter bw, string name, Tensor<float> tensor)
     {
         bw.Write(name);
@@ -346,6 +467,7 @@ public sealed unsafe class GgufLoraModel : IDisposable
         if (!_disposed)
         {
             _disposed = true;
+            _wFinalNorm.Dispose();
             _gpuEngine?.Dispose();
             foreach (var b in _blocks) b.Dispose();
             _blocks.Clear();

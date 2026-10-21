@@ -67,4 +67,55 @@ public class LoraModelTests
             }
         }
     }
+
+    [Fact]
+    public void TrainedAdapter_Qwen3_HeaderAndWeightsIntegrity()
+    {
+        string[] candidatePaths = [
+            Path.Combine(AppContext.BaseDirectory, "tune_output", "adapter_model.bin"),
+            @"C:\Users\spuri\source\repos\PolarsPlus\Glacier.Tune\tune_output\adapter_model.bin",
+            @"C:\Users\spuri\source\repos\PolarsPlus\tune_output\adapter_model.bin"
+        ];
+
+        string? binPath = null;
+        foreach (var p in candidatePaths)
+        {
+            if (File.Exists(p)) { binPath = p; break; }
+        }
+
+        if (binPath == null) return; // Skip if run before training
+
+        using var fs = File.OpenRead(binPath);
+        using var br = new BinaryReader(fs);
+
+        uint magic = br.ReadUInt32();
+        Assert.Equal(0x41524F4Cu, magic); // 'LORA'
+
+        uint version = br.ReadUInt32();
+        Assert.Equal(1u, version);
+
+        int layerCount = br.ReadInt32();
+        Assert.True(layerCount == 28 || layerCount == 36, $"Expected 28 (Qwen2.5-7B) or 36 (Qwen3-4B) layers, but got {layerCount}");
+
+        int rank = br.ReadInt32();
+        Assert.Equal(16, rank);
+
+        float alpha = br.ReadSingle();
+        Assert.Equal(32.0f, alpha);
+
+        int tensorCount = br.ReadInt32();
+        Assert.Equal(layerCount * 14, tensorCount); // 14 tensors per layer (7 projections * 2 matrices)
+
+        for (int t = 0; t < tensorCount; t++)
+        {
+            string name = br.ReadString();
+            int dim0 = br.ReadInt32();
+            int dim1 = br.ReadInt32();
+            Assert.True(dim0 > 0 && dim1 > 0, $"Tensor {name} dimensions must be positive");
+            long bytes = (long)dim0 * dim1 * sizeof(float);
+            fs.Seek(bytes, SeekOrigin.Current);
+        }
+
+        Assert.Equal(fs.Length, fs.Position); // Exactly consumed to EOF
+    }
 }
