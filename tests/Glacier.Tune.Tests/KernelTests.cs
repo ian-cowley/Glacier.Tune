@@ -205,7 +205,7 @@ public unsafe class KernelTests
     public void FusedCrossEntropyLoss_ComputesExactGradient_WithAutogradParity()
     {
         const int seqLen = 4;
-        const int hiddenDim = 16;
+        const int hiddenDim = 32;
         const int vocabSize = 32;
 
         float[] finalHidden = new float[seqLen * hiddenDim];

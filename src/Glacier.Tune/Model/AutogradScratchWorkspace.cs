@@ -36,14 +36,6 @@ public sealed unsafe class AutogradScratchWorkspace : IDisposable
     private int _kvDim;
     private bool _disposed;
 
-    public int MaxSeqLen => _maxSeqLen;
-    public int HiddenDim => _hiddenDim;
-    public int FfnDim => _ffnDim;
-    public int QDim => _qDim;
-    public int KvDim => _kvDim;
-
-    public static AutogradScratchWorkspace? Current => s_threadLocalWorkspace.Value;
-
     public static AutogradScratchWorkspace GetOrCreate(int seqLen, int hiddenDim, int ffnDim, int nHeadsQ, int nHeadsKv, int headDim)
     {
         var ws = s_threadLocalWorkspace.Value;
@@ -133,44 +125,12 @@ public sealed unsafe class AutogradScratchWorkspace : IDisposable
     public static Tensor<float> Wrap(float* ptr, params ReadOnlySpan<int> shape)
     {
         var s = new Shape8(shape);
-        new Span<float>(ptr, (int)s.ElementCount).Clear();
         var strides = Shape8.ComputeContiguousStrides(s);
         var block = new NativeMemoryBlock<float>(ptr, s.ElementCount, ownsMemory: false);
         return new Tensor<float>(block, s, strides, 0);
     }
 
-    public static Tensor<float> Wrap(float* ptr, int dim0, int dim1)
-    {
-        long count = (long)dim0 * dim1;
-        new Span<float>(ptr, (int)count).Clear();
-        Span<int> dims = stackalloc int[2] { dim0, dim1 };
-        var s = new Shape8(dims);
-        var strides = Shape8.ComputeContiguousStrides(s);
-        var block = new NativeMemoryBlock<float>(ptr, count, ownsMemory: false);
-        return new Tensor<float>(block, s, strides, 0);
-    }
-
-    public static Tensor<float> Wrap(float* ptr, int dim0)
-    {
-        new Span<float>(ptr, dim0).Clear();
-        Span<int> dims = stackalloc int[1] { dim0 };
-        var s = new Shape8(dims);
-        var strides = Shape8.ComputeContiguousStrides(s);
-        var block = new NativeMemoryBlock<float>(ptr, dim0, ownsMemory: false);
-        return new Tensor<float>(block, s, strides, 0);
-    }
-
     public void Dispose()
-    {
-        if (!_disposed)
-        {
-            _disposed = true;
-            FreeAll();
-            GC.SuppressFinalize(this);
-        }
-    }
-
-    ~AutogradScratchWorkspace()
     {
         if (!_disposed)
         {

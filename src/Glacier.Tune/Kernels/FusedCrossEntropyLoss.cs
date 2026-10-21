@@ -16,136 +16,8 @@ namespace Glacier.Tune.Kernels;
 /// </summary>
 public static unsafe class FusedCrossEntropyLoss
 {
-    [ThreadStatic]
-    private static LossScratchArena? t_arena;
-    private static readonly ThreadLocal<float[]> s_threadLocalBuffer = new(() => new float[32768]);
+    private static readonly ThreadLocal<float[]> s_threadLocalBuffer = new(() => new float[8192]);
     private const int VocabTileSize = 4096;
-
-    /// <summary>
-    /// Thread-local persistent unmanaged memory workspace for fused cross-entropy calculations.
-    /// Completely eliminates heap and native memory reallocations during training steps.
-    /// </summary>
-    public sealed class LossScratchArena : IDisposable
-    {
-        public float* ValidHidden { get; private set; }
-        public float* TileLogits { get; private set; }
-        public float* RunningMax { get; private set; }
-        public float* RunningSumExp { get; private set; }
-        public float* TargetLogits { get; private set; }
-        public float* LogSumExp { get; private set; }
-        public int* ValidSeqIndices { get; private set; }
-        public float* GpuValidLogits { get; private set; }
-        public float* TempRow { get; private set; }
-
-        private int _maxValidCount;
-        private int _maxHiddenDim;
-        private int _maxTileSize;
-        private int _maxSeqLen;
-        private int _maxGpuVocabSize;
-        private bool _disposed;
-
-        public void EnsureCapacity(int seqLen, int validCount, int hiddenDim, int tileSize, int gpuVocabSize = 0)
-        {
-            ObjectDisposedException.ThrowIf(_disposed, this);
-
-            if (seqLen > _maxSeqLen || ValidSeqIndices == null)
-            {
-                if (ValidSeqIndices != null) NativeMemory.AlignedFree(ValidSeqIndices);
-                _maxSeqLen = Math.Max(seqLen, Math.Max(1024, _maxSeqLen * 2));
-                ValidSeqIndices = (int*)NativeMemory.AlignedAlloc((nuint)_maxSeqLen * sizeof(int), 64);
-            }
-
-            if (validCount > _maxValidCount || RunningMax == null)
-            {
-                FreeMetrics();
-                _maxValidCount = Math.Max(validCount, Math.Max(1024, _maxValidCount * 2));
-                RunningMax = (float*)NativeMemory.AlignedAlloc((nuint)_maxValidCount * sizeof(float), 64);
-                RunningSumExp = (float*)NativeMemory.AlignedAlloc((nuint)_maxValidCount * sizeof(float), 64);
-                TargetLogits = (float*)NativeMemory.AlignedAlloc((nuint)_maxValidCount * sizeof(float), 64);
-                LogSumExp = (float*)NativeMemory.AlignedAlloc((nuint)_maxValidCount * sizeof(float), 64);
-            }
-
-            int targetValidCount = Math.Max(validCount, _maxValidCount);
-            if (targetValidCount > _maxValidCount || hiddenDim > _maxHiddenDim || ValidHidden == null)
-            {
-                if (ValidHidden != null) NativeMemory.AlignedFree(ValidHidden);
-                _maxHiddenDim = Math.Max(hiddenDim, _maxHiddenDim);
-                ValidHidden = (float*)NativeMemory.AlignedAlloc((nuint)((long)targetValidCount * _maxHiddenDim) * sizeof(float), 64);
-            }
-
-            if (hiddenDim > _maxHiddenDim || TempRow == null)
-            {
-                if (TempRow != null) NativeMemory.AlignedFree(TempRow);
-                _maxHiddenDim = Math.Max(hiddenDim, _maxHiddenDim);
-                TempRow = (float*)NativeMemory.AlignedAlloc((nuint)Math.Max(32768, _maxHiddenDim) * sizeof(float), 64);
-            }
-
-            if (targetValidCount > _maxValidCount || tileSize > _maxTileSize || TileLogits == null)
-            {
-                if (TileLogits != null) NativeMemory.AlignedFree(TileLogits);
-                _maxTileSize = Math.Max(tileSize, _maxTileSize);
-                TileLogits = (float*)NativeMemory.AlignedAlloc((nuint)((long)targetValidCount * _maxTileSize) * sizeof(float), 64);
-            }
-
-            if (gpuVocabSize > 0 && (targetValidCount > _maxValidCount || gpuVocabSize > _maxGpuVocabSize || GpuValidLogits == null))
-            {
-                if (GpuValidLogits != null) NativeMemory.AlignedFree(GpuValidLogits);
-                _maxGpuVocabSize = Math.Max(gpuVocabSize, _maxGpuVocabSize);
-                GpuValidLogits = (float*)NativeMemory.AlignedAlloc((nuint)((long)targetValidCount * _maxGpuVocabSize) * sizeof(float), 64);
-            }
-        }
-
-        private void FreeMetrics()
-        {
-            if (RunningMax != null) { NativeMemory.AlignedFree(RunningMax); RunningMax = null; }
-            if (RunningSumExp != null) { NativeMemory.AlignedFree(RunningSumExp); RunningSumExp = null; }
-            if (TargetLogits != null) { NativeMemory.AlignedFree(TargetLogits); TargetLogits = null; }
-            if (LogSumExp != null) { NativeMemory.AlignedFree(LogSumExp); LogSumExp = null; }
-        }
-
-        private void FreeAll()
-        {
-            FreeMetrics();
-            if (ValidSeqIndices != null) { NativeMemory.AlignedFree(ValidSeqIndices); ValidSeqIndices = null; }
-            if (ValidHidden != null) { NativeMemory.AlignedFree(ValidHidden); ValidHidden = null; }
-            if (TileLogits != null) { NativeMemory.AlignedFree(TileLogits); TileLogits = null; }
-            if (GpuValidLogits != null) { NativeMemory.AlignedFree(GpuValidLogits); GpuValidLogits = null; }
-            if (TempRow != null) { NativeMemory.AlignedFree(TempRow); TempRow = null; }
-            _maxValidCount = 0;
-            _maxHiddenDim = 0;
-            _maxTileSize = 0;
-            _maxSeqLen = 0;
-            _maxGpuVocabSize = 0;
-        }
-
-        public void Dispose()
-        {
-            if (!_disposed)
-            {
-                _disposed = true;
-                FreeAll();
-                GC.SuppressFinalize(this);
-            }
-        }
-
-        ~LossScratchArena()
-        {
-            if (!_disposed)
-            {
-                _disposed = true;
-                FreeAll();
-            }
-        }
-    }
-
-    /// <summary>
-    /// Explicitly resets the thread-local scratch workspace.
-    /// </summary>
-    public static void ResetScratchWorkspace()
-    {
-        t_arena?.Dispose();
-        t_arena = null;
-    }
 
     public static float ComputeLossAndGradients(
         float* finalHidden, // [seqLen, hiddenDim]
@@ -161,20 +33,12 @@ public static unsafe class FusedCrossEntropyLoss
         // Clear hidden state gradients
         new Span<float>(dFinalHidden, seqLen * hiddenDim).Clear();
 
-        int actualTileSize = Math.Min(VocabTileSize, vocabSize);
-        bool isGpu = Glacier.Tune.Gpu.GpuLoraEngine.Current != null && Glacier.Tune.Gpu.GpuLoraEngine.Current.LmHeadWeight != IntPtr.Zero;
-
-        // 1. Acquire thread-local persistent arena and ensure capacity
-        var arena = t_arena ??= new LossScratchArena();
-        arena.EnsureCapacity(seqLen, Math.Min(seqLen, targetTokens.Length), hiddenDim, actualTileSize, isGpu ? vocabSize : 0);
-
-        int* validSeqIndices = arena.ValidSeqIndices;
+        // 1. Identify valid assistant target tokens (where target >= 0 and target < vocabSize)
+        int[] validSeqIndices = new int[seqLen];
         int validCount = 0;
-        int maxTokensToCheck = Math.Min(seqLen, targetTokens.Length);
-        for (int t = 0; t < maxTokensToCheck; t++)
+        for (int t = 0; t < seqLen; t++)
         {
-            int token = targetTokens[t];
-            if (token >= 0 && token < vocabSize)
+            if (t < targetTokens.Length && targetTokens[t] >= 0 && targetTokens[t] < vocabSize)
             {
                 validSeqIndices[validCount++] = t;
             }
@@ -185,8 +49,8 @@ public static unsafe class FusedCrossEntropyLoss
         float invValid = 1.0f / validCount;
         float totalLoss = 0.0f;
 
-        // 2. Pack valid hidden states into contiguous arena buffer [validCount, hiddenDim]
-        float* pValidHidden = arena.ValidHidden;
+        // 2. Pack valid hidden states into contiguous buffer [validCount, hiddenDim]
+        float* pValidHidden = (float*)NativeMemory.Alloc((nuint)(validCount * hiddenDim), sizeof(float));
 
         for (int i = 0; i < validCount; i++)
         {
@@ -197,32 +61,93 @@ public static unsafe class FusedCrossEntropyLoss
         }
 
         // 3. GPU execution branch (if GPU LoRA engine is configured)
-        if (isGpu)
+        if (Glacier.Tune.Gpu.GpuLoraEngine.Current != null && Glacier.Tune.Gpu.GpuLoraEngine.Current.LmHeadWeight != IntPtr.Zero)
         {
-            float* pValidLogits = arena.GpuValidLogits;
-            Glacier.Tune.Gpu.GpuLoraEngine.Current!.ComputeLmHeadLogits(
-                lmHeadType, Glacier.Tune.Gpu.GpuLoraEngine.Current.LmHeadWeight, pValidHidden, pValidLogits, hiddenDim, vocabSize, validCount);
+            float* pValidLogits = (float*)NativeMemory.Alloc((nuint)((long)validCount * vocabSize), sizeof(float));
+            try
+            {
+                Glacier.Tune.Gpu.GpuLoraEngine.Current.ComputeLmHeadLogits(
+                    lmHeadType, Glacier.Tune.Gpu.GpuLoraEngine.Current.LmHeadWeight, pValidHidden, pValidLogits, hiddenDim, vocabSize, validCount);
 
-            return ComputeGpuLossAndGradientsParallel(
-                pValidLogits, dFinalHidden, validSeqIndices, targetTokens, lmHeadType, lmHeadWeight, validCount, hiddenDim, vocabSize, invValid);
+                object lossLock = new();
+                Parallel.For<double>(0, validCount, () => 0.0, (i, loopState, localLoss) =>
+                {
+                    int t = validSeqIndices[i];
+                    int targetId = targetTokens[t];
+                    float* logits = pValidLogits + (long)i * vocabSize;
+                    float* dhVec = dFinalHidden + (long)t * hiddenDim;
+
+                    float maxLogit = VectorizedMax(logits, vocabSize);
+                    float sumExp = VectorizedSumExp(logits, vocabSize, maxLogit);
+                    float logSumExp = maxLogit + MathF.Log(sumExp);
+                    float targetLogit = logits[targetId];
+                    float tokenLoss = logSumExp - targetLogit;
+
+                    float pTarget = MathF.Exp(targetLogit - logSumExp);
+                    float targetGradScale = (pTarget - 1.0f) * invValid;
+
+                    float[] tempBuf = s_threadLocalBuffer.Value!;
+                    if (tempBuf.Length < hiddenDim)
+                    {
+                        tempBuf = new float[hiddenDim];
+                        s_threadLocalBuffer.Value = tempBuf;
+                    }
+
+                    fixed (float* tempRow = tempBuf)
+                    {
+                        QuantKernels.ExtractEmbedding(lmHeadType, lmHeadWeight, targetId, tempRow, hiddenDim);
+                        AccumulateScaled(dhVec, tempRow, targetGradScale, hiddenDim);
+
+                        const float precisionThreshold = -16.0f;
+                        for (int v = 0; v < vocabSize; v++)
+                        {
+                            if (v == targetId) continue;
+                            float diff = logits[v] - logSumExp;
+                            if (diff < precisionThreshold) continue;
+
+                            float p = MathF.Exp(diff);
+                            float pScale = p * invValid;
+
+                            QuantKernels.ExtractEmbedding(lmHeadType, lmHeadWeight, v, tempRow, hiddenDim);
+                            AccumulateScaled(dhVec, tempRow, pScale, hiddenDim);
+                        }
+                    }
+
+                    return localLoss + tokenLoss;
+                },
+                localLoss =>
+                {
+                    lock (lossLock) totalLoss += (float)localLoss;
+                });
+
+                return totalLoss * invValid;
+            }
+            finally
+            {
+                NativeMemory.Free(pValidHidden);
+                NativeMemory.Free(pValidLogits);
+            }
         }
 
         // 4. 2D Tiled Online Streaming Softmax across large vocabulary
+        int actualTileSize = Math.Min(VocabTileSize, vocabSize);
         int numTiles = (vocabSize + actualTileSize - 1) / actualTileSize;
         int rowBytes = (int)GgufTypes.GetRowBytes(lmHeadType, hiddenDim);
 
-        float* pTileLogits = arena.TileLogits;
-        float* runningMax = arena.RunningMax;
-        float* runningSumExp = arena.RunningSumExp;
-        float* targetLogits = arena.TargetLogits;
-        float* logSumExp = arena.LogSumExp;
+        float* pTileLogits = (float*)NativeMemory.Alloc((nuint)((long)validCount * actualTileSize), sizeof(float));
+        float* runningMax = (float*)NativeMemory.Alloc((nuint)validCount, sizeof(float));
+        float* runningSumExp = (float*)NativeMemory.Alloc((nuint)validCount, sizeof(float));
+        float* targetLogits = (float*)NativeMemory.Alloc((nuint)validCount, sizeof(float));
+        float* logSumExp = (float*)NativeMemory.Alloc((nuint)validCount, sizeof(float));
 
-        for (int i = 0; i < validCount; i++)
+        try
         {
-            runningMax[i] = float.NegativeInfinity;
-            runningSumExp[i] = 0.0f;
-            targetLogits[i] = 0.0f;
-        }
+            for (int i = 0; i < validCount; i++)
+            {
+                runningMax[i] = float.NegativeInfinity;
+                runningSumExp[i] = 0.0f;
+                targetLogits[i] = 0.0f;
+            }
 
             // PASS 1: Online Log-Sum-Exp computation streamed in tiles
             for (int tile = 0; tile < numTiles; tile++)
@@ -231,7 +156,7 @@ public static unsafe class FusedCrossEntropyLoss
                 int vCount = Math.Min(actualTileSize, vocabSize - vStart);
                 byte* tileWeight = lmHeadWeight + (long)vStart * rowBytes;
 
-                ComputeTileLogits(lmHeadType, tileWeight, pValidHidden, pTileLogits, hiddenDim, vCount, validCount, arena.TempRow);
+                QuantKernels.MatMulBatch(lmHeadType, tileWeight, pValidHidden, pTileLogits, hiddenDim, vCount, validCount);
 
                 for (int i = 0; i < validCount; i++)
                 {
@@ -271,18 +196,24 @@ public static unsafe class FusedCrossEntropyLoss
             if (numTiles == 1)
             {
                 // Single tile: reuse pTileLogits directly without re-evaluating GEMM
-                if (validCount <= 128 || vocabSize <= 1024)
+                Parallel.For(0, validCount, i =>
                 {
-                    float* tempRow = arena.TempRow;
-                    const float precisionThreshold = -16.0f;
-                    for (int i = 0; i < validCount; i++)
-                    {
-                        int t = validSeqIndices[i];
-                        int targetId = targetTokens[t];
-                        float lse = logSumExp[i];
-                        float* logits = pTileLogits + (long)i * vocabSize;
-                        float* dhVec = dFinalHidden + (long)t * hiddenDim;
+                    int t = validSeqIndices[i];
+                    int targetId = targetTokens[t];
+                    float lse = logSumExp[i];
+                    float* logits = pTileLogits + (long)i * vocabSize;
+                    float* dhVec = dFinalHidden + (long)t * hiddenDim;
 
+                    float[] tempBuf = s_threadLocalBuffer.Value!;
+                    if (tempBuf.Length < hiddenDim)
+                    {
+                        tempBuf = new float[hiddenDim];
+                        s_threadLocalBuffer.Value = tempBuf;
+                    }
+
+                    fixed (float* tempRow = tempBuf)
+                    {
+                        const float precisionThreshold = -16.0f;
                         for (int v = 0; v < vocabSize; v++)
                         {
                             float diff = logits[v] - lse;
@@ -302,12 +233,7 @@ public static unsafe class FusedCrossEntropyLoss
                             }
                         }
                     }
-                }
-                else
-                {
-                    BackpropSingleTileParallel(
-                        pTileLogits, dFinalHidden, logSumExp, validSeqIndices, targetTokens, lmHeadType, lmHeadWeight, validCount, hiddenDim, vocabSize, invValid);
-                }
+                });
             }
             else
             {
@@ -318,20 +244,26 @@ public static unsafe class FusedCrossEntropyLoss
                     int vCount = Math.Min(actualTileSize, vocabSize - vStart);
                     byte* tileWeight = lmHeadWeight + (long)vStart * rowBytes;
 
-                    ComputeTileLogits(lmHeadType, tileWeight, pValidHidden, pTileLogits, hiddenDim, vCount, validCount, arena.TempRow);
+                    QuantKernels.MatMulBatch(lmHeadType, tileWeight, pValidHidden, pTileLogits, hiddenDim, vCount, validCount);
 
-                    if (validCount <= 128 || vCount <= 1024)
+                    Parallel.For(0, validCount, i =>
                     {
-                        float* tempRow = arena.TempRow;
-                        const float precisionThreshold = -16.0f;
-                        for (int i = 0; i < validCount; i++)
-                        {
-                            int t = validSeqIndices[i];
-                            int targetId = targetTokens[t];
-                            float lse = logSumExp[i];
-                            float* logits = pTileLogits + (long)i * vCount;
-                            float* dhVec = dFinalHidden + (long)t * hiddenDim;
+                        int t = validSeqIndices[i];
+                        int targetId = targetTokens[t];
+                        float lse = logSumExp[i];
+                        float* logits = pTileLogits + (long)i * vCount;
+                        float* dhVec = dFinalHidden + (long)t * hiddenDim;
 
+                        float[] tempBuf = s_threadLocalBuffer.Value!;
+                        if (tempBuf.Length < hiddenDim)
+                        {
+                            tempBuf = new float[hiddenDim];
+                            s_threadLocalBuffer.Value = tempBuf;
+                        }
+
+                        fixed (float* tempRow = tempBuf)
+                        {
+                            const float precisionThreshold = -16.0f;
                             for (int v = 0; v < vCount; v++)
                             {
                                 int globalV = vStart + v;
@@ -352,239 +284,21 @@ public static unsafe class FusedCrossEntropyLoss
                                 }
                             }
                         }
-                    }
-                    else
-                    {
-                        BackpropMultiTileParallel(
-                            pTileLogits, dFinalHidden, logSumExp, validSeqIndices, targetTokens, lmHeadType, lmHeadWeight, vStart, vCount, validCount, hiddenDim, invValid);
-                    }
-                }
-            }
-
-        return totalLoss * invValid;
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void ComputeTileLogits(
-        GgufType lmHeadType,
-        byte* tileWeight,
-        float* pValidHidden,
-        float* pTileLogits,
-        int hiddenDim,
-        int vCount,
-        int validCount,
-        float* tempRow)
-    {
-        if (validCount <= 128 || vCount <= 1024)
-        {
-            if (lmHeadType == GgufType.F32)
-            {
-                float* f32Weights = (float*)tileWeight;
-                for (int r = 0; r < vCount; r++)
-                {
-                    float* rowPtr = f32Weights + (long)r * hiddenDim;
-                    for (int b = 0; b < validCount; b++)
-                    {
-                        float* x = pValidHidden + (long)b * hiddenDim;
-                        pTileLogits[b * vCount + r] = QuantKernels.VecDotF32(rowPtr, x, hiddenDim);
-                    }
-                }
-            }
-            else
-            {
-                for (int r = 0; r < vCount; r++)
-                {
-                    QuantKernels.ExtractEmbedding(lmHeadType, tileWeight, r, tempRow, hiddenDim);
-                    for (int b = 0; b < validCount; b++)
-                    {
-                        float* x = pValidHidden + (long)b * hiddenDim;
-                        pTileLogits[b * vCount + r] = QuantKernels.VecDotF32(tempRow, x, hiddenDim);
-                    }
+                    });
                 }
             }
         }
-        else
+        finally
         {
-            QuantKernels.MatMulBatch(lmHeadType, tileWeight, pValidHidden, pTileLogits, hiddenDim, vCount, validCount);
+            NativeMemory.Free(pValidHidden);
+            NativeMemory.Free(pTileLogits);
+            NativeMemory.Free(runningMax);
+            NativeMemory.Free(runningSumExp);
+            NativeMemory.Free(targetLogits);
+            NativeMemory.Free(logSumExp);
         }
-    }
-
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    private static float ComputeGpuLossAndGradientsParallel(
-        float* pValidLogits,
-        float* dFinalHidden,
-        int* validSeqIndices,
-        int[] targetTokens,
-        GgufType lmHeadType,
-        byte* lmHeadWeight,
-        int validCount,
-        int hiddenDim,
-        int vocabSize,
-        float invValid)
-    {
-        float totalLoss = 0.0f;
-        object lossLock = new();
-        Parallel.For<double>(0, validCount, () => 0.0, (i, loopState, localLoss) =>
-        {
-            int t = validSeqIndices[i];
-            int targetId = targetTokens[t];
-            float* logits = pValidLogits + (long)i * vocabSize;
-            float* dhVec = dFinalHidden + (long)t * hiddenDim;
-
-            float maxLogit = VectorizedMax(logits, vocabSize);
-            float sumExp = VectorizedSumExp(logits, vocabSize, maxLogit);
-            float logSumExp = maxLogit + MathF.Log(sumExp);
-            float targetLogit = logits[targetId];
-            float tokenLoss = logSumExp - targetLogit;
-
-            float pTarget = MathF.Exp(targetLogit - logSumExp);
-            float targetGradScale = (pTarget - 1.0f) * invValid;
-
-            float[] tempBuf = s_threadLocalBuffer.Value!;
-            if (tempBuf.Length < hiddenDim)
-            {
-                tempBuf = new float[hiddenDim];
-                s_threadLocalBuffer.Value = tempBuf;
-            }
-
-            fixed (float* tempRow = tempBuf)
-            {
-                QuantKernels.ExtractEmbedding(lmHeadType, lmHeadWeight, targetId, tempRow, hiddenDim);
-                AccumulateScaled(dhVec, tempRow, targetGradScale, hiddenDim);
-
-                const float precisionThreshold = -16.0f;
-                for (int v = 0; v < vocabSize; v++)
-                {
-                    if (v == targetId) continue;
-                    float diff = logits[v] - logSumExp;
-                    if (diff < precisionThreshold) continue;
-
-                    float p = MathF.Exp(diff);
-                    float pScale = p * invValid;
-
-                    QuantKernels.ExtractEmbedding(lmHeadType, lmHeadWeight, v, tempRow, hiddenDim);
-                    AccumulateScaled(dhVec, tempRow, pScale, hiddenDim);
-                }
-            }
-
-            return localLoss + tokenLoss;
-        },
-        localLoss =>
-        {
-            lock (lossLock) totalLoss += (float)localLoss;
-        });
 
         return totalLoss * invValid;
-    }
-
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    private static void BackpropSingleTileParallel(
-        float* pTileLogits,
-        float* dFinalHidden,
-        float* logSumExp,
-        int* validSeqIndices,
-        int[] targetTokens,
-        GgufType lmHeadType,
-        byte* lmHeadWeight,
-        int validCount,
-        int hiddenDim,
-        int vocabSize,
-        float invValid)
-    {
-        Parallel.For(0, validCount, i =>
-        {
-            int t = validSeqIndices[i];
-            int targetId = targetTokens[t];
-            float lse = logSumExp[i];
-            float* logits = pTileLogits + (long)i * vocabSize;
-            float* dhVec = dFinalHidden + (long)t * hiddenDim;
-
-            float[] tempBuf = s_threadLocalBuffer.Value!;
-            if (tempBuf.Length < hiddenDim)
-            {
-                tempBuf = new float[Math.Max(32768, hiddenDim)];
-                s_threadLocalBuffer.Value = tempBuf;
-            }
-
-            fixed (float* tempRow = tempBuf)
-            {
-                const float precisionThreshold = -16.0f;
-                for (int v = 0; v < vocabSize; v++)
-                {
-                    float diff = logits[v] - lse;
-                    if (v == targetId)
-                    {
-                        float p = MathF.Exp(diff);
-                        float targetGradScale = (p - 1.0f) * invValid;
-                        QuantKernels.ExtractEmbedding(lmHeadType, lmHeadWeight, v, tempRow, hiddenDim);
-                        AccumulateScaled(dhVec, tempRow, targetGradScale, hiddenDim);
-                    }
-                    else if (diff >= precisionThreshold)
-                    {
-                        float p = MathF.Exp(diff);
-                        float pScale = p * invValid;
-                        QuantKernels.ExtractEmbedding(lmHeadType, lmHeadWeight, v, tempRow, hiddenDim);
-                        AccumulateScaled(dhVec, tempRow, pScale, hiddenDim);
-                    }
-                }
-            }
-        });
-    }
-
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    private static void BackpropMultiTileParallel(
-        float* pTileLogits,
-        float* dFinalHidden,
-        float* logSumExp,
-        int* validSeqIndices,
-        int[] targetTokens,
-        GgufType lmHeadType,
-        byte* lmHeadWeight,
-        int vStart,
-        int vCount,
-        int validCount,
-        int hiddenDim,
-        float invValid)
-    {
-        Parallel.For(0, validCount, i =>
-        {
-            int t = validSeqIndices[i];
-            int targetId = targetTokens[t];
-            float lse = logSumExp[i];
-            float* logits = pTileLogits + (long)i * vCount;
-            float* dhVec = dFinalHidden + (long)t * hiddenDim;
-
-            float[] tempBuf = s_threadLocalBuffer.Value!;
-            if (tempBuf.Length < hiddenDim)
-            {
-                tempBuf = new float[Math.Max(32768, hiddenDim)];
-                s_threadLocalBuffer.Value = tempBuf;
-            }
-
-            fixed (float* tempRow = tempBuf)
-            {
-                const float precisionThreshold = -16.0f;
-                for (int v = 0; v < vCount; v++)
-                {
-                    int globalV = vStart + v;
-                    float diff = logits[v] - lse;
-                    if (globalV == targetId)
-                    {
-                        float p = MathF.Exp(diff);
-                        float targetGradScale = (p - 1.0f) * invValid;
-                        QuantKernels.ExtractEmbedding(lmHeadType, lmHeadWeight, globalV, tempRow, hiddenDim);
-                        AccumulateScaled(dhVec, tempRow, targetGradScale, hiddenDim);
-                    }
-                    else if (diff >= precisionThreshold)
-                    {
-                        float p = MathF.Exp(diff);
-                        float pScale = p * invValid;
-                        QuantKernels.ExtractEmbedding(lmHeadType, lmHeadWeight, globalV, tempRow, hiddenDim);
-                        AccumulateScaled(dhVec, tempRow, pScale, hiddenDim);
-                    }
-                }
-            }
-        });
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]

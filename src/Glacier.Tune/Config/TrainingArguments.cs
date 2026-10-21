@@ -18,13 +18,4 @@ public sealed class TrainingArguments
     public string Device { get; set; } = "auto";
     public int? MaxSteps { get; set; } = null;
     public bool CheckpointActivations { get; set; } = false;
-
-    // High-Throughput QLoRA & Optimizer Hyperparameters
-    public float MaxGradNorm { get; set; } = 1.0f;
-    public float WeightDecay { get; set; } = 0.01f;
-    public float Beta1 { get; set; } = 0.9f;
-    public float Beta2 { get; set; } = 0.999f;
-    public float Eps { get; set; } = 1e-8f;
-    public bool IsQLora { get; set; } = true;
-    public int QuantBits { get; set; } = 4;
 }
