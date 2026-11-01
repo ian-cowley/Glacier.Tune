@@ -9,15 +9,25 @@ using Glacier.Tune.Trainer;
 
 if (args.Length > 0 && (args[0] == "--merge" || args[0] == "-m"))
 {
-    string baseModel = args.Length > 1 ? args[1] : @"D:\lmstudio\models\lmstudio-community\Qwen2.5-7B-Instruct-1M-GGUF\Qwen2.5-7B-Instruct-1M-Q4_K_M.gguf";
-    string adapterPath = args.Length > 2 ? args[2] : @"C:\Users\spuri\source\repos\PolarsPlus\Glacier.Tune\tune_output\adapter_model.bin";
-    string outModel = args.Length > 3 ? args[3] : @"D:\lmstudio\models\Local\Qwen2.5-Coder-7B-Enterprise-GGUF\qwen2.5-7b-glacier-enterprise-q8_0.gguf";
+    string? baseModel = args.Length > 1 ? args[1] : Environment.GetEnvironmentVariable("GLACIER_BASE_GGUF");
+    string adapterPath = args.Length > 2
+        ? args[2]
+        : (Environment.GetEnvironmentVariable("GLACIER_LORA_ADAPTER") ?? Path.Combine(Directory.GetCurrentDirectory(), "tune_output", "adapter_model.bin"));
+    string outModel = args.Length > 3
+        ? args[3]
+        : (Environment.GetEnvironmentVariable("GLACIER_MERGED_GGUF") ?? Path.Combine(Directory.GetCurrentDirectory(), "tune_output", "merged_model.gguf"));
+
+    if (string.IsNullOrWhiteSpace(baseModel))
+    {
+        Console.WriteLine("Usage: dotnet run --project samples/Glacier.Tune.Demo -- --merge <base.gguf> [adapter_model.bin] [merged_out.gguf]");
+        return;
+    }
 
     Console.ForegroundColor = ConsoleColor.Cyan;
     Console.WriteLine("================================================================================");
     Console.WriteLine("         GLACIER.TUNE: PURE C# .NET 10 GGUF STANDALONE ADAPTER MERGER           ");
     Console.WriteLine("        Zero Python - Direct Native Memory SIMD Quantized Fusion                ");
-    Console.WriteLine("================================================================================\\n");
+    Console.WriteLine("================================================================================\n");
     Console.ResetColor();
 
     GgufMerger.Merge(baseModel, adapterPath, outModel);
@@ -31,7 +41,6 @@ Console.WriteLine("          Instant GGUF Zero-Copy Memory Mapping & LoRA Backpr
 Console.WriteLine("================================================================================\n");
 Console.ResetColor();
 
-// Determine device target: --device <dev>, --gpu, --cpu, or auto
 string device = "auto";
 int maxSteps = 3;
 string? userGguf = null;
@@ -55,21 +64,21 @@ for (int i = 0; i < args.Length; i++)
     {
         device = "cpu";
     }
-    else if (!args[i].StartsWith("-"))
+    else if (!args[i].StartsWith('-'))
     {
         if (userGguf == null) userGguf = args[i];
         else if (userJsonl == null) userJsonl = args[i];
     }
 }
 
-// Path to raw untuned GGUF base model and enterprise dataset
-string ggufPath = userGguf ?? @"D:\lmstudio\models\lmstudio-community\Qwen2.5-7B-Instruct-1M-GGUF\Qwen2.5-7B-Instruct-1M-Q4_K_M.gguf";
-string trainJsonl = userJsonl ?? FindDatasetPath();
+string? ggufPath = userGguf ?? Environment.GetEnvironmentVariable("GLACIER_BASE_GGUF");
+string trainJsonl = userJsonl ?? Environment.GetEnvironmentVariable("GLACIER_TUNE_DATASET") ?? FindDatasetPath();
 
-if (!File.Exists(ggufPath))
+if (string.IsNullOrWhiteSpace(ggufPath) || !File.Exists(ggufPath))
 {
-    Console.ForegroundColor = ConsoleColor.Red;
-    Console.WriteLine($"[ERROR] Raw base GGUF model not found at {ggufPath}");
+    Console.ForegroundColor = ConsoleColor.Yellow;
+    Console.WriteLine("Usage: dotnet run --project samples/Glacier.Tune.Demo -- <base_model.gguf> [dataset.jsonl] [--gpu|--cpu] [--steps N]");
+    Console.WriteLine("   or set GLACIER_BASE_GGUF=<path/to/base_model.gguf> and GLACIER_TUNE_DATASET=<path/to/dataset.jsonl>.");
     Console.ResetColor();
     return;
 }
@@ -84,13 +93,12 @@ if (!File.Exists(trainJsonl))
 
 static string FindDatasetPath()
 {
-    string[] candidates = [
+    string[] candidates =
+    [
         Path.Combine(AppContext.BaseDirectory, "data", "enterprise_dev_train.jsonl"),
         Path.Combine(Directory.GetCurrentDirectory(), "data", "enterprise_dev_train.jsonl"),
         Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "data", "enterprise_dev_train.jsonl"),
-        Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "data", "enterprise_dev_train.jsonl"),
-        @"C:\Users\spuri\source\repos\PolarsPlus\Glacier.Tune\data\enterprise_dev_train.jsonl",
-        @"C:\Users\spuri\source\repos\modelTrain\data\enterprise_dev_train.jsonl"
+        Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "data", "enterprise_dev_train.jsonl")
     ];
     foreach (var path in candidates)
     {
@@ -100,13 +108,13 @@ static string FindDatasetPath()
 }
 
 // 1. Load GGUF Model via Zero-Copy Memory Mapping
-Console.WriteLine($"[1/4] Loading Raw Untuned Qwen 2.5 7B Base Model (Target Device: {device.ToUpperInvariant()})...");
+Console.WriteLine($"[1/4] Loading Raw Untuned GGUF Base Model (Target Device: {device.ToUpperInvariant()})...");
 var swMmf = Stopwatch.StartNew();
 using var model = GgufLoraModel.Load(ggufPath, new LoraConfig { Rank = 16, Alpha = 32f }, device: device);
 swMmf.Stop();
 
 Console.ForegroundColor = ConsoleColor.Green;
-Console.WriteLine($"  Model Loaded in {swMmf.Elapsed.TotalMilliseconds:F2} ms (4.36 GB Virtual Address Mapping)!");
+Console.WriteLine($"  Model Loaded in {swMmf.Elapsed.TotalMilliseconds:F2} ms!");
 Console.ResetColor();
 
 var (trainable, total, pct) = model.GetParameterStats();
@@ -118,17 +126,20 @@ Console.WriteLine($"  Parameter Efficiency: {100.0 - pct:F2}% parameter reductio
 Console.ResetColor();
 
 // 2. Ingest and Tokenize ChatML Dataset
-Console.WriteLine("[2/4] Ingesting and Tokenizing Enterprise ChatML Dataset...");
+Console.WriteLine("[2/4] Ingesting and Tokenizing ChatML Dataset...");
 var swData = Stopwatch.StartNew();
 var dataset = ChatMlDataset.FromFile(trainJsonl, model.Tokenizer, maxSeqLength: 160);
 swData.Stop();
 
-Console.WriteLine($"  Ingested {dataset.Count:N0} enterprise samples in {swData.Elapsed.TotalMilliseconds:F2} ms!");
-Console.WriteLine($"  First Example Length: {dataset.Examples[0].InputIds.Length} tokens (Labels masked for prompt tokens)\n");
+Console.WriteLine($"  Ingested {dataset.Count:N0} samples in {swData.Elapsed.TotalMilliseconds:F2} ms!");
+if (dataset.Count > 0)
+{
+    Console.WriteLine($"  First Example Length: {dataset.Examples[0].InputIds.Length} tokens (Labels masked for prompt & assistant header tokens)\n");
+}
 
 // 3. Fine-Tuning Execution
-Console.WriteLine("[3/4] Executing Fine-Tuning with AutogradTape & AdamW...");
-string outputDir = Path.Combine(AppContext.BaseDirectory, "tune_output");
+Console.WriteLine("[3/4] Executing Fine-Tuning with Reverse-Mode Backpropagation & AdamW...");
+string outputDir = Path.Combine(Directory.GetCurrentDirectory(), "tune_output");
 var trainingArgs = new TrainingArguments
 {
     LearningRate = 5e-4f,
@@ -144,16 +155,6 @@ var trainingArgs = new TrainingArguments
 using var trainer = new LoraTrainer(model, trainingArgs);
 trainer.Train(dataset);
 
-// Also copy adapter to convenient location
-string repoOutputDir = Path.Combine(@"C:\Users\spuri\source\repos\PolarsPlus\Glacier.Tune", "tune_output");
-Directory.CreateDirectory(repoOutputDir);
-foreach (var file in Directory.GetFiles(outputDir))
-{
-    File.Copy(file, Path.Combine(repoOutputDir, Path.GetFileName(file)), overwrite: true);
-}
-
 Console.ForegroundColor = ConsoleColor.Green;
-Console.WriteLine($"\n[SUCCESS] Trained LoRA Adapter exported to both:");
-Console.WriteLine($"  1. {outputDir}");
-Console.WriteLine($"  2. {repoOutputDir}");
+Console.WriteLine($"\n[SUCCESS] Trained LoRA Adapter exported to: {outputDir}");
 Console.ResetColor();

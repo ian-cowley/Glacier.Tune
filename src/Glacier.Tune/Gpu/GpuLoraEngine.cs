@@ -11,7 +11,7 @@ using Glacier.Tune.Diagnostics;
 /// <summary>
 /// High-performance GPU VRAM accelerator for Glacier.Tune.
 /// Uploads frozen base GGUF model weights to NVIDIA VRAM once at startup,
-/// and executes batched sequence GEMMs directly on CUDA cores.
+/// and executes batched sequence forward and backward GEMMs directly on CUDA cores.
 /// </summary>
 public sealed unsafe partial class GpuLoraEngine : IDisposable
 {
@@ -21,8 +21,9 @@ public sealed unsafe partial class GpuLoraEngine : IDisposable
     private readonly GpuContext _gpu;
     private readonly ModelWeights _weights;
     private readonly IntPtr _module;
+    private readonly IntPtr _bwdModule;
 
-    // Kernel function handles
+    // Forward & ops kernel function handles (from Glacier.Inference fatbinary)
     private readonly IntPtr _fnGemmQ4KBatch;
     private readonly IntPtr _fnGemmQ6KBatch;
     private readonly IntPtr _fnGemmQ8_0Batch;
@@ -36,6 +37,15 @@ public sealed unsafe partial class GpuLoraEngine : IDisposable
     private readonly IntPtr _fnAttnTrainBwdDqDs;
     private readonly IntPtr _fnAttnTrainBwdDkDv;
 
+    // Extended forward & transpose-backward kernel handles (from Glacier.Tune tune_bwd.cubin)
+    private readonly IntPtr _fnGemmF32Batch;
+    private readonly IntPtr _fnGemmQ4_0Batch;
+    private readonly IntPtr _fnGemmQ4KBwd;
+    private readonly IntPtr _fnGemmQ6KBwd;
+    private readonly IntPtr _fnGemmQ8_0Bwd;
+    private readonly IntPtr _fnGemmQ4_0Bwd;
+    private readonly IntPtr _fnGemmF32Bwd;
+
     // Scratch buffers in VRAM
     private IntPtr _dScratchX;
     private nuint _scratchXCap;
@@ -43,7 +53,7 @@ public sealed unsafe partial class GpuLoraEngine : IDisposable
     private nuint _scratchYCap;
     private readonly object _scratchLock = new();
 
-    // Dedicated FFN VRAM buffers (avoids PCIe ping-pong for Gate/Up/Hidden)
+    // Dedicated FFN VRAM buffers
     private IntPtr _dFfnNormX;
     private nuint _ffnNormXCap;
     private IntPtr _dFfnGate;
@@ -77,7 +87,7 @@ public sealed unsafe partial class GpuLoraEngine : IDisposable
     private IntPtr _dDv;
     private nuint _dvCap;
 
-    // VRAM Weight pointers for 28 layers
+    // VRAM Weight pointers for transformer layers
     private readonly IntPtr[] _dQLayers;
     private readonly IntPtr[] _dQBiasLayers;
     private readonly IntPtr[] _dKLayers;
@@ -85,6 +95,7 @@ public sealed unsafe partial class GpuLoraEngine : IDisposable
     private readonly IntPtr[] _dVLayers;
     private readonly IntPtr[] _dVBiasLayers;
     private readonly IntPtr[] _dAttnOutLayers;
+    private readonly IntPtr[] _dAttnOutBiasLayers;
     private readonly IntPtr[] _dGateLayers;
     private readonly IntPtr[] _dUpLayers;
     private readonly IntPtr[] _dDownLayers;
@@ -97,29 +108,12 @@ public sealed unsafe partial class GpuLoraEngine : IDisposable
     public GpuContext Gpu => _gpu;
     public IntPtr LmHeadWeight => _dLmHeadWeight;
 
+    public bool SupportsAttention(int seqLen, int headDim) =>
+        headDim is > 0 and <= 1024 && (long)seqLen * sizeof(float) <= 48 * 1024;
+
     public GpuLoraEngine(ModelWeights weights, int deviceOrdinal = 0)
     {
         _weights = weights;
-        _gpu = new GpuContext(deviceOrdinal);
-
-        // 1. Load CUDA fatbinary kernel module
-        byte[] cubin = KernelCompiler.GetOrCompileKernels(_gpu.ArchString);
-        CuDriver.Check(CuDriver.ModuleLoadData(out _module, cubin), $"ModuleLoadData({_gpu.ArchString})");
-
-        // 2. Retrieve kernel function handles
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmQ4KBatch, _module, "gemm_q4_k_batch"), "ModuleGetFunction(gemm_q4_k_batch)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmQ6KBatch, _module, "gemm_q6_k_batch"), "ModuleGetFunction(gemm_q6_k_batch)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmQ8_0Batch, _module, "gemm_q8_0_batch"), "ModuleGetFunction(gemm_q8_0_batch)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmSwigluBatch, _module, "gemm_q4_k_swiglu_batch"), "ModuleGetFunction(gemm_q4_k_swiglu_batch)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRmsNormBatch, _module, "rms_norm_batch"), "ModuleGetFunction(rms_norm_batch)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnSwiglu, _module, "swiglu_kernel"), "ModuleGetFunction(swiglu_kernel)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnSwigluBwd, _module, "swiglu_bwd_kernel"), "ModuleGetFunction(swiglu_bwd_kernel)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnVecAdd, _module, "vec_add_kernel"), "ModuleGetFunction(vec_add_kernel)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRopeBatch, _module, "rope_batch"), "ModuleGetFunction(rope_batch)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttnTrainFwd, _module, "attention_causal_gqa_train_fwd"), "ModuleGetFunction(attention_causal_gqa_train_fwd)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttnTrainBwdDqDs, _module, "attention_causal_gqa_train_bwd_dq_ds"), "ModuleGetFunction(attention_causal_gqa_train_bwd_dq_ds)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttnTrainBwdDkDv, _module, "attention_causal_gqa_train_bwd_dk_dv"), "ModuleGetFunction(attention_causal_gqa_train_bwd_dk_dv)");
-
         int blockCount = weights.BlockCount;
         _dQLayers = new IntPtr[blockCount];
         _dQBiasLayers = new IntPtr[blockCount];
@@ -128,63 +122,119 @@ public sealed unsafe partial class GpuLoraEngine : IDisposable
         _dVLayers = new IntPtr[blockCount];
         _dVBiasLayers = new IntPtr[blockCount];
         _dAttnOutLayers = new IntPtr[blockCount];
+        _dAttnOutBiasLayers = new IntPtr[blockCount];
         _dGateLayers = new IntPtr[blockCount];
         _dUpLayers = new IntPtr[blockCount];
         _dDownLayers = new IntPtr[blockCount];
 
-        // 3. Preallocate initial scratch buffers (e.g. seqLen 512 x 18944 dim x 4 bytes ~ 38 MB)
-        _scratchXCap = (nuint)(512 * Math.Max(weights.EmbeddingLength, weights.FeedForwardLength) * sizeof(float));
-        _scratchYCap = _scratchXCap;
-        _dScratchX = _gpu.AllocateDevice(_scratchXCap);
-        _dScratchY = _gpu.AllocateDevice(_scratchYCap);
+        _gpu = new GpuContext(deviceOrdinal);
 
-        // Preallocate dedicated FFN VRAM buffers (total ~130 MB, stays resident in VRAM)
-        _ffnNormXCap = (nuint)(512 * weights.EmbeddingLength * sizeof(float));
-        _dFfnNormX = _gpu.AllocateDevice(_ffnNormXCap);
+        try
+        {
+            // 1. Load primary CUDA fatbinary kernel module
+            byte[] cubin = KernelCompiler.GetOrCompileKernels(_gpu.ArchString);
+            CuDriver.Check(CuDriver.ModuleLoadData(out _module, cubin), $"ModuleLoadData({_gpu.ArchString})");
 
-        _ffnGateCap = (nuint)(512 * weights.FeedForwardLength * sizeof(float));
-        _dFfnGate = _gpu.AllocateDevice(_ffnGateCap);
+            // 2. Load Glacier.Tune backward/extended GEMM CUDA fatbinary module
+            byte[] bwdCubin = LoadTuneBackwardCubin();
+            CuDriver.Check(CuDriver.ModuleLoadData(out _bwdModule, bwdCubin), $"ModuleLoadData(tune_bwd:{_gpu.ArchString})");
 
-        _ffnUpCap = _ffnGateCap;
-        _dFfnUp = _gpu.AllocateDevice(_ffnUpCap);
+            // 3. Retrieve kernel function handles
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmQ4KBatch, _module, "gemm_q4_k_batch"), "ModuleGetFunction(gemm_q4_k_batch)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmQ6KBatch, _module, "gemm_q6_k_batch"), "ModuleGetFunction(gemm_q6_k_batch)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmQ8_0Batch, _module, "gemm_q8_0_batch"), "ModuleGetFunction(gemm_q8_0_batch)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmSwigluBatch, _module, "gemm_q4_k_swiglu_batch"), "ModuleGetFunction(gemm_q4_k_swiglu_batch)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRmsNormBatch, _module, "rms_norm_batch"), "ModuleGetFunction(rms_norm_batch)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnSwiglu, _module, "swiglu_kernel"), "ModuleGetFunction(swiglu_kernel)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnSwigluBwd, _module, "swiglu_bwd_kernel"), "ModuleGetFunction(swiglu_bwd_kernel)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnVecAdd, _module, "vec_add_kernel"), "ModuleGetFunction(vec_add_kernel)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRopeBatch, _module, "rope_batch"), "ModuleGetFunction(rope_batch)");
 
-        _ffnHiddenCap = _ffnGateCap;
-        _dFfnHidden = _gpu.AllocateDevice(_ffnHiddenCap);
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttnTrainFwd, _bwdModule, "tune_attn_causal_gqa_fwd"), "ModuleGetFunction(tune_attn_causal_gqa_fwd)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttnTrainBwdDqDs, _bwdModule, "tune_attn_causal_gqa_bwd_dq_ds"), "ModuleGetFunction(tune_attn_causal_gqa_bwd_dq_ds)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttnTrainBwdDkDv, _bwdModule, "tune_attn_causal_gqa_bwd_dk_dv"), "ModuleGetFunction(tune_attn_causal_gqa_bwd_dk_dv)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmF32Batch, _bwdModule, "gemm_f32_batch"), "ModuleGetFunction(gemm_f32_batch)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmQ4_0Batch, _bwdModule, "gemm_q4_0_batch"), "ModuleGetFunction(gemm_q4_0_batch)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmQ4KBwd, _bwdModule, "gemm_q4_k_bwd"), "ModuleGetFunction(gemm_q4_k_bwd)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmQ6KBwd, _bwdModule, "gemm_q6_k_bwd"), "ModuleGetFunction(gemm_q6_k_bwd)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmQ8_0Bwd, _bwdModule, "gemm_q8_0_bwd"), "ModuleGetFunction(gemm_q8_0_bwd)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmQ4_0Bwd, _bwdModule, "gemm_q4_0_bwd"), "ModuleGetFunction(gemm_q4_0_bwd)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmF32Bwd, _bwdModule, "gemm_f32_bwd"), "ModuleGetFunction(gemm_f32_bwd)");
 
-        _ffnDownOutCap = _ffnNormXCap;
-        _dFfnDownOut = _gpu.AllocateDevice(_ffnDownOutCap);
+            int initSeq = Math.Min(512, Math.Max(16, weights.ContextLength));
+            _scratchXCap = (nuint)((long)initSeq * Math.Max(weights.EmbeddingLength, weights.FeedForwardLength) * sizeof(float));
+            _scratchYCap = _scratchXCap;
+            _dScratchX = _gpu.AllocateDevice(_scratchXCap);
+            _dScratchY = _gpu.AllocateDevice(_scratchYCap);
 
-        // Preallocate dedicated QKV VRAM buffers
-        int qDim = weights.HeadCount * weights.HeadDim;
-        int kvDim = weights.HeadCountKv * weights.HeadDim;
-        _qBufCap = (nuint)(512 * qDim * sizeof(float));
-        _dQBuf = _gpu.AllocateDevice(_qBufCap);
+            _ffnNormXCap = (nuint)((long)initSeq * weights.EmbeddingLength * sizeof(float));
+            _dFfnNormX = _gpu.AllocateDevice(_ffnNormXCap);
 
-        _kBufCap = (nuint)(512 * kvDim * sizeof(float));
-        _dKBuf = _gpu.AllocateDevice(_kBufCap);
+            _ffnGateCap = (nuint)((long)initSeq * weights.FeedForwardLength * sizeof(float));
+            _dFfnGate = _gpu.AllocateDevice(_ffnGateCap);
 
-        _vBufCap = _kBufCap;
-        _dVBuf = _gpu.AllocateDevice(_vBufCap);
+            _ffnUpCap = _ffnGateCap;
+            _dFfnUp = _gpu.AllocateDevice(_ffnUpCap);
 
-        // Preallocate dedicated Attention VRAM buffers
-        _attnOutCap = _qBufCap;
-        _dAttnOut = _gpu.AllocateDevice(_attnOutCap);
-        _dqCap = _qBufCap;
-        _dDq = _gpu.AllocateDevice(_dqCap);
-        _dkCap = _kBufCap;
-        _dDk = _gpu.AllocateDevice(_dkCap);
-        _dvCap = _kBufCap;
-        _dDv = _gpu.AllocateDevice(_dvCap);
+            _ffnHiddenCap = _ffnGateCap;
+            _dFfnHidden = _gpu.AllocateDevice(_ffnHiddenCap);
 
-        _attnProbsCap = (nuint)((long)weights.HeadCount * 512 * 512 * sizeof(float));
-        _attnDsCap = _attnProbsCap;
-        _dAttnProbs = _gpu.AllocateDevice(_attnProbsCap);
-        _dAttnDs = _gpu.AllocateDevice(_attnDsCap);
+            _ffnDownOutCap = _ffnNormXCap;
+            _dFfnDownOut = _gpu.AllocateDevice(_ffnDownOutCap);
 
-        // 4. Upload frozen base weights into GPU VRAM
-        UploadBaseWeights();
+            int qDim = weights.HeadCount * weights.HeadDim;
+            int kvDim = weights.HeadCountKv * weights.HeadDim;
+            _qBufCap = (nuint)((long)initSeq * qDim * sizeof(float));
+            _dQBuf = _gpu.AllocateDevice(_qBufCap);
 
-        s_current = this;
+            _kBufCap = (nuint)((long)initSeq * kvDim * sizeof(float));
+            _dKBuf = _gpu.AllocateDevice(_kBufCap);
+
+            _vBufCap = _kBufCap;
+            _dVBuf = _gpu.AllocateDevice(_vBufCap);
+
+            _attnOutCap = _qBufCap;
+            _dAttnOut = _gpu.AllocateDevice(_attnOutCap);
+            _dqCap = _qBufCap;
+            _dDq = _gpu.AllocateDevice(_dqCap);
+            _dkCap = _kBufCap;
+            _dDk = _gpu.AllocateDevice(_dkCap);
+            _dvCap = _kBufCap;
+            _dDv = _gpu.AllocateDevice(_dvCap);
+
+            _attnProbsCap = (nuint)((long)weights.HeadCount * initSeq * initSeq * sizeof(float));
+            _attnDsCap = _attnProbsCap;
+            _dAttnProbs = _gpu.AllocateDevice(_attnProbsCap);
+            _dAttnDs = _gpu.AllocateDevice(_attnDsCap);
+
+            UploadBaseWeights();
+            s_current = this;
+        }
+        catch
+        {
+            Dispose();
+            throw;
+        }
+    }
+
+    private static byte[] LoadTuneBackwardCubin()
+    {
+        var asm = typeof(GpuLoraEngine).Assembly;
+        using var stream = asm.GetManifestResourceStream("Glacier.Tune.Gpu.Kernels.tune_bwd.cubin");
+        if (stream != null)
+        {
+            using var ms = new MemoryStream();
+            stream.CopyTo(ms);
+            return ms.ToArray();
+        }
+
+        string localPath = Path.Combine(AppContext.BaseDirectory, "Gpu", "Kernels", "tune_bwd.cubin");
+        if (File.Exists(localPath))
+        {
+            return File.ReadAllBytes(localPath);
+        }
+
+        throw new FileNotFoundException("Embedded CUDA training module 'Glacier.Tune.Gpu.Kernels.tune_bwd.cubin' not found.");
     }
 
     private void UploadBaseWeights()
@@ -242,6 +292,13 @@ public sealed unsafe partial class GpuLoraEngine : IDisposable
             _dAttnOutLayers[l] = _gpu.AllocateDevice(attnOutBytes);
             _gpu.CopyToDevice(_dAttnOutLayers[l], (IntPtr)lw.AttnOutWeight, attnOutBytes);
 
+            if (lw.AttnOutBias != null)
+            {
+                nuint attnOutBiasBytes = (nuint)(dim * sizeof(float));
+                _dAttnOutBiasLayers[l] = _gpu.AllocateDevice(attnOutBiasBytes);
+                _gpu.CopyToDevice(_dAttnOutBiasLayers[l], (IntPtr)lw.AttnOutBias, attnOutBiasBytes);
+            }
+
             nuint gateBytes = (nuint)GgufTypes.GetRowBytes(lw.FfnGateType, dim) * (nuint)ffnDim;
             _dGateLayers[l] = _gpu.AllocateDevice(gateBytes);
             _gpu.CopyToDevice(_dGateLayers[l], (IntPtr)lw.FfnGateWeight, gateBytes);
@@ -255,13 +312,12 @@ public sealed unsafe partial class GpuLoraEngine : IDisposable
             _gpu.CopyToDevice(_dDownLayers[l], (IntPtr)lw.FfnDownWeight, downBytes);
         }
 
-        // Upload LM Head weight
         nuint outBytes = (nuint)GgufTypes.GetRowBytes(_weights.OutType, dim) * (nuint)_weights.VocabSize;
         _dLmHeadWeight = _gpu.AllocateDevice(outBytes);
         _gpu.CopyToDevice(_dLmHeadWeight, (IntPtr)_weights.OutWeight, outBytes);
 
         sw.Stop();
-        GlacierDiagnostics.LogInformation($"  [GPU VRAM] Model resident in GPU VRAM ({sw.Elapsed.TotalSeconds:F2}s, 100% Zero-Copy PCIe during training)!");
+        GlacierDiagnostics.LogInformation($"  [GPU VRAM] Model resident in GPU VRAM ({sw.Elapsed.TotalSeconds:F2}s, 100% Zero-Copy PCIe base weights)!");
     }
 
     public IntPtr GetQ(int layer) => _dQLayers[layer];
@@ -271,6 +327,7 @@ public sealed unsafe partial class GpuLoraEngine : IDisposable
     public IntPtr GetV(int layer) => _dVLayers[layer];
     public IntPtr GetVBias(int layer) => _dVBiasLayers[layer];
     public IntPtr GetAttnOut(int layer) => _dAttnOutLayers[layer];
+    public IntPtr GetAttnOutBias(int layer) => _dAttnOutBiasLayers[layer];
     public IntPtr GetGate(int layer) => _dGateLayers[layer];
     public IntPtr GetUp(int layer) => _dUpLayers[layer];
     public IntPtr GetDown(int layer) => _dDownLayers[layer];
@@ -291,6 +348,7 @@ public sealed unsafe partial class GpuLoraEngine : IDisposable
             _gpu.FreeDevice(_dVLayers[l]);
             _gpu.FreeDevice(_dVBiasLayers[l]);
             _gpu.FreeDevice(_dAttnOutLayers[l]);
+            _gpu.FreeDevice(_dAttnOutBiasLayers[l]);
             _gpu.FreeDevice(_dGateLayers[l]);
             _gpu.FreeDevice(_dUpLayers[l]);
             _gpu.FreeDevice(_dDownLayers[l]);
@@ -313,6 +371,13 @@ public sealed unsafe partial class GpuLoraEngine : IDisposable
         _gpu.FreeDevice(_dDq);
         _gpu.FreeDevice(_dDk);
         _gpu.FreeDevice(_dDv);
+
+        if (_gpu.Handle != IntPtr.Zero)
+        {
+            CuDriver.CtxSetCurrent(_gpu.Handle);
+            if (_bwdModule != IntPtr.Zero) CuDriver.ModuleUnload(_bwdModule);
+            if (_module != IntPtr.Zero) CuDriver.ModuleUnload(_module);
+        }
 
         _gpu.Dispose();
     }

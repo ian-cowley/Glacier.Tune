@@ -65,16 +65,17 @@ graph TD
     B --> C["TransformerBlock (x28 Layers)"]
     D["Trainable LoRA Adapters<br/>(40.3M Params, r=16)"] --> C
     C --> E["Online Streaming Fused Cross-Entropy<br/>(152,064 Vocab, &lt;2 MB RAM)"]
-    E -->|dX_final| F["Reverse-Mode Backpropagation<br/>(Activation Checkpointing)"]
+    E -->|dX_final| F["Reverse-Mode Backpropagation<br/>(Base + LoRA Transpose-GEMMs &amp; Checkpointing)"]
     F -->|dA, dB| G["In-Place AdamW Optimizer<br/>(Cosine LR Decay)"]
-    G --> H["PEFT-Compatible Export<br/>(lora_adapter.bin)"]
+    G --> H["Adapter Export &amp; Standalone GGUF Merger<br/>(adapter_model.bin / Fused .gguf)"]
 ```
 
 ### Full 28-Layer Transformer Backpropagation Pipeline
 1. **RoPE Inversion**: Exact orthogonal reverse rotation ($\sin(-\theta) = -\sin\theta$) with zero memory allocations.
 2. **Causal Attention Gradient**: Exact reverse multi-head GQA self-attention propagating upstream gradient $dO$ into $dQ, dK, dV$.
 3. **SwiGLU Analytical Derivatives**: Exact gradients $\frac{\partial Y}{\partial \text{Gate}}$ and $\frac{\partial Y}{\partial \text{Up}}$ derived through the Sigmoid Linear Unit.
-4. **Fused Cross-Entropy**: Direct loss and $\nabla_{X_{final}}$ calculation across 152,064 classes in unmanaged memory without materializing full logits.
+4. **Fused Cross-Entropy**: Direct 64-bit online Log-Sum-Exp loss and unbiased $\nabla_{X_{final}}$ calculation across 152,064 classes in tiled VRAM / unmanaged memory without materializing full logits.
+5. **Frozen Base-Weight Transpose-GEMM Backpropagation**: Exact chain-rule input gradient propagation ($dX += dY \cdot W_{\text{base}}$) across all 7 projections (`Q`, `K`, `V`, `O`, `Gate`, `Up`, `Down`) in CUDA VRAM (`Q4_K`, `Q6_K`, `Q8_0`, `Q4_0`, `F32`) and AVX-512/AVX2 SIMD.
 
 ---
 
@@ -101,7 +102,7 @@ A complete 10-step gradient descent sequence was physically executed using `Glac
 | **Managed Allocations** | **0 B (Zero managed GC allocations)** |
 
 > ⚠️ **TRAINING RUN STATUS & CONVERGENCE DISCLOSURE**:  
-> **Full 533-Sample Epoch Status: Untested (Full run not executed)**. While 10 physical gradient backpropagation steps were executed to capture exact hardware execution telemetry (confirming 6.96s/step and 46.0 tok/s), a complete multi-hundred step epoch traversing all 533 samples to final convergence was not executed in its entirety.
+> **Full 533-Sample Epoch Status: Untested (Full run not executed)**. While 10 physical gradient backpropagation steps were executed to capture hardware execution telemetry, a complete multi-hundred step epoch traversing all 533 samples to final convergence was not executed in its entirety. Note: Historical v1.0.5–v1.0.6 telemetry above reflects pre-v1.0.7 adapter-only backward timing; v1.0.7 adds full frozen base-weight transpose-GEMM backpropagation (`dX += dY * W_base`) across all 7 projections per block plus tiled VRAM LM-head backpropagation.
 
 ### Historical Step 1 Optimization Progression
 *(Microbenchmark latency progression during initial kernel development)*
@@ -160,11 +161,15 @@ using var trainer = new LoraTrainer(model, args);
 trainer.Train(dataset);
 
 // 4. Standalone GGUF Export (Zero Python / Zero llama.cpp)
-// Fuses all 196 LoRA-adapted projection matrices into lossless Q8_0 in ~6.8 seconds:
+// Fuses all adapted projections into standalone Q4_K / Q4_0 / Q8_0 / F32 GGUF weights:
 Glacier.Tune.Export.GgufMerger.Merge(
     baseGgufPath: "qwen2.5-coder-7b-q4_k_m.gguf",
     adapterBinPath: "./fine_tuned_lora/adapter_model.bin",
-    outputGgufPath: "./qwen2.5-coder-7b-enterprise-q8_0.gguf"
+    outputGgufPath: "./qwen2.5-coder-7b-enterprise-q8_0.gguf",
+    options: new Glacier.Tune.Export.GgufMerger.MergeOptions
+    {
+        TargetQuantization = Glacier.Tune.Export.TargetQuantization.Q8_0
+    }
 );
 ```
 
@@ -187,7 +192,18 @@ dotnet run -c Release --project samples/Glacier.Tune.Demo -- --merge \
 
 - **[Glacier.Inference](https://github.com/ian-cowley/Glacier.Inference)**: Sub-millisecond GGUF model loading, SIMD AVX-512 GEMV kernels, and embedded BPE tokenization.
 - **[Glacier.Tensor](https://github.com/ian-cowley/Glacier.Tensor)**: Strided tensor representations, `LoraLinear` layers, AutogradTape, and AdamW optimizer.
-- **[Glacier.Polaris](https://github.com/ian-cowley/Glacier.Polaris)**: Arrow columnar memory backend for zero-copy training data pipelines.
+- **[Glacier.Gpu](https://github.com/ian-cowley/Glacier.Gpu)**: Bare-metal CUDA driver bindings, device memory management, and cross-platform GPU acceleration primitives.
+
+---
+
+## 🆕 What's New in v1.0.7
+
+- **Full Frozen Base-Weight Backpropagation (CUDA VRAM & AVX-512/AVX2 SIMD)** — Added transposed quantized & FP32 backward GEMM kernels (`tune_bwd.cubin`: `Q4_K`, `Q6_K`, `Q8_0`, `Q4_0`, `F32`) and tiled SIMD CPU `LoraKernels.AccumulateBaseBackward` (`dX += dY * W_base`), propagating exact chain-rule gradients through all 7 projections (`Q`, `K`, `V`, `O`, `Gate`, `Up`, `Down`) across every transformer layer from step 0 ($B = 0$) onward.
+- **Arbitrary-`head_dim` CUDA Causal GQA Training Attention** — Added warp-aligned FlashAttention-2 training forward and backward kernels (`tune_attn_causal_gqa_fwd`, `tune_attn_causal_gqa_bwd_dq_ds`, `tune_attn_causal_gqa_bwd_dk_dv`) supporting any head dimension (`32`–`1024`) with instance-isolated multi-model GPU context binding.
+- **Exact Unbiased Tiled Cross-Entropy Backpropagation** — Upgraded `FusedCrossEntropyLoss` to 64-bit online Log-Sum-Exp accumulation with tiled VRAM & SIMD transpose-GEMM gradient propagation (`< 16 MB` bounded tile memory) and eliminated `-16.0f` tail-logit truncation bias.
+- **ChatML Assistant Header Masking, Gradient Accumulation & `TargetModules`** — `ChatMlDataset` masks `<|im_start|>assistant\n` role headers and trailing newlines; `LoraTrainer` averages microbatch gradients (`1 / accumSteps`) prior to norm clipping and supports periodic `SaveSteps` checkpoints; `TransformerBlock` honors `LoraConfig.TargetModules` with distinct deterministic per-(layer, projection) initialization seeds.
+- **Native AOT & Hardened Standalone `GgufMerger`** — Enabled `<IsAotCompatible>true</IsAotCompatible>` with reflection-free `Utf8JsonWriter` config serialization, added `TargetQuantization.F32` and `GgufLoraModel.ForwardLogits`, automatic Glacier/PEFT adapter layout resolution, upfront dimension/truncation validation, and in-place base GGUF overwrite protection.
+- **65 unit, finite-difference oracle, and GPU/CPU parity tests** passing (100% green, 0 warnings).
 
 ---
 

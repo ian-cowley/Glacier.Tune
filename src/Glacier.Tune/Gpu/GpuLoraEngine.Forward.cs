@@ -10,6 +10,9 @@ using Glacier.Tune.Model;
 
 public sealed unsafe partial class GpuLoraEngine
 {
+    public bool SupportsForwardGemm(GgufType type) =>
+        type is GgufType.Q4_K or GgufType.Q6_K or GgufType.Q8_0 or GgufType.Q4_0 or GgufType.F32;
+
     public void ForwardProjection(
         GgufType type,
         IntPtr dW,
@@ -20,8 +23,8 @@ public sealed unsafe partial class GpuLoraEngine
         int outFeatures,
         int seqLen)
     {
-        nuint bytesIn = (nuint)(seqLen * inFeatures * sizeof(float));
-        nuint bytesOut = (nuint)(seqLen * outFeatures * sizeof(float));
+        nuint bytesIn = (nuint)((long)seqLen * inFeatures * sizeof(float));
+        nuint bytesOut = (nuint)((long)seqLen * outFeatures * sizeof(float));
 
         lock (_scratchLock)
         {
@@ -38,13 +41,8 @@ public sealed unsafe partial class GpuLoraEngine
                 _scratchYCap = bytesOut * 2;
             }
 
-            // Copy input activations to GPU scratch buffer
             _gpu.CopyToDevice(_dScratchX, (IntPtr)x.DataPointer, bytesIn);
-
-            // Execute batched quantized GEMM kernel in VRAM
             LaunchGemmBatch(type, _dScratchY, _dScratchX, dW, inFeatures, outFeatures, seqLen, dBias);
-
-            // Copy output activations back to host tensor
             _gpu.CopyToHost((IntPtr)output.DataPointer, _dScratchY, bytesOut);
         }
     }
@@ -58,7 +56,7 @@ public sealed unsafe partial class GpuLoraEngine
         int vocabSize,
         int validCount)
     {
-        nuint bytesIn = (nuint)(validCount * hiddenDim * sizeof(float));
+        nuint bytesIn = (nuint)((long)validCount * hiddenDim * sizeof(float));
         nuint bytesOut = (nuint)((long)validCount * vocabSize * sizeof(float));
 
         lock (_scratchLock)
@@ -77,9 +75,7 @@ public sealed unsafe partial class GpuLoraEngine
             }
 
             _gpu.CopyToDevice(_dScratchX, (IntPtr)pValidHidden, bytesIn);
-
             LaunchGemmBatch(lmHeadType, _dScratchY, _dScratchX, dLmHeadWeight, hiddenDim, vocabSize, validCount);
-
             _gpu.CopyToHost((IntPtr)pValidLogits, _dScratchY, bytesOut);
         }
     }
@@ -101,6 +97,8 @@ public sealed unsafe partial class GpuLoraEngine
             GgufType.Q4_K => _fnGemmQ4KBatch,
             GgufType.Q6_K => _fnGemmQ6KBatch,
             GgufType.Q8_0 => _fnGemmQ8_0Batch,
+            GgufType.Q4_0 => _fnGemmQ4_0Batch,
+            GgufType.F32 => _fnGemmF32Batch,
             _ => throw new NotSupportedException($"GPU batch GEMM does not support type {type}")
         };
 
@@ -120,6 +118,7 @@ public sealed unsafe partial class GpuLoraEngine
         pArgs[6] = &dBias;
         pArgs[7] = &dResidual;
 
+        CuDriver.CtxSetCurrent(_gpu.Handle);
         CuDriver.Check(CuDriver.LaunchKernel(
             fn,
             gridX, gridY, 1,
@@ -140,6 +139,7 @@ public sealed unsafe partial class GpuLoraEngine
         pArgs[2] = &dDst;
         pArgs[3] = &size;
 
+        CuDriver.CtxSetCurrent(_gpu.Handle);
         CuDriver.Check(CuDriver.LaunchKernel(
             _fnSwiglu,
             gridX, 1, 1,
@@ -172,6 +172,7 @@ public sealed unsafe partial class GpuLoraEngine
         pArgs[5] = &mRows;
         pArgs[6] = &batchSize;
 
+        CuDriver.CtxSetCurrent(_gpu.Handle);
         CuDriver.Check(CuDriver.LaunchKernel(
             _fnGemmSwigluBatch,
             gridX, gridY, 1,
@@ -191,6 +192,7 @@ public sealed unsafe partial class GpuLoraEngine
         pArgs[1] = &dB;
         pArgs[2] = &size;
 
+        CuDriver.CtxSetCurrent(_gpu.Handle);
         CuDriver.Check(CuDriver.LaunchKernel(
             _fnVecAdd,
             gridX, 1, 1,
@@ -216,31 +218,27 @@ public sealed unsafe partial class GpuLoraEngine
         int qDim = _weights.HeadCount * headDim;
         int kvDim = _weights.HeadCountKv * headDim;
 
-        nuint normBytes = (nuint)(seqLen * hiddenDim * sizeof(float));
-        nuint qBytes = (nuint)(seqLen * qDim * sizeof(float));
-        nuint kvBytes = (nuint)(seqLen * kvDim * sizeof(float));
+        nuint normBytes = (nuint)((long)seqLen * hiddenDim * sizeof(float));
+        nuint qBytes = (nuint)((long)seqLen * qDim * sizeof(float));
+        nuint kvBytes = (nuint)((long)seqLen * kvDim * sizeof(float));
 
         lock (_scratchLock)
         {
             EnsureQkvCapacity(normBytes, qBytes, kvBytes);
 
-            // Copy norm1X to device ONCE (eliminates 2 redundant PCIe copies)
             _gpu.CopyToDevice(_dFfnNormX, (IntPtr)norm1X.DataPointer, normBytes);
 
             var lw = _weights.Layers[layerIndex];
 
-            // Execute Q, K, V projections in VRAM
             LaunchGemmBatch(lw.QType, _dQBuf, _dFfnNormX, _dQLayers[layerIndex], hiddenDim, qDim, seqLen, _dQBiasLayers[layerIndex]);
             LaunchGemmBatch(lw.KType, _dKBuf, _dFfnNormX, _dKLayers[layerIndex], hiddenDim, kvDim, seqLen, _dKBiasLayers[layerIndex]);
             LaunchGemmBatch(lw.VType, _dVBuf, _dFfnNormX, _dVLayers[layerIndex], hiddenDim, kvDim, seqLen, _dVBiasLayers[layerIndex]);
 
-            // Copy back to host tensors
             _gpu.CopyToHost((IntPtr)q.DataPointer, _dQBuf, qBytes);
             _gpu.CopyToHost((IntPtr)k.DataPointer, _dKBuf, kvBytes);
             _gpu.CopyToHost((IntPtr)v.DataPointer, _dVBuf, kvBytes);
         }
 
-        // Add LoRA adapter deltas on host
         AddLoraDeltaHost(norm1X, qLora, q);
         AddLoraDeltaHost(norm1X, kLora, k);
         AddLoraDeltaHost(norm1X, vLora, v);
@@ -261,55 +259,114 @@ public sealed unsafe partial class GpuLoraEngine
         int hiddenDim = _weights.EmbeddingLength;
         int ffnDim = _weights.FeedForwardLength;
 
-        nuint normBytes = (nuint)(seqLen * hiddenDim * sizeof(float));
-        nuint ffnBytes = (nuint)(seqLen * ffnDim * sizeof(float));
+        nuint normBytes = (nuint)((long)seqLen * hiddenDim * sizeof(float));
+        nuint ffnBytes = (nuint)((long)seqLen * ffnDim * sizeof(float));
         int totalFfnElements = seqLen * ffnDim;
 
-        lock (_scratchLock)
+        var lw = _weights.Layers[layerIndex];
+        bool gateZero = gateLora.IsZeroDelta;
+        bool upZero = upLora.IsZeroDelta;
+        bool downZero = downLora.IsZeroDelta;
+
+        // Fast path: when Gate & Up LoRA deltas are identically zero (e.g., step 0 cold start or disabled adapters)
+        if (gateZero && upZero)
         {
-            EnsureFfnCapacity(normBytes, ffnBytes);
-
-            // 1. Copy norm2X to GPU ONCE
-            _gpu.CopyToDevice(_dFfnNormX, (IntPtr)norm2X.DataPointer, normBytes);
-
-            // 2. Launch Gate and Up base GEMMs in VRAM
-            var lw = _weights.Layers[layerIndex];
-            if (outGate == null && outUp == null && lw.FfnGateType == GgufType.Q4_K && lw.FfnUpType == GgufType.Q4_K)
+            Tensor<float>? tempHidden = (!downZero && outHidden == null) ? new Tensor<float>(seqLen, ffnDim) : null;
+            try
             {
-                // Fused Gate + Up + SwiGLU: SiLU(Gate) * Up in registers in a single kernel pass!
-                LaunchGemmSwigluBatch(_dFfnHidden, _dFfnNormX, _dGateLayers[layerIndex], _dUpLayers[layerIndex], hiddenDim, ffnDim, seqLen);
+                lock (_scratchLock)
+                {
+                    EnsureFfnCapacity(normBytes, ffnBytes);
+                    _gpu.CopyToDevice(_dFfnNormX, (IntPtr)norm2X.DataPointer, normBytes);
+
+                    if (outGate == null && outUp == null && lw.FfnGateType == GgufType.Q4_K && lw.FfnUpType == GgufType.Q4_K)
+                    {
+                        LaunchGemmSwigluBatch(_dFfnHidden, _dFfnNormX, _dGateLayers[layerIndex], _dUpLayers[layerIndex], hiddenDim, ffnDim, seqLen);
+                    }
+                    else
+                    {
+                        LaunchGemmBatch(lw.FfnGateType, _dFfnGate, _dFfnNormX, _dGateLayers[layerIndex], hiddenDim, ffnDim, seqLen);
+                        LaunchGemmBatch(lw.FfnUpType, _dFfnUp, _dFfnNormX, _dUpLayers[layerIndex], hiddenDim, ffnDim, seqLen);
+
+                        if (outGate != null) _gpu.CopyToHost((IntPtr)outGate.DataPointer, _dFfnGate, ffnBytes);
+                        if (outUp != null) _gpu.CopyToHost((IntPtr)outUp.DataPointer, _dFfnUp, ffnBytes);
+
+                        LaunchSwiglu(_dFfnHidden, _dFfnGate, _dFfnUp, totalFfnElements);
+                    }
+
+                    Tensor<float>? hiddenTarget = outHidden ?? tempHidden;
+                    if (hiddenTarget != null)
+                    {
+                        _gpu.CopyToHost((IntPtr)hiddenTarget.DataPointer, _dFfnHidden, ffnBytes);
+                    }
+
+                    LaunchGemmBatch(lw.FfnDownType, _dFfnDownOut, _dFfnHidden, _dDownLayers[layerIndex], ffnDim, hiddenDim, seqLen);
+                    _gpu.CopyToHost((IntPtr)outDown.DataPointer, _dFfnDownOut, normBytes);
+                }
+
+                if (!downZero)
+                {
+                    AddLoraDeltaHost((outHidden ?? tempHidden)!, downLora, outDown);
+                }
             }
-            else
+            finally
             {
-                LaunchGemmBatch(lw.FfnGateType, _dFfnGate, _dFfnNormX, _dGateLayers[layerIndex], hiddenDim, ffnDim, seqLen);
-                LaunchGemmBatch(lw.FfnUpType, _dFfnUp, _dFfnNormX, _dUpLayers[layerIndex], hiddenDim, ffnDim, seqLen);
-
-                // 3. Save Gate & Up to host if required for activation checkpointing backward pass
-                if (outGate != null) _gpu.CopyToHost((IntPtr)outGate.DataPointer, _dFfnGate, ffnBytes);
-                if (outUp != null) _gpu.CopyToHost((IntPtr)outUp.DataPointer, _dFfnUp, ffnBytes);
-
-                // 4. Compute SwiGLU in VRAM: Hidden = SiLU(Gate) * Up
-                LaunchSwiglu(_dFfnHidden, _dFfnGate, _dFfnUp, totalFfnElements);
+                tempHidden?.Dispose();
             }
-
-            // 5. Save Hidden to host if required
-            if (outHidden != null) _gpu.CopyToHost((IntPtr)outHidden.DataPointer, _dFfnHidden, ffnBytes);
-
-            // 6. Launch Down base GEMM in VRAM: DownOut = Hidden * W_down
-            LaunchGemmBatch(lw.FfnDownType, _dFfnDownOut, _dFfnHidden, _dDownLayers[layerIndex], ffnDim, hiddenDim, seqLen);
-
-            // 7. Copy DownOut back to host (1 PCIe transfer)
-            _gpu.CopyToHost((IntPtr)outDown.DataPointer, _dFfnDownOut, normBytes);
+            return;
         }
 
-        // 8. Add LoRA adapter deltas
-        if (outGate != null) AddLoraDeltaHost(norm2X, gateLora, outGate);
-        if (outUp != null) AddLoraDeltaHost(norm2X, upLora, outUp);
-        if (outHidden != null) AddLoraDeltaHost(outHidden, downLora, outDown);
+        // Exact trained-adapter path: apply Gate & Up LoRA deltas BEFORE SwiGLU and Down projection
+        Tensor<float> gateBuf = outGate ?? new Tensor<float>(seqLen, ffnDim);
+        Tensor<float> upBuf = outUp ?? new Tensor<float>(seqLen, ffnDim);
+        Tensor<float> hiddenBuf = outHidden ?? new Tensor<float>(seqLen, ffnDim);
+
+        try
+        {
+            lock (_scratchLock)
+            {
+                EnsureFfnCapacity(normBytes, ffnBytes);
+                _gpu.CopyToDevice(_dFfnNormX, (IntPtr)norm2X.DataPointer, normBytes);
+                LaunchGemmBatch(lw.FfnGateType, _dFfnGate, _dFfnNormX, _dGateLayers[layerIndex], hiddenDim, ffnDim, seqLen);
+                LaunchGemmBatch(lw.FfnUpType, _dFfnUp, _dFfnNormX, _dUpLayers[layerIndex], hiddenDim, ffnDim, seqLen);
+                _gpu.CopyToHost((IntPtr)gateBuf.DataPointer, _dFfnGate, ffnBytes);
+                _gpu.CopyToHost((IntPtr)upBuf.DataPointer, _dFfnUp, ffnBytes);
+            }
+
+            if (!gateZero) AddLoraDeltaHost(norm2X, gateLora, gateBuf);
+            if (!upZero) AddLoraDeltaHost(norm2X, upLora, upBuf);
+
+            SwiGluKernel.Forward(
+                (float*)gateBuf.DataPointer,
+                (float*)upBuf.DataPointer,
+                (float*)hiddenBuf.DataPointer,
+                totalFfnElements);
+
+            lock (_scratchLock)
+            {
+                EnsureFfnCapacity(normBytes, ffnBytes);
+                _gpu.CopyToDevice(_dFfnHidden, (IntPtr)hiddenBuf.DataPointer, ffnBytes);
+                LaunchGemmBatch(lw.FfnDownType, _dFfnDownOut, _dFfnHidden, _dDownLayers[layerIndex], ffnDim, hiddenDim, seqLen);
+                _gpu.CopyToHost((IntPtr)outDown.DataPointer, _dFfnDownOut, normBytes);
+            }
+
+            if (!downZero)
+            {
+                AddLoraDeltaHost(hiddenBuf, downLora, outDown);
+            }
+        }
+        finally
+        {
+            if (outGate == null) gateBuf.Dispose();
+            if (outUp == null) upBuf.Dispose();
+            if (outHidden == null) hiddenBuf.Dispose();
+        }
     }
 
     private static void AddLoraDeltaHost(Tensor<float> x, LoraAdapter adapter, Tensor<float> output)
     {
+        if (!adapter.IsEnabled || adapter.IsZeroDelta) return;
+
         if (x.IsContiguous && output.IsContiguous && adapter.AdapterA.IsContiguous && adapter.AdapterB.IsContiguous)
         {
             int seqLen = x.Shape[0];
@@ -329,7 +386,6 @@ public sealed unsafe partial class GpuLoraEngine
             return;
         }
 
-        // output += (alpha / r) * (x * A) * B
         using var lowRank = TensorOps.MatMul(x, adapter.AdapterA, GpuTarget.Cpu);
         using var delta = TensorOps.MatMul(lowRank, adapter.AdapterB, GpuTarget.Cpu);
         using var scaled = TensorOps.Scale(delta, adapter.Scaling);
@@ -364,6 +420,7 @@ public sealed unsafe partial class GpuLoraEngine
         pArgs[7] = &freqBase;
         pArgs[8] = &freqScale;
 
+        CuDriver.CtxSetCurrent(_gpu.Handle);
         CuDriver.Check(CuDriver.LaunchKernel(
             _fnRopeBatch,
             gridSize, 1, 1,
@@ -377,10 +434,13 @@ public sealed unsafe partial class GpuLoraEngine
         IntPtr dQ, IntPtr dK, IntPtr dV, IntPtr dAttnOut, IntPtr dProbs,
         int seqLen, int nHeadsQ, int nHeadsKv, int headDim, float scale)
     {
-        uint blockSize = (uint)headDim;
+        if (headDim <= 0 || headDim > 1024)
+            throw new ArgumentOutOfRangeException(nameof(headDim), $"GPU training attention requires 1 <= headDim <= 1024, got {headDim}.");
+
+        uint blockSize = (uint)(((headDim + 31) / 32) * 32);
         uint gridX = (uint)nHeadsQ;
         uint gridY = (uint)seqLen;
-        uint sharedMemBytes = dProbs != IntPtr.Zero ? (uint)((4 + seqLen) * sizeof(float)) : 16;
+        uint sharedMemBytes = dProbs != IntPtr.Zero ? (uint)(seqLen * sizeof(float)) : 0u;
 
         void** pArgs = stackalloc void*[10];
         pArgs[0] = &dQ;
@@ -394,13 +454,14 @@ public sealed unsafe partial class GpuLoraEngine
         pArgs[8] = &headDim;
         pArgs[9] = &scale;
 
+        CuDriver.CtxSetCurrent(_gpu.Handle);
         CuDriver.Check(CuDriver.LaunchKernel(
             _fnAttnTrainFwd,
             gridX, gridY, 1,
             blockSize, 1, 1,
             sharedMemBytes, IntPtr.Zero,
             (IntPtr)pArgs,
-            IntPtr.Zero), "LaunchKernel(attention_causal_gqa_train_fwd)");
+            IntPtr.Zero), "LaunchKernel(tune_attn_causal_gqa_fwd)");
     }
 
     public void ForwardAttention(
@@ -418,34 +479,29 @@ public sealed unsafe partial class GpuLoraEngine
     {
         int qDim = nHeadsQ * headDim;
         int kvDim = nHeadsKv * headDim;
-        nuint qBytes = (nuint)(seqLen * qDim * sizeof(float));
-        nuint kvBytes = (nuint)(seqLen * kvDim * sizeof(float));
+        nuint qBytes = (nuint)((long)seqLen * qDim * sizeof(float));
+        nuint kvBytes = (nuint)((long)seqLen * kvDim * sizeof(float));
         float scale = 1.0f / MathF.Sqrt(headDim);
 
         lock (_scratchLock)
         {
             EnsureAttnCapacity(seqLen, nHeadsQ, nHeadsKv, headDim);
 
-            // Copy Q, K, V to VRAM buffers
             _gpu.CopyToDevice(_dQBuf, (IntPtr)q.DataPointer, qBytes);
             _gpu.CopyToDevice(_dKBuf, (IntPtr)k.DataPointer, kvBytes);
             _gpu.CopyToDevice(_dVBuf, (IntPtr)v.DataPointer, kvBytes);
 
-            // 1. RoPE in VRAM (GPU batch kernel)
             LaunchRopeBatch(_dQBuf, _dKBuf, nHeadsQ, nHeadsKv, headDim, seqLen, ropeFreqBase, 1.0f);
 
-            // Copy RoPE-applied Q and K back to host if needed for backward
             if (attnProbs != null)
             {
                 _gpu.CopyToHost((IntPtr)q.DataPointer, _dQBuf, qBytes);
                 _gpu.CopyToHost((IntPtr)k.DataPointer, _dKBuf, kvBytes);
             }
 
-            // 2. Causal FlashAttention in VRAM
             IntPtr dProbs = attnProbs != null ? _dAttnProbs : IntPtr.Zero;
             LaunchAttnTrainFwd(_dQBuf, _dKBuf, _dVBuf, _dAttnOut, dProbs, seqLen, nHeadsQ, nHeadsKv, headDim, scale);
 
-            // Copy results back
             _gpu.CopyToHost((IntPtr)attnOut.DataPointer, _dAttnOut, qBytes);
             if (attnProbs != null)
             {

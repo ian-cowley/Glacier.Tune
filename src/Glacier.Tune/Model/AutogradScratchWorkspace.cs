@@ -89,6 +89,9 @@ public sealed unsafe class AutogradScratchWorkspace : IDisposable
         FfnScratchA = (float*)NativeMemory.AlignedAlloc(bytesFfn, 64);
         FfnScratchB = (float*)NativeMemory.AlignedAlloc(bytesFfn, 64);
         FfnScratchC = (float*)NativeMemory.AlignedAlloc(bytesFfn, 64);
+        NativeMemory.Clear(FfnScratchA, bytesFfn);
+        NativeMemory.Clear(FfnScratchB, bytesFfn);
+        NativeMemory.Clear(FfnScratchC, bytesFfn);
 
         HiddenScratchA = (float*)NativeMemory.AlignedAlloc(bytesHidden, 64);
         HiddenScratchB = (float*)NativeMemory.AlignedAlloc(bytesHidden, 64);
@@ -96,11 +99,21 @@ public sealed unsafe class AutogradScratchWorkspace : IDisposable
         HiddenScratchD = (float*)NativeMemory.AlignedAlloc(bytesHidden, 64);
         HiddenScratchE = (float*)NativeMemory.AlignedAlloc(bytesHidden, 64);
         HiddenScratchF = (float*)NativeMemory.AlignedAlloc(bytesHidden, 64);
+        NativeMemory.Clear(HiddenScratchA, bytesHidden);
+        NativeMemory.Clear(HiddenScratchB, bytesHidden);
+        NativeMemory.Clear(HiddenScratchC, bytesHidden);
+        NativeMemory.Clear(HiddenScratchD, bytesHidden);
+        NativeMemory.Clear(HiddenScratchE, bytesHidden);
+        NativeMemory.Clear(HiddenScratchF, bytesHidden);
 
         QDimScratchA = (float*)NativeMemory.AlignedAlloc(bytesQ, 64);
         QDimScratchB = (float*)NativeMemory.AlignedAlloc(bytesQ, 64);
         KvDimScratchA = (float*)NativeMemory.AlignedAlloc(bytesKv, 64);
         KvDimScratchB = (float*)NativeMemory.AlignedAlloc(bytesKv, 64);
+        NativeMemory.Clear(QDimScratchA, bytesQ);
+        NativeMemory.Clear(QDimScratchB, bytesQ);
+        NativeMemory.Clear(KvDimScratchA, bytesKv);
+        NativeMemory.Clear(KvDimScratchB, bytesKv);
     }
 
     private void FreeAll()
@@ -125,6 +138,7 @@ public sealed unsafe class AutogradScratchWorkspace : IDisposable
     public static Tensor<float> Wrap(float* ptr, params ReadOnlySpan<int> shape)
     {
         var s = new Shape8(shape);
+        new Span<float>(ptr, (int)s.ElementCount).Clear();
         var strides = Shape8.ComputeContiguousStrides(s);
         var block = new NativeMemoryBlock<float>(ptr, s.ElementCount, ownsMemory: false);
         return new Tensor<float>(block, s, strides, 0);

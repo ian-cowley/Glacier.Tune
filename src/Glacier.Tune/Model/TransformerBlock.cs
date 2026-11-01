@@ -71,6 +71,7 @@ public sealed unsafe class TransformerBlock : IDisposable
     private readonly LoraAdapter _downProj;
 
     private readonly List<Tensor<float>> _trainableParameters = [];
+    private Glacier.Tune.Gpu.GpuLoraEngine? _gpuEngine;
     private bool _disposed;
 
     public int LayerIndex => _layerIndex;
@@ -110,16 +111,17 @@ public sealed unsafe class TransformerBlock : IDisposable
 
         int qDim = _nHeadsQ * _headDim;
         int kvDim = _nHeadsKv * _headDim;
+        int baseSeed = config.Seed ?? 42;
 
-        // Initialize LoRA adapters wrapping base weights with target hardware accelerator
-        _qProj = new LoraAdapter(_hiddenDim, qDim, config.Rank, config.Alpha, config.Seed, target);
-        _kProj = new LoraAdapter(_hiddenDim, kvDim, config.Rank, config.Alpha, config.Seed, target);
-        _vProj = new LoraAdapter(_hiddenDim, kvDim, config.Rank, config.Alpha, config.Seed, target);
-        _oProj = new LoraAdapter(qDim, _hiddenDim, config.Rank, config.Alpha, config.Seed, target);
+        // Initialize LoRA adapters wrapping base weights with deterministic per-(layer, projection) seeds
+        _qProj = new LoraAdapter(_hiddenDim, qDim, config.Rank, config.Alpha, DeriveSeed(baseSeed, layerIndex, 0), target, HasTarget(config, "q_proj", "attn_q"));
+        _kProj = new LoraAdapter(_hiddenDim, kvDim, config.Rank, config.Alpha, DeriveSeed(baseSeed, layerIndex, 1), target, HasTarget(config, "k_proj", "attn_k"));
+        _vProj = new LoraAdapter(_hiddenDim, kvDim, config.Rank, config.Alpha, DeriveSeed(baseSeed, layerIndex, 2), target, HasTarget(config, "v_proj", "attn_v"));
+        _oProj = new LoraAdapter(qDim, _hiddenDim, config.Rank, config.Alpha, DeriveSeed(baseSeed, layerIndex, 3), target, HasTarget(config, "o_proj", "attn_output"));
 
-        _gateProj = new LoraAdapter(_hiddenDim, _ffnDim, config.Rank, config.Alpha, config.Seed, target);
-        _upProj = new LoraAdapter(_hiddenDim, _ffnDim, config.Rank, config.Alpha, config.Seed, target);
-        _downProj = new LoraAdapter(_ffnDim, _hiddenDim, config.Rank, config.Alpha, config.Seed, target);
+        _gateProj = new LoraAdapter(_hiddenDim, _ffnDim, config.Rank, config.Alpha, DeriveSeed(baseSeed, layerIndex, 4), target, HasTarget(config, "gate_proj", "ffn_gate"));
+        _upProj = new LoraAdapter(_hiddenDim, _ffnDim, config.Rank, config.Alpha, DeriveSeed(baseSeed, layerIndex, 5), target, HasTarget(config, "up_proj", "ffn_up"));
+        _downProj = new LoraAdapter(_ffnDim, _hiddenDim, config.Rank, config.Alpha, DeriveSeed(baseSeed, layerIndex, 6), target, HasTarget(config, "down_proj", "ffn_down"));
 
         RegisterAdapter(_qProj);
         RegisterAdapter(_kProj);
@@ -128,6 +130,30 @@ public sealed unsafe class TransformerBlock : IDisposable
         RegisterAdapter(_gateProj);
         RegisterAdapter(_upProj);
         RegisterAdapter(_downProj);
+    }
+
+    private static int DeriveSeed(int baseSeed, int layerIndex, int projOrdinal) =>
+        unchecked(baseSeed + layerIndex * 1009 + projOrdinal * 9176);
+
+    private static bool HasTarget(LoraConfig config, string canonicalName, string ggufAlias)
+    {
+        if (config.TargetModules == null || config.TargetModules.Length == 0)
+        {
+            return true;
+        }
+
+        foreach (string module in config.TargetModules)
+        {
+            if (string.Equals(module, canonicalName, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(module, ggufAlias, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(module, "all", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(module, "all-linear", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private void RegisterAdapter(LoraAdapter lora)
@@ -140,13 +166,14 @@ public sealed unsafe class TransformerBlock : IDisposable
     /// </summary>
     public void ConnectGpuWeights(Glacier.Tune.Gpu.GpuLoraEngine engine)
     {
-        _qProj.SetGpuBaseWeights(engine.GetQ(_layerIndex), engine.GetQBias(_layerIndex));
-        _kProj.SetGpuBaseWeights(engine.GetK(_layerIndex), engine.GetKBias(_layerIndex));
-        _vProj.SetGpuBaseWeights(engine.GetV(_layerIndex), engine.GetVBias(_layerIndex));
-        _oProj.SetGpuBaseWeights(engine.GetAttnOut(_layerIndex));
-        _gateProj.SetGpuBaseWeights(engine.GetGate(_layerIndex));
-        _upProj.SetGpuBaseWeights(engine.GetUp(_layerIndex));
-        _downProj.SetGpuBaseWeights(engine.GetDown(_layerIndex));
+        _gpuEngine = engine;
+        _qProj.SetGpuBaseWeights(engine, engine.GetQ(_layerIndex), engine.GetQBias(_layerIndex));
+        _kProj.SetGpuBaseWeights(engine, engine.GetK(_layerIndex), engine.GetKBias(_layerIndex));
+        _vProj.SetGpuBaseWeights(engine, engine.GetV(_layerIndex), engine.GetVBias(_layerIndex));
+        _oProj.SetGpuBaseWeights(engine, engine.GetAttnOut(_layerIndex), engine.GetAttnOutBias(_layerIndex));
+        _gateProj.SetGpuBaseWeights(engine, engine.GetGate(_layerIndex));
+        _upProj.SetGpuBaseWeights(engine, engine.GetUp(_layerIndex));
+        _downProj.SetGpuBaseWeights(engine, engine.GetDown(_layerIndex));
     }
 
     /// <summary>
@@ -177,9 +204,13 @@ public sealed unsafe class TransformerBlock : IDisposable
         var k = new Tensor<float>(seqLen, kvDim);
         var v = new Tensor<float>(seqLen, kvDim);
 
-        if (Glacier.Tune.Gpu.GpuLoraEngine.Current != null)
+        var gpu = _gpuEngine;
+        if (gpu != null &&
+            gpu.SupportsForwardGemm(_weights.QType) &&
+            gpu.SupportsForwardGemm(_weights.KType) &&
+            gpu.SupportsForwardGemm(_weights.VType))
         {
-            Glacier.Tune.Gpu.GpuLoraEngine.Current.ForwardQKV(
+            gpu.ForwardQKV(
                 _layerIndex, norm1X, q, k, v, _qProj, _kProj, _vProj, seqLen);
         }
         else
@@ -196,9 +227,9 @@ public sealed unsafe class TransformerBlock : IDisposable
         var attnOut = new Tensor<float>(seqLen, qDim);
         var attnProbs = state != null ? new Tensor<float>(_nHeadsQ, seqLen, seqLen) : null;
 
-        if (Glacier.Tune.Gpu.GpuLoraEngine.Current != null)
+        if (gpu != null && gpu.SupportsAttention(seqLen, _headDim))
         {
-            Glacier.Tune.Gpu.GpuLoraEngine.Current.ForwardAttention(
+            gpu.ForwardAttention(
                 _layerIndex, q, k, v, attnOut, attnProbs,
                 seqLen, _nHeadsQ, _nHeadsKv, _headDim, _ropeFreqBase);
         }
@@ -255,7 +286,7 @@ public sealed unsafe class TransformerBlock : IDisposable
         if (state != null) state.Norm2X = norm2X;
         if (swDbg is not null) { tNorm2 = swDbg.ElapsedMilliseconds; swDbg.Restart(); }
 
-        // 7 & 8. Fused SwiGLU FFN & Down Projection in VRAM
+        // 7 & 8. Fused SwiGLU FFN & Down Projection in VRAM / CPU
         var downOut = new Tensor<float>(seqLen, _hiddenDim);
         Tensor<float>? gate = null;
         Tensor<float>? up = null;
@@ -271,9 +302,12 @@ public sealed unsafe class TransformerBlock : IDisposable
             state.Hidden = hidden;
         }
 
-        if (Glacier.Tune.Gpu.GpuLoraEngine.Current != null)
+        if (gpu != null &&
+            gpu.SupportsForwardGemm(_weights.FfnGateType) &&
+            gpu.SupportsForwardGemm(_weights.FfnUpType) &&
+            gpu.SupportsForwardGemm(_weights.FfnDownType))
         {
-            Glacier.Tune.Gpu.GpuLoraEngine.Current.ForwardFfn(
+            gpu.ForwardFfn(
                 _layerIndex, norm2X, gate, up, hidden, downOut,
                 _gateProj, _upProj, _downProj, seqLen);
         }
@@ -314,7 +348,6 @@ public sealed unsafe class TransformerBlock : IDisposable
         if (!saveActivations)
         {
             x1.Dispose();
-            hidden?.Dispose();
             norm2X.Dispose();
         }
 
@@ -323,7 +356,8 @@ public sealed unsafe class TransformerBlock : IDisposable
 
     /// <summary>
     /// Executes full reverse-mode backpropagation through the transformer block.
-    /// Propagates gradients through DownProj, SwiGLU, Gate/Up, Norm2, OProj, CausalAttention, RoPE, Q/K/V, and Norm1.
+    /// Propagates gradients through frozen base projections and LoRA adapters across
+    /// DownProj, SwiGLU, Gate/Up, Norm2, OProj, CausalAttention, RoPE, Q/K/V, and Norm1.
     /// Returns dXInput for the preceding layer.
     /// </summary>
     public Tensor<float> Backward(
@@ -341,10 +375,9 @@ public sealed unsafe class TransformerBlock : IDisposable
         // -------------------------------------------------------------
         // A. FFN Backward Pass
         // -------------------------------------------------------------
-        // Down projection backward: accumulates adapter gradients into DownProj
-        // and returns gradient contribution to Hidden
+        // Down projection backward: dHidden = dOutput * (W_down + DeltaW_down)
         using var dHidden = AutogradScratchWorkspace.Wrap(ws.FfnScratchA, seqLen, _ffnDim);
-        _downProj.Backward(dOutput, state.Hidden!, dHidden);
+        _downProj.Backward(_weights.FfnDownType, _weights.FfnDownWeight, dOutput, state.Hidden!, dHidden);
         if (swDbg is not null) { tDownBwd = swDbg.ElapsedMilliseconds; swDbg.Restart(); }
 
         // SwiGLU backward: dGate, dUp
@@ -363,8 +396,8 @@ public sealed unsafe class TransformerBlock : IDisposable
         using var dNorm2X_Gate = AutogradScratchWorkspace.Wrap(ws.HiddenScratchA, seqLen, _hiddenDim);
         using var dNorm2X_Up = AutogradScratchWorkspace.Wrap(ws.HiddenScratchB, seqLen, _hiddenDim);
         Parallel.Invoke(
-            () => _gateProj.Backward(dGate, state.Norm2X!, dNorm2X_Gate),
-            () => _upProj.Backward(dUp, state.Norm2X!, dNorm2X_Up)
+            () => _gateProj.Backward(_weights.FfnGateType, _weights.FfnGateWeight, dGate, state.Norm2X!, dNorm2X_Gate),
+            () => _upProj.Backward(_weights.FfnUpType, _weights.FfnUpWeight, dUp, state.Norm2X!, dNorm2X_Up)
         );
         using var dNorm2X = AutogradScratchWorkspace.Wrap(ws.HiddenScratchC, seqLen, _hiddenDim);
         ElementwiseKernels.Add(dNorm2X_Gate, dNorm2X_Up, dNorm2X);
@@ -387,9 +420,9 @@ public sealed unsafe class TransformerBlock : IDisposable
         int qDim = _nHeadsQ * _headDim;
         int kvDim = _nHeadsKv * _headDim;
 
-        // OProj backward: dAttnOut = dX1 * W_o^T
+        // OProj backward: dAttnOut = dX1 * (W_o + DeltaW_o)
         using var dAttnOut = AutogradScratchWorkspace.Wrap(ws.QDimScratchA, seqLen, qDim);
-        _oProj.Backward(dX1, state.AttnOut!, dAttnOut);
+        _oProj.Backward(_weights.AttnOutType, _weights.AttnOutWeight, dX1, state.AttnOut!, dAttnOut);
         if (swDbg is not null) { tOBwd = swDbg.ElapsedMilliseconds; swDbg.Restart(); }
 
         // Causal Attention & RoPE backward -> dQ, dK, dV
@@ -397,9 +430,9 @@ public sealed unsafe class TransformerBlock : IDisposable
         using var dK = AutogradScratchWorkspace.Wrap(ws.KvDimScratchA, seqLen, kvDim);
         using var dV = AutogradScratchWorkspace.Wrap(ws.KvDimScratchB, seqLen, kvDim);
 
-        if (Glacier.Tune.Gpu.GpuLoraEngine.Current != null)
+        if (_gpuEngine != null && _gpuEngine.SupportsAttention(seqLen, _headDim))
         {
-            Glacier.Tune.Gpu.GpuLoraEngine.Current.BackwardAttention(
+            _gpuEngine.BackwardAttention(
                 _layerIndex, dAttnOut,
                 state.Q!, state.K!, state.V!, state.AttnProbs!,
                 dQ, dK, dV,
@@ -425,9 +458,9 @@ public sealed unsafe class TransformerBlock : IDisposable
         using var dNorm1X_K = AutogradScratchWorkspace.Wrap(ws.HiddenScratchB, seqLen, _hiddenDim);
         using var dNorm1X_V = AutogradScratchWorkspace.Wrap(ws.HiddenScratchC, seqLen, _hiddenDim);
         Parallel.Invoke(
-            () => _qProj.Backward(dQ, state.Norm1X!, dNorm1X_Q),
-            () => _kProj.Backward(dK, state.Norm1X!, dNorm1X_K),
-            () => _vProj.Backward(dV, state.Norm1X!, dNorm1X_V)
+            () => _qProj.Backward(_weights.QType, _weights.QWeight, dQ, state.Norm1X!, dNorm1X_Q),
+            () => _kProj.Backward(_weights.KType, _weights.KWeight, dK, state.Norm1X!, dNorm1X_K),
+            () => _vProj.Backward(_weights.VType, _weights.VWeight, dV, state.Norm1X!, dNorm1X_V)
         );
         using var dNorm1X = AutogradScratchWorkspace.Wrap(ws.HiddenScratchD, seqLen, _hiddenDim);
         ElementwiseKernels.Add(dNorm1X_Q, dNorm1X_K, dNorm1X);

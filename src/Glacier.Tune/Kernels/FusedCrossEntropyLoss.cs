@@ -2,7 +2,6 @@ using System;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
-using System.Threading;
 using System.Threading.Tasks;
 using Glacier.Inference.Gguf;
 using Glacier.Inference.Quant;
@@ -11,12 +10,11 @@ namespace Glacier.Tune.Kernels;
 
 /// <summary>
 /// Online streaming Fused Cross-Entropy Loss over large vocabularies (e.g. 152,064 tokens).
-/// Computes online Log-Sum-Exp and directly backpropagates dLogits into hidden-state gradients (dX)
-/// with sub-2MB peak memory consumption, avoiding large [T x Vocab] tensor allocations.
+/// Computes online Log-Sum-Exp and directly backpropagates exact unbiased dLogits into hidden-state gradients (dX)
+/// via tiled GPU VRAM or SIMD CPU transpose-GEMMs without allocating full [T x Vocab] tensors.
 /// </summary>
 public static unsafe class FusedCrossEntropyLoss
 {
-    private static readonly ThreadLocal<float[]> s_threadLocalBuffer = new(() => new float[8192]);
     private const int VocabTileSize = 4096;
 
     public static float ComputeLossAndGradients(
@@ -28,12 +26,13 @@ public static unsafe class FusedCrossEntropyLoss
         float* dFinalHidden, // [seqLen, hiddenDim] - output gradient
         int seqLen,
         int hiddenDim,
-        int vocabSize)
+        int vocabSize,
+        Glacier.Tune.Gpu.GpuLoraEngine? gpuEngine = null)
     {
         // Clear hidden state gradients
         new Span<float>(dFinalHidden, seqLen * hiddenDim).Clear();
 
-        // 1. Identify valid assistant target tokens (where target >= 0 and target < vocabSize)
+        // 1. Identify valid target tokens (where target >= 0 and target < vocabSize)
         int[] validSeqIndices = new int[seqLen];
         int validCount = 0;
         for (int t = 0; t < seqLen; t++)
@@ -47,197 +46,69 @@ public static unsafe class FusedCrossEntropyLoss
         if (validCount == 0) return 0.0f;
 
         float invValid = 1.0f / validCount;
-        float totalLoss = 0.0f;
 
-        // 2. Pack valid hidden states into contiguous buffer [validCount, hiddenDim]
-        float* pValidHidden = (float*)NativeMemory.Alloc((nuint)(validCount * hiddenDim), sizeof(float));
-
-        for (int i = 0; i < validCount; i++)
-        {
-            int t = validSeqIndices[i];
-            float* src = finalHidden + (long)t * hiddenDim;
-            float* dst = pValidHidden + (long)i * hiddenDim;
-            Buffer.MemoryCopy(src, dst, (ulong)(hiddenDim * sizeof(float)), (ulong)(hiddenDim * sizeof(float)));
-        }
-
-        // 3. GPU execution branch (if GPU LoRA engine is configured)
-        if (Glacier.Tune.Gpu.GpuLoraEngine.Current != null && Glacier.Tune.Gpu.GpuLoraEngine.Current.LmHeadWeight != IntPtr.Zero)
-        {
-            float* pValidLogits = (float*)NativeMemory.Alloc((nuint)((long)validCount * vocabSize), sizeof(float));
-            try
-            {
-                Glacier.Tune.Gpu.GpuLoraEngine.Current.ComputeLmHeadLogits(
-                    lmHeadType, Glacier.Tune.Gpu.GpuLoraEngine.Current.LmHeadWeight, pValidHidden, pValidLogits, hiddenDim, vocabSize, validCount);
-
-                object lossLock = new();
-                Parallel.For<double>(0, validCount, () => 0.0, (i, loopState, localLoss) =>
-                {
-                    int t = validSeqIndices[i];
-                    int targetId = targetTokens[t];
-                    float* logits = pValidLogits + (long)i * vocabSize;
-                    float* dhVec = dFinalHidden + (long)t * hiddenDim;
-
-                    float maxLogit = VectorizedMax(logits, vocabSize);
-                    float sumExp = VectorizedSumExp(logits, vocabSize, maxLogit);
-                    float logSumExp = maxLogit + MathF.Log(sumExp);
-                    float targetLogit = logits[targetId];
-                    float tokenLoss = logSumExp - targetLogit;
-
-                    float pTarget = MathF.Exp(targetLogit - logSumExp);
-                    float targetGradScale = (pTarget - 1.0f) * invValid;
-
-                    float[] tempBuf = s_threadLocalBuffer.Value!;
-                    if (tempBuf.Length < hiddenDim)
-                    {
-                        tempBuf = new float[hiddenDim];
-                        s_threadLocalBuffer.Value = tempBuf;
-                    }
-
-                    fixed (float* tempRow = tempBuf)
-                    {
-                        QuantKernels.ExtractEmbedding(lmHeadType, lmHeadWeight, targetId, tempRow, hiddenDim);
-                        AccumulateScaled(dhVec, tempRow, targetGradScale, hiddenDim);
-
-                        const float precisionThreshold = -16.0f;
-                        for (int v = 0; v < vocabSize; v++)
-                        {
-                            if (v == targetId) continue;
-                            float diff = logits[v] - logSumExp;
-                            if (diff < precisionThreshold) continue;
-
-                            float p = MathF.Exp(diff);
-                            float pScale = p * invValid;
-
-                            QuantKernels.ExtractEmbedding(lmHeadType, lmHeadWeight, v, tempRow, hiddenDim);
-                            AccumulateScaled(dhVec, tempRow, pScale, hiddenDim);
-                        }
-                    }
-
-                    return localLoss + tokenLoss;
-                },
-                localLoss =>
-                {
-                    lock (lossLock) totalLoss += (float)localLoss;
-                });
-
-                return totalLoss * invValid;
-            }
-            finally
-            {
-                NativeMemory.Free(pValidHidden);
-                NativeMemory.Free(pValidLogits);
-            }
-        }
-
-        // 4. 2D Tiled Online Streaming Softmax across large vocabulary
-        int actualTileSize = Math.Min(VocabTileSize, vocabSize);
-        int numTiles = (vocabSize + actualTileSize - 1) / actualTileSize;
-        int rowBytes = (int)GgufTypes.GetRowBytes(lmHeadType, hiddenDim);
-
-        float* pTileLogits = (float*)NativeMemory.Alloc((nuint)((long)validCount * actualTileSize), sizeof(float));
-        float* runningMax = (float*)NativeMemory.Alloc((nuint)validCount, sizeof(float));
-        float* runningSumExp = (float*)NativeMemory.Alloc((nuint)validCount, sizeof(float));
-        float* targetLogits = (float*)NativeMemory.Alloc((nuint)validCount, sizeof(float));
-        float* logSumExp = (float*)NativeMemory.Alloc((nuint)validCount, sizeof(float));
+        // 2. Pack valid hidden states [validCount, hiddenDim] and valid target IDs
+        float* pValidHidden = (float*)NativeMemory.AlignedAlloc((nuint)((long)validCount * hiddenDim * sizeof(float)), 64);
+        float* pValidGrad = (float*)NativeMemory.AlignedAlloc((nuint)((long)validCount * hiddenDim * sizeof(float)), 64);
+        int* validTargetIds = (int*)NativeMemory.Alloc((nuint)validCount, sizeof(int));
 
         try
         {
+            new Span<float>(pValidGrad, validCount * hiddenDim).Clear();
+
             for (int i = 0; i < validCount; i++)
             {
-                runningMax[i] = float.NegativeInfinity;
-                runningSumExp[i] = 0.0f;
-                targetLogits[i] = 0.0f;
+                int t = validSeqIndices[i];
+                validTargetIds[i] = targetTokens[t];
+                float* src = finalHidden + (long)t * hiddenDim;
+                float* dst = pValidHidden + (long)i * hiddenDim;
+                Buffer.MemoryCopy(src, dst, (ulong)(hiddenDim * sizeof(float)), (ulong)(hiddenDim * sizeof(float)));
             }
 
-            // PASS 1: Online Log-Sum-Exp computation streamed in tiles
-            for (int tile = 0; tile < numTiles; tile++)
+            // 3. Tiled GPU VRAM execution branch (bounded < 16 MB tile logit memory, zero CPU dequantization)
+            var gpu = gpuEngine;
+            if (gpu != null &&
+                gpu.LmHeadWeight != IntPtr.Zero &&
+                gpu.SupportsForwardGemm(lmHeadType) &&
+                gpu.SupportsBackwardGemm(lmHeadType))
             {
-                int vStart = tile * actualTileSize;
-                int vCount = Math.Min(actualTileSize, vocabSize - vStart);
-                byte* tileWeight = lmHeadWeight + (long)vStart * rowBytes;
+                float gpuLoss = gpu.ComputeTiledLmHeadLossAndGradients(
+                    lmHeadType,
+                    pValidHidden,
+                    pValidGrad,
+                    validTargetIds,
+                    hiddenDim,
+                    vocabSize,
+                    validCount,
+                    VocabTileSize,
+                    &VectorizedMax,
+                    &VectorizedSumExp);
 
-                QuantKernels.MatMulBatch(lmHeadType, tileWeight, pValidHidden, pTileLogits, hiddenDim, vCount, validCount);
+                ScatterValidGradients(pValidGrad, dFinalHidden, validSeqIndices, validCount, hiddenDim);
+                return gpuLoss;
+            }
 
+            // 4. 2D Tiled Online Streaming Softmax & Exact Unbiased Transpose-GEMM on CPU
+            int actualTileSize = Math.Min(VocabTileSize, vocabSize);
+            int numTiles = (vocabSize + actualTileSize - 1) / actualTileSize;
+            int rowBytes = (int)GgufTypes.GetRowBytes(lmHeadType, hiddenDim);
+
+            float* pTileLogits = (float*)NativeMemory.AlignedAlloc((nuint)((long)validCount * actualTileSize * sizeof(float)), 64);
+            float* runningMax = (float*)NativeMemory.Alloc((nuint)validCount, sizeof(float));
+            double* runningSumExp = (double*)NativeMemory.Alloc((nuint)validCount, sizeof(double));
+            float* targetLogits = (float*)NativeMemory.Alloc((nuint)validCount, sizeof(float));
+            double* logSumExp = (double*)NativeMemory.Alloc((nuint)validCount, sizeof(double));
+
+            try
+            {
                 for (int i = 0; i < validCount; i++)
                 {
-                    float* logits = pTileLogits + (long)i * vCount;
-                    int t = validSeqIndices[i];
-                    int targetId = targetTokens[t];
-                    if (targetId >= vStart && targetId < vStart + vCount)
-                    {
-                        targetLogits[i] = logits[targetId - vStart];
-                    }
-
-                    float tileMax = VectorizedMax(logits, vCount);
-                    if (float.IsNegativeInfinity(runningMax[i]))
-                    {
-                        runningMax[i] = tileMax;
-                        runningSumExp[i] = VectorizedSumExp(logits, vCount, tileMax);
-                    }
-                    else
-                    {
-                        float mNew = MathF.Max(runningMax[i], tileMax);
-                        float factor = MathF.Exp(runningMax[i] - mNew);
-                        float tileSum = VectorizedSumExp(logits, vCount, mNew);
-                        runningSumExp[i] = runningSumExp[i] * factor + tileSum;
-                        runningMax[i] = mNew;
-                    }
+                    runningMax[i] = float.NegativeInfinity;
+                    runningSumExp[i] = 0.0;
+                    targetLogits[i] = 0.0f;
                 }
-            }
 
-            for (int i = 0; i < validCount; i++)
-            {
-                float lse = runningMax[i] + MathF.Log(runningSumExp[i]);
-                logSumExp[i] = lse;
-                totalLoss += lse - targetLogits[i];
-            }
-
-            // PASS 2: Exact analytical gradient backpropagation directly into dFinalHidden
-            if (numTiles == 1)
-            {
-                // Single tile: reuse pTileLogits directly without re-evaluating GEMM
-                Parallel.For(0, validCount, i =>
-                {
-                    int t = validSeqIndices[i];
-                    int targetId = targetTokens[t];
-                    float lse = logSumExp[i];
-                    float* logits = pTileLogits + (long)i * vocabSize;
-                    float* dhVec = dFinalHidden + (long)t * hiddenDim;
-
-                    float[] tempBuf = s_threadLocalBuffer.Value!;
-                    if (tempBuf.Length < hiddenDim)
-                    {
-                        tempBuf = new float[hiddenDim];
-                        s_threadLocalBuffer.Value = tempBuf;
-                    }
-
-                    fixed (float* tempRow = tempBuf)
-                    {
-                        const float precisionThreshold = -16.0f;
-                        for (int v = 0; v < vocabSize; v++)
-                        {
-                            float diff = logits[v] - lse;
-                            if (v == targetId)
-                            {
-                                float p = MathF.Exp(diff);
-                                float targetGradScale = (p - 1.0f) * invValid;
-                                QuantKernels.ExtractEmbedding(lmHeadType, lmHeadWeight, v, tempRow, hiddenDim);
-                                AccumulateScaled(dhVec, tempRow, targetGradScale, hiddenDim);
-                            }
-                            else if (diff >= precisionThreshold)
-                            {
-                                float p = MathF.Exp(diff);
-                                float pScale = p * invValid;
-                                QuantKernels.ExtractEmbedding(lmHeadType, lmHeadWeight, v, tempRow, hiddenDim);
-                                AccumulateScaled(dhVec, tempRow, pScale, hiddenDim);
-                            }
-                        }
-                    }
-                });
-            }
-            else
-            {
-                // Multi-tile streaming backpropagation
+                // PASS 1: Online Log-Sum-Exp computation streamed in tiles
                 for (int tile = 0; tile < numTiles; tile++)
                 {
                     int vStart = tile * actualTileSize;
@@ -246,59 +117,115 @@ public static unsafe class FusedCrossEntropyLoss
 
                     QuantKernels.MatMulBatch(lmHeadType, tileWeight, pValidHidden, pTileLogits, hiddenDim, vCount, validCount);
 
-                    Parallel.For(0, validCount, i =>
+                    for (int i = 0; i < validCount; i++)
                     {
-                        int t = validSeqIndices[i];
-                        int targetId = targetTokens[t];
-                        float lse = logSumExp[i];
                         float* logits = pTileLogits + (long)i * vCount;
-                        float* dhVec = dFinalHidden + (long)t * hiddenDim;
-
-                        float[] tempBuf = s_threadLocalBuffer.Value!;
-                        if (tempBuf.Length < hiddenDim)
+                        int targetId = validTargetIds[i];
+                        if (targetId >= vStart && targetId < vStart + vCount)
                         {
-                            tempBuf = new float[hiddenDim];
-                            s_threadLocalBuffer.Value = tempBuf;
+                            targetLogits[i] = logits[targetId - vStart];
                         }
 
-                        fixed (float* tempRow = tempBuf)
+                        float tileMax = VectorizedMax(logits, vCount);
+                        if (float.IsNegativeInfinity(runningMax[i]))
                         {
-                            const float precisionThreshold = -16.0f;
-                            for (int v = 0; v < vCount; v++)
+                            runningMax[i] = tileMax;
+                            runningSumExp[i] = VectorizedSumExp(logits, vCount, tileMax);
+                        }
+                        else
+                        {
+                            float mNew = MathF.Max(runningMax[i], tileMax);
+                            double factor = Math.Exp((double)runningMax[i] - mNew);
+                            double tileSum = VectorizedSumExp(logits, vCount, mNew);
+                            runningSumExp[i] = runningSumExp[i] * factor + tileSum;
+                            runningMax[i] = mNew;
+                        }
+                    }
+                }
+
+                double totalLoss = 0.0;
+                for (int i = 0; i < validCount; i++)
+                {
+                    double lse = runningMax[i] + Math.Log(runningSumExp[i]);
+                    logSumExp[i] = lse;
+                    totalLoss += lse - targetLogits[i];
+                }
+
+                // PASS 2: Exact unbiased analytical gradient backpropagation via tiled BaseBackward
+                for (int tile = 0; tile < numTiles; tile++)
+                {
+                    int vStart = tile * actualTileSize;
+                    int vCount = Math.Min(actualTileSize, vocabSize - vStart);
+                    byte* tileWeight = lmHeadWeight + (long)vStart * rowBytes;
+
+                    if (numTiles > 1)
+                    {
+                        QuantKernels.MatMulBatch(lmHeadType, tileWeight, pValidHidden, pTileLogits, hiddenDim, vCount, validCount);
+                    }
+
+                    int vStartSnap = vStart;
+                    int vCountSnap = vCount;
+                    Parallel.For(0, validCount, i =>
+                    {
+                        int targetId = validTargetIds[i];
+                        double lse = logSumExp[i];
+                        float* logits = pTileLogits + (long)i * vCountSnap;
+                        for (int v = 0; v < vCountSnap; v++)
+                        {
+                            if (vStartSnap + v == targetId)
                             {
-                                int globalV = vStart + v;
-                                float diff = logits[v] - lse;
-                                if (globalV == targetId)
-                                {
-                                    float p = MathF.Exp(diff);
-                                    float targetGradScale = (p - 1.0f) * invValid;
-                                    QuantKernels.ExtractEmbedding(lmHeadType, lmHeadWeight, globalV, tempRow, hiddenDim);
-                                    AccumulateScaled(dhVec, tempRow, targetGradScale, hiddenDim);
-                                }
-                                else if (diff >= precisionThreshold)
-                                {
-                                    float p = MathF.Exp(diff);
-                                    float pScale = p * invValid;
-                                    QuantKernels.ExtractEmbedding(lmHeadType, lmHeadWeight, globalV, tempRow, hiddenDim);
-                                    AccumulateScaled(dhVec, tempRow, pScale, hiddenDim);
-                                }
+                                logits[v] = (float)(Math.Exp(logits[v] - lse) - 1.0) * invValid;
+                            }
+                            else
+                            {
+                                logits[v] = MathF.Exp((float)(logits[v] - lse)) * invValid;
                             }
                         }
                     });
+
+                    LoraKernels.AccumulateBaseBackward(
+                        lmHeadType,
+                        tileWeight,
+                        pTileLogits,
+                        pValidGrad,
+                        validCount,
+                        hiddenDim,
+                        vCount);
                 }
+
+                ScatterValidGradients(pValidGrad, dFinalHidden, validSeqIndices, validCount, hiddenDim);
+                return (float)(totalLoss * invValid);
+            }
+            finally
+            {
+                NativeMemory.AlignedFree(pTileLogits);
+                NativeMemory.Free(runningMax);
+                NativeMemory.Free(runningSumExp);
+                NativeMemory.Free(targetLogits);
+                NativeMemory.Free(logSumExp);
             }
         }
         finally
         {
-            NativeMemory.Free(pValidHidden);
-            NativeMemory.Free(pTileLogits);
-            NativeMemory.Free(runningMax);
-            NativeMemory.Free(runningSumExp);
-            NativeMemory.Free(targetLogits);
-            NativeMemory.Free(logSumExp);
+            NativeMemory.AlignedFree(pValidHidden);
+            NativeMemory.AlignedFree(pValidGrad);
+            NativeMemory.Free(validTargetIds);
         }
+    }
 
-        return totalLoss * invValid;
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void ScatterValidGradients(float* pValidGrad, float* dFinalHidden, int[] validSeqIndices, int validCount, int hiddenDim)
+    {
+        ulong rowBytes = (ulong)(hiddenDim * sizeof(float));
+        for (int i = 0; i < validCount; i++)
+        {
+            int t = validSeqIndices[i];
+            Buffer.MemoryCopy(
+                pValidGrad + (long)i * hiddenDim,
+                dFinalHidden + (long)t * hiddenDim,
+                rowBytes,
+                rowBytes);
+        }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
@@ -356,62 +283,13 @@ public static unsafe class FusedCrossEntropyLoss
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
-    private static float VectorizedSumExp(float* data, int count, float maxVal)
+    private static double VectorizedSumExp(float* data, int count, float maxVal)
     {
-        float sum = 0f;
+        double sum = 0.0;
         for (int i = 0; i < count; i++)
         {
             sum += MathF.Exp(data[i] - maxVal);
         }
         return sum;
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
-    private static void AccumulateScaled(float* dst, float* src, float scale, int count)
-    {
-        int i = 0;
-        if (Vector512.IsHardwareAccelerated && count >= Vector512<float>.Count)
-        {
-            var vScale = Vector512.Create(scale);
-            int step = Vector512<float>.Count;
-            int limit = count - step;
-            for (; i <= limit; i += step)
-            {
-                var vDst = Vector512.Load(dst + i);
-                var vSrc = Vector512.Load(src + i);
-                vDst = Vector512.FusedMultiplyAdd(vSrc, vScale, vDst);
-                vDst.Store(dst + i);
-            }
-        }
-        else if (Vector256.IsHardwareAccelerated && count >= Vector256<float>.Count)
-        {
-            var vScale = Vector256.Create(scale);
-            int step = Vector256<float>.Count;
-            int limit = count - step;
-            for (; i <= limit; i += step)
-            {
-                var vDst = Vector256.Load(dst + i);
-                var vSrc = Vector256.Load(src + i);
-                vDst = Vector256.FusedMultiplyAdd(vSrc, vScale, vDst);
-                vDst.Store(dst + i);
-            }
-        }
-        else if (Vector128.IsHardwareAccelerated && count >= Vector128<float>.Count)
-        {
-            var vScale = Vector128.Create(scale);
-            int step = Vector128<float>.Count;
-            int limit = count - step;
-            for (; i <= limit; i += step)
-            {
-                var vDst = Vector128.Load(dst + i);
-                var vSrc = Vector128.Load(src + i);
-                vDst = Vector128.FusedMultiplyAdd(vSrc, vScale, vDst);
-                vDst.Store(dst + i);
-            }
-        }
-        for (; i < count; i++)
-        {
-            dst[i] += scale * src[i];
-        }
     }
 }

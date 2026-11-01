@@ -12,7 +12,7 @@ namespace Glacier.Tune.Kernels;
 /// Eliminates intermediate tensor allocations, non-contiguous matrix transpositions,
 /// and CPU indexer overhead by directly operating on contiguous pointers using AVX2/FMA SIMD.
 /// </summary>
-public static unsafe class LoraKernels
+public static unsafe partial class LoraKernels
 {
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public static void ApplyLoraDelta(

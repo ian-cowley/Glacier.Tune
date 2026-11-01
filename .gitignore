@@ -34,6 +34,13 @@ ncrunch*
 Thumbs.db
 .DS_Store
 
+# Secrets & local configuration (Zero Secrets Policy)
+appsettings*.json
+!appsettings.template.json
+.env
+*.env
+*.env.*
+
 # Scratch / working directories
 brain/
 scratch/

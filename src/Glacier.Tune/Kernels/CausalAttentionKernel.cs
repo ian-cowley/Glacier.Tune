@@ -1,15 +1,19 @@
 using System;
+using System.Buffers;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 
 namespace Glacier.Tune.Kernels;
 
 /// <summary>
 /// Full-sequence Causal Multi-Head Self-Attention forward and backward kernels with Grouped-Query Attention (GQA).
-/// Handles arbitrary sequence lengths with causal lower-triangular masking.
+/// Handles arbitrary sequence lengths with causal lower-triangular masking and bounded stack usage.
 /// </summary>
 public static unsafe class CausalAttentionKernel
 {
+    private const int MaxStackAllocSeqLen = 1024;
+
     public static void Forward(
         float* q, float* k, float* v,
         float* output,
@@ -88,11 +92,10 @@ public static unsafe class CausalAttentionKernel
         new Span<float>(dv, seqLen * nHeadsKv * headDim).Clear();
 
         // Allocate lock-free per-head accumulation workspace
-        // Each Q-head accumulates into its own isolated slice [seqLen, headDim] with ZERO lock contention
         long perHeadKvElements = (long)seqLen * headDim;
         nuint workspaceBytes = (nuint)(nHeadsQ * perHeadKvElements * sizeof(float));
-        float* dkWorkspace = (float*)System.Runtime.InteropServices.NativeMemory.AllocZeroed(workspaceBytes);
-        float* dvWorkspace = (float*)System.Runtime.InteropServices.NativeMemory.AllocZeroed(workspaceBytes);
+        float* dkWorkspace = (float*)NativeMemory.AllocZeroed(workspaceBytes);
+        float* dvWorkspace = (float*)NativeMemory.AllocZeroed(workspaceBytes);
 
         try
         {
@@ -103,59 +106,76 @@ public static unsafe class CausalAttentionKernel
                 float* headDk = dkWorkspace + (long)h * perHeadKvElements;
                 float* headDv = dvWorkspace + (long)h * perHeadKvElements;
 
-                // Temporary per-thread buffers
-                Span<float> dpRow = stackalloc float[seqLen];
-                Span<float> dsRow = stackalloc float[seqLen];
+                float[]? pooledScratch = seqLen > MaxStackAllocSeqLen
+                    ? ArrayPool<float>.Shared.Rent(seqLen * 2)
+                    : null;
 
-                for (int i = 0; i < seqLen; i++)
+                try
                 {
-                    float* dOutVec = dOutput + ((long)i * nHeadsQ + h) * headDim;
-                    float* pRow = probsHead + (long)i * seqLen;
+                    Span<float> dpRow = pooledScratch != null
+                        ? pooledScratch.AsSpan(0, seqLen)
+                        : stackalloc float[seqLen];
+                    Span<float> dsRow = pooledScratch != null
+                        ? pooledScratch.AsSpan(seqLen, seqLen)
+                        : stackalloc float[seqLen];
 
-                    // 1. dP = dOut * V^T (only for j <= i)
-                    float dotPdP = 0.0f;
-                    for (int j = 0; j <= i; j++)
+                    for (int i = 0; i < seqLen; i++)
                     {
-                        float* vVec = v + ((long)j * nHeadsKv + kvH) * headDim;
-                        float dp = 0.0f;
-                        for (int d = 0; d < headDim; d++) dp += dOutVec[d] * vVec[d];
-                        dpRow[j] = dp;
-                        dotPdP += pRow[j] * dp;
-                    }
+                        float* dOutVec = dOutput + ((long)i * nHeadsQ + h) * headDim;
+                        float* pRow = probsHead + (long)i * seqLen;
 
-                    // 2. Softmax backward: dS = P * (dP - dot(P, dP)) * scale
-                    for (int j = 0; j <= i; j++)
-                    {
-                        dsRow[j] = pRow[j] * (dpRow[j] - dotPdP) * scale;
-                    }
-
-                    // 3. dQ += dS * K
-                    float* dqVec = dq + ((long)i * nHeadsQ + h) * headDim;
-                    for (int j = 0; j <= i; j++)
-                    {
-                        float ds = dsRow[j];
-                        float* kVec = k + ((long)j * nHeadsKv + kvH) * headDim;
-                        for (int d = 0; d < headDim; d++)
+                        // 1. dP = dOut * V^T (only for j <= i)
+                        float dotPdP = 0.0f;
+                        for (int j = 0; j <= i; j++)
                         {
-                            dqVec[d] += ds * kVec[d];
+                            float* vVec = v + ((long)j * nHeadsKv + kvH) * headDim;
+                            float dp = 0.0f;
+                            for (int d = 0; d < headDim; d++) dp += dOutVec[d] * vVec[d];
+                            dpRow[j] = dp;
+                            dotPdP += pRow[j] * dp;
+                        }
+
+                        // 2. Softmax backward: dS = P * (dP - dot(P, dP)) * scale
+                        for (int j = 0; j <= i; j++)
+                        {
+                            dsRow[j] = pRow[j] * (dpRow[j] - dotPdP) * scale;
+                        }
+
+                        // 3. dQ += dS * K
+                        float* dqVec = dq + ((long)i * nHeadsQ + h) * headDim;
+                        for (int j = 0; j <= i; j++)
+                        {
+                            float ds = dsRow[j];
+                            float* kVec = k + ((long)j * nHeadsKv + kvH) * headDim;
+                            for (int d = 0; d < headDim; d++)
+                            {
+                                dqVec[d] += ds * kVec[d];
+                            }
+                        }
+
+                        // 4. dK and dV accumulations into isolated per-head buffer (100% LOCK-FREE)
+                        for (int j = 0; j <= i; j++)
+                        {
+                            float ds = dsRow[j];
+                            float pVal = pRow[j];
+
+                            float* headDkVec = headDk + (long)j * headDim;
+                            float* headDvVec = headDv + (long)j * headDim;
+                            float* qVec = q + ((long)i * nHeadsQ + h) * headDim;
+
+                            for (int d = 0; d < headDim; d++)
+                            {
+                                headDkVec[d] += ds * qVec[d];
+                                headDvVec[d] += pVal * dOutVec[d];
+                            }
                         }
                     }
-
-                    // 4. dK and dV accumulations into isolated per-head buffer (100% LOCK-FREE)
-                    for (int j = 0; j <= i; j++)
+                }
+                finally
+                {
+                    if (pooledScratch != null)
                     {
-                        float ds = dsRow[j];
-                        float pVal = pRow[j];
-
-                        float* headDkVec = headDk + (long)j * headDim;
-                        float* headDvVec = headDv + (long)j * headDim;
-                        float* qVec = q + ((long)i * nHeadsQ + h) * headDim;
-
-                        for (int d = 0; d < headDim; d++)
-                        {
-                            headDkVec[d] += ds * qVec[d];
-                            headDvVec[d] += pVal * dOutVec[d];
-                        }
+                        ArrayPool<float>.Shared.Return(pooledScratch);
                     }
                 }
             });
@@ -187,8 +207,8 @@ public static unsafe class CausalAttentionKernel
         }
         finally
         {
-            System.Runtime.InteropServices.NativeMemory.Free(dkWorkspace);
-            System.Runtime.InteropServices.NativeMemory.Free(dvWorkspace);
+            NativeMemory.Free(dkWorkspace);
+            NativeMemory.Free(dvWorkspace);
         }
     }
 }

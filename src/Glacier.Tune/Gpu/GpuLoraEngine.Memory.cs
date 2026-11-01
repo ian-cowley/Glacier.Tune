@@ -11,6 +11,7 @@ public sealed unsafe partial class GpuLoraEngine
             _gpu.FreeDevice(_dFfnNormX);
             _gpu.FreeDevice(_dFfnDownOut);
             _ffnNormXCap = normBytes * 2;
+            _ffnDownOutCap = _ffnNormXCap;
             _dFfnNormX = _gpu.AllocateDevice(_ffnNormXCap);
             _dFfnDownOut = _gpu.AllocateDevice(_ffnNormXCap);
         }
@@ -20,6 +21,8 @@ public sealed unsafe partial class GpuLoraEngine
             _gpu.FreeDevice(_dFfnUp);
             _gpu.FreeDevice(_dFfnHidden);
             _ffnGateCap = ffnBytes * 2;
+            _ffnUpCap = _ffnGateCap;
+            _ffnHiddenCap = _ffnGateCap;
             _dFfnGate = _gpu.AllocateDevice(_ffnGateCap);
             _dFfnUp = _gpu.AllocateDevice(_ffnGateCap);
             _dFfnHidden = _gpu.AllocateDevice(_ffnGateCap);
@@ -33,6 +36,7 @@ public sealed unsafe partial class GpuLoraEngine
             _gpu.FreeDevice(_dFfnNormX);
             _gpu.FreeDevice(_dFfnDownOut);
             _ffnNormXCap = normBytes * 2;
+            _ffnDownOutCap = _ffnNormXCap;
             _dFfnNormX = _gpu.AllocateDevice(_ffnNormXCap);
             _dFfnDownOut = _gpu.AllocateDevice(_ffnNormXCap);
         }
@@ -47,6 +51,7 @@ public sealed unsafe partial class GpuLoraEngine
             _gpu.FreeDevice(_dKBuf);
             _gpu.FreeDevice(_dVBuf);
             _kBufCap = kvBytes * 2;
+            _vBufCap = _kBufCap;
             _dKBuf = _gpu.AllocateDevice(_kBufCap);
             _dVBuf = _gpu.AllocateDevice(_kBufCap);
         }
@@ -56,9 +61,25 @@ public sealed unsafe partial class GpuLoraEngine
     {
         int qDim = nHeadsQ * headDim;
         int kvDim = nHeadsKv * headDim;
-        nuint attnOutBytes = (nuint)(seqLen * qDim * sizeof(float));
+        nuint attnOutBytes = (nuint)((long)seqLen * qDim * sizeof(float));
         nuint probsBytes = (nuint)((long)nHeadsQ * seqLen * seqLen * sizeof(float));
-        nuint kvBytes = (nuint)(seqLen * kvDim * sizeof(float));
+        nuint kvBytes = (nuint)((long)seqLen * kvDim * sizeof(float));
+
+        if (attnOutBytes > _qBufCap)
+        {
+            _gpu.FreeDevice(_dQBuf);
+            _qBufCap = attnOutBytes * 2;
+            _dQBuf = _gpu.AllocateDevice(_qBufCap);
+        }
+        if (kvBytes > _kBufCap)
+        {
+            _gpu.FreeDevice(_dKBuf);
+            _gpu.FreeDevice(_dVBuf);
+            _kBufCap = kvBytes * 2;
+            _vBufCap = _kBufCap;
+            _dKBuf = _gpu.AllocateDevice(_kBufCap);
+            _dVBuf = _gpu.AllocateDevice(_kBufCap);
+        }
 
         if (attnOutBytes > _attnOutCap)
         {
