@@ -1,3 +1,5 @@
+[assembly: Xunit.CollectionBehavior(DisableTestParallelization = true)]
+
 namespace Glacier.Tune.Tests;
 
 using System;
