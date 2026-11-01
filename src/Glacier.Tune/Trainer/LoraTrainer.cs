@@ -2,7 +2,7 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.Intrinsics;
-using Glacier.Gpu.Drivers;
+using Glacier.Inference.Gpu;
 using Glacier.Tensor.Autograd;
 using Glacier.Tensor.Core;
 using Glacier.Tensor.Layers;

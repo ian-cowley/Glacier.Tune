@@ -6,6 +6,10 @@ on:
     tags: ['v*']
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -42,15 +46,15 @@ jobs:
         run: dotnet test tests/Glacier.Tune.Tests/Glacier.Tune.Tests.csproj --configuration Release --no-restore --no-build
 
       - name: Pack
-        run: dotnet pack src/Glacier.Tune/Glacier.Tune.csproj --configuration Release --output packages
+        run: dotnet pack src/Glacier.Tune/Glacier.Tune.csproj --configuration Release --no-build --output packages
 
       - name: Publish to nuget.org
         if: env.NUGET_API_KEY != '' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/'))
-        run: dotnet nuget push "packages/*.nupkg" --api-key $NUGET_API_KEY --source https://api.nuget.org/v3/index.json --skip-duplicate || true
+        run: dotnet nuget push "packages/*.nupkg" --api-key $NUGET_API_KEY --source https://api.nuget.org/v3/index.json --skip-duplicate
 
       - name: Publish to GitHub Packages
         if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/')
-        run: dotnet nuget push "packages/*.nupkg" --api-key ${{ secrets.GITHUB_TOKEN }} --source https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json --skip-duplicate || true
+        run: dotnet nuget push "packages/*.nupkg" --api-key ${{ secrets.GITHUB_TOKEN }} --source "github-packages" --skip-duplicate
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
