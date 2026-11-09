@@ -52,6 +52,6 @@
     <ProjectReference Include="..\..\..\Glacier.Gpu\src\Glacier.Gpu\Glacier.Gpu.csproj" Condition="Exists('..\..\..\Glacier.Gpu\src\Glacier.Gpu\Glacier.Gpu.csproj') and '$(UseLocalProjectReferences)' == 'true'" />
   </ItemGroup>
   <ItemGroup Condition="!Exists('..\..\..\Glacier.Gpu\src\Glacier.Gpu\Glacier.Gpu.csproj') or '$(UseLocalProjectReferences)' != 'true'">
-    <PackageReference Include="Glacier.Gpu" Version="1.0.9" Condition="!Exists('..\..\..\Glacier.Gpu\src\Glacier.Gpu\Glacier.Gpu.csproj') or '$(UseLocalProjectReferences)' != 'true'" />
+    <PackageReference Include="Glacier.Gpu" Version="1.1.0" Condition="!Exists('..\..\..\Glacier.Gpu\src\Glacier.Gpu\Glacier.Gpu.csproj') or '$(UseLocalProjectReferences)' != 'true'" />
   </ItemGroup>
 </Project>
