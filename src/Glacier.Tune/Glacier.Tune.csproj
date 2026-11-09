@@ -14,17 +14,17 @@
 
     <!-- NuGet Package Properties -->
     <PackageId>Glacier.Tune</PackageId>
-    <Version>1.0.7</Version>
+    <Version>1.1.0</Version>
     <Authors>Ian Cowley</Authors>
     <Company>Glacier High-Performance Ecosystem</Company>
-    <Description>Pure C# .NET 10 LLM fine-tuning, PEFT (LoRA / QLoRA), and model alignment engine. Direct GGUF zero-copy memory-mapping, zero-allocation Autograd backpropagation, and instant adapter fusion.</Description>
+    <Description>Pure C# .NET 10 LLM fine-tuning, PEFT (LoRA / QLoRA), continual learning Sleep consolidation, pre-allocated MoE expansion, and model alignment engine. Direct GGUF zero-copy memory-mapping, zero-allocation Autograd backpropagation, and instant adapter fusion.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/ian-cowley/Glacier.Tune</PackageProjectUrl>
     <RepositoryUrl>https://github.com/ian-cowley/Glacier.Tune.git</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
-    <PackageTags>llm;fine-tuning;lora;qlora;peft;gguf;qwen;deep-learning;csharp;net10;glacier</PackageTags>
+    <PackageTags>llm;fine-tuning;lora;qlora;peft;gguf;qwen;deep-learning;csharp;net10;glacier;continual-learning;sleep;gkd;moe</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
-    <PackageReleaseNotes>v1.0.7: Full frozen base-weight transpose-GEMM backpropagation across all 7 projections in CUDA VRAM (Q4_K, Q6_K, Q8_0, Q4_0, F32) and AVX-512/AVX2 SIMD; warp-aligned arbitrary-head_dim Causal GQA training attention; exact 64-bit tiled online Cross-Entropy backpropagation; ChatML assistant header masking; microbatch gradient averaging; TargetModules selection; Native AOT reflection-free serialization; hardened GgufMerger with F32 &amp; PEFT layout support; 65 passing tests.</PackageReleaseNotes>
+    <PackageReleaseNotes>v1.1.0: Introduces Continual Learning Sleep Consolidation Pipeline and Pre-allocated MoE Parameter Expansion (arXiv:2606.03979). Implements PreallocatedMoeExpansionBank with 64-byte aligned unmanaged slots and SIMD Top-k routing, DreamQualityFilter with AVX2 SIMD Levenshtein edit distance and cosine similarity filtering, and SleepConsolidationTrainer with 3-phase biological consolidation (Dreaming, Generalized Knowledge Distillation / GKD with beta-divergence, and Synaptic Pruning). Updates Glacier.Inference dependency to v1.5.0 and Glacier.Tensor to v1.1.0.</PackageReleaseNotes>
   </PropertyGroup>
 
   <ItemGroup>
@@ -38,14 +38,14 @@
     <ProjectReference Include="..\..\..\Glacier.Inference\src\Glacier.Inference\Glacier.Inference.csproj" Condition="Exists('..\..\..\Glacier.Inference\src\Glacier.Inference\Glacier.Inference.csproj') and '$(UseLocalProjectReferences)' == 'true'" />
   </ItemGroup>
   <ItemGroup Condition="!Exists('..\..\..\Glacier.Inference\src\Glacier.Inference\Glacier.Inference.csproj') or '$(UseLocalProjectReferences)' != 'true'">
-    <PackageReference Include="Glacier.Inference" Version="1.3.0" Condition="!Exists('..\..\..\Glacier.Inference\src\Glacier.Inference\Glacier.Inference.csproj') or '$(UseLocalProjectReferences)' != 'true'" />
+    <PackageReference Include="Glacier.Inference" Version="1.5.0" Condition="!Exists('..\..\..\Glacier.Inference\src\Glacier.Inference\Glacier.Inference.csproj') or '$(UseLocalProjectReferences)' != 'true'" />
   </ItemGroup>
 
   <ItemGroup Condition="Exists('..\..\..\Glacier.Tensor\src\Glacier.Tensor\Glacier.Tensor.csproj') and '$(UseLocalProjectReferences)' == 'true'">
     <ProjectReference Include="..\..\..\Glacier.Tensor\src\Glacier.Tensor\Glacier.Tensor.csproj" Condition="Exists('..\..\..\Glacier.Tensor\src\Glacier.Tensor\Glacier.Tensor.csproj') and '$(UseLocalProjectReferences)' == 'true'" />
   </ItemGroup>
   <ItemGroup Condition="!Exists('..\..\..\Glacier.Tensor\src\Glacier.Tensor\Glacier.Tensor.csproj') or '$(UseLocalProjectReferences)' != 'true'">
-    <PackageReference Include="Glacier.Tensor" Version="1.0.9" Condition="!Exists('..\..\..\Glacier.Tensor\src\Glacier.Tensor\Glacier.Tensor.csproj') or '$(UseLocalProjectReferences)' != 'true'" />
+    <PackageReference Include="Glacier.Tensor" Version="1.1.0" Condition="!Exists('..\..\..\Glacier.Tensor\src\Glacier.Tensor\Glacier.Tensor.csproj') or '$(UseLocalProjectReferences)' != 'true'" />
   </ItemGroup>
 
   <ItemGroup Condition="Exists('..\..\..\Glacier.Gpu\src\Glacier.Gpu\Glacier.Gpu.csproj') and '$(UseLocalProjectReferences)' == 'true'">

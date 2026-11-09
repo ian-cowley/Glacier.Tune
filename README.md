@@ -196,6 +196,16 @@ dotnet run -c Release --project samples/Glacier.Tune.Demo -- --merge \
 
 ---
 
+## 🆕 What's New in v1.1.0
+
+- **Sleep Consolidation Framework & MoE Parameter Expansion (arXiv:2606.03979)** — Added biological 3-phase offline memory consolidation pipeline:
+  - `PreallocatedMoeExpansionBank`: Pre-allocated 64-byte unmanaged aligned parameter bank (`MoeExpertSlotDescriptor`) enabling zero-perturbation unlocking of low-rank MoE experts and SIMD Top-$k$ gating during sleep.
+  - `DreamQualityFilter`: Vectorized AVX2 Levenshtein edit distance and cosine embedding similarity scoring to filter on-policy self-generated synthetic dream trajectories.
+  - `SleepConsolidationTrainer`: Generalized Knowledge Distillation (GKD) with configurable forward/reverse KL $\beta$-divergence, transferring volatile fast memory representations into unlocked slow MoE experts, followed by synaptic pruning of fast buffers.
+- **Dependency Upgrades**: Upgraded `Glacier.Inference` to `v1.5.0` (HOPE Continuum Memory) and `Glacier.Tensor` to `v1.1.0`.
+
+---
+
 ## 🆕 What's New in v1.0.7
 
 - **Full Frozen Base-Weight Backpropagation (CUDA VRAM & AVX-512/AVX2 SIMD)** — Added transposed quantized & FP32 backward GEMM kernels (`tune_bwd.cubin`: `Q4_K`, `Q6_K`, `Q8_0`, `Q4_0`, `F32`) and tiled SIMD CPU `LoraKernels.AccumulateBaseBackward` (`dX += dY * W_base`), propagating exact chain-rule gradients through all 7 projections (`Q`, `K`, `V`, `O`, `Gate`, `Up`, `Down`) across every transformer layer from step 0 ($B = 0$) onward.
