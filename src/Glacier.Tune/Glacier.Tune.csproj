@@ -38,7 +38,7 @@
     <ProjectReference Include="..\..\..\Glacier.Inference\src\Glacier.Inference\Glacier.Inference.csproj" Condition="Exists('..\..\..\Glacier.Inference\src\Glacier.Inference\Glacier.Inference.csproj') and '$(UseLocalProjectReferences)' == 'true'" />
   </ItemGroup>
   <ItemGroup Condition="!Exists('..\..\..\Glacier.Inference\src\Glacier.Inference\Glacier.Inference.csproj') or '$(UseLocalProjectReferences)' != 'true'">
-    <PackageReference Include="Glacier.Inference" Version="1.5.0" Condition="!Exists('..\..\..\Glacier.Inference\src\Glacier.Inference\Glacier.Inference.csproj') or '$(UseLocalProjectReferences)' != 'true'" />
+    <PackageReference Include="Glacier.Inference" Version="1.6.0" Condition="!Exists('..\..\..\Glacier.Inference\src\Glacier.Inference\Glacier.Inference.csproj') or '$(UseLocalProjectReferences)' != 'true'" />
   </ItemGroup>
 
   <ItemGroup Condition="Exists('..\..\..\Glacier.Tensor\src\Glacier.Tensor\Glacier.Tensor.csproj') and '$(UseLocalProjectReferences)' == 'true'">
