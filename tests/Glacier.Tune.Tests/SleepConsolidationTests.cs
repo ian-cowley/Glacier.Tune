@@ -202,5 +202,51 @@ public class SleepConsolidationTests
         }
         return basis;
     }
+
+    [Fact]
+    public async Task PreallocatedMoeExpansionBank_SaveAndLoad_PreservesWeightsAndForwardDelta()
+    {
+        const int dim = 32;
+        const int rank = 8;
+        string path = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"moe_ckpt_{Guid.NewGuid():N}.bin");
+
+        try
+        {
+            Random rng = new Random(99);
+            float[] centroid = CreateRandomUnitVector(rng, dim);
+            float[] query = CreateRandomUnitVector(rng, dim);
+            float[] expectedDelta = new float[dim];
+            float[] scratch = new float[rank];
+
+            using (var bank = new PreallocatedMoeExpansionBank(dim, rank, maxExperts: 4))
+            using (var trainer = new SleepConsolidationTrainer(bank))
+            {
+                int slot = trainer.ParameterExpansion(centroid);
+                var batch = new[]
+                {
+                    new DreamCandidate("p", "p", query, CreateRandomUnitVector(rng, dim), 1.0f, 1.0f, 0.95f)
+                };
+                await trainer.ConsolidateKnowledgeAsync(slot, batch, distillationSteps: 40, learningRate: 0.25f);
+                bank.ForwardDelta(query, expectedDelta, scratch);
+                bank.Save(path);
+            }
+
+            using var restored = PreallocatedMoeExpansionBank.Load(path);
+            Assert.Equal(dim, restored.Dimension);
+            Assert.Equal(rank, restored.Rank);
+            Assert.Equal(1, restored.ActiveExpertCount);
+
+            float[] actualDelta = new float[dim];
+            restored.ForwardDelta(query, actualDelta, scratch);
+            for (int i = 0; i < dim; i++)
+            {
+                Assert.Equal(expectedDelta[i], actualDelta[i], precision: 5);
+            }
+        }
+        finally
+        {
+            if (System.IO.File.Exists(path)) System.IO.File.Delete(path);
+        }
+    }
 }
 

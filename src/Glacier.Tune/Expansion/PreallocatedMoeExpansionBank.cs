@@ -371,6 +371,116 @@ public sealed unsafe class PreallocatedMoeExpansionBank : ISleepExpansionRouter,
         }
     }
 
+    private const uint CheckpointMagic = 0x454F4D47; // "GMOE"
+    private const int CheckpointVersion = 1;
+
+    /// <summary>
+    /// Persists all unlocked MoE expert slots (statuses, routing centroids, and low-rank A/B matrices) to disk.
+    /// </summary>
+    public void Save(string filePath)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (string.IsNullOrWhiteSpace(filePath)) throw new ArgumentException("File path is required.", nameof(filePath));
+
+        string? dir = Path.GetDirectoryName(Path.GetFullPath(filePath));
+        if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+
+        string tempPath = filePath + ".tmp";
+        using (var fs = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
+        using (var writer = new BinaryWriter(fs))
+        {
+            writer.Write(CheckpointMagic);
+            writer.Write(CheckpointVersion);
+            writer.Write(_dimension);
+            writer.Write(_rank);
+            writer.Write(_maxExperts);
+            writer.Write(_activeExpertCount);
+
+            int aCount = _dimension * _rank;
+            int bCount = _rank * _dimension;
+
+            for (int i = 0; i < _activeExpertCount; i++)
+            {
+                ref MoeExpertSlotDescriptor desc = ref _descriptors[i];
+                writer.Write((byte)desc.Status);
+                writer.Write(desc.RouterTemperature);
+
+                writer.Write(new ReadOnlySpan<byte>((byte*)desc.CentroidPointer, _dimension * sizeof(float)));
+                writer.Write(new ReadOnlySpan<byte>((byte*)desc.MatrixAPointer, aCount * sizeof(float)));
+                writer.Write(new ReadOnlySpan<byte>((byte*)desc.MatrixBPointer, bCount * sizeof(float)));
+            }
+        }
+
+        File.Move(tempPath, filePath, overwrite: true);
+    }
+
+    /// <summary>
+    /// Restores a <see cref="PreallocatedMoeExpansionBank"/> checkpoint saved with <see cref="Save"/>.
+    /// </summary>
+    public static PreallocatedMoeExpansionBank Load(string filePath)
+    {
+        if (string.IsNullOrWhiteSpace(filePath)) throw new ArgumentException("File path is required.", nameof(filePath));
+
+        using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+        using var reader = new BinaryReader(fs);
+
+        uint magic = reader.ReadUInt32();
+        if (magic != CheckpointMagic)
+            throw new InvalidDataException($"Invalid MoE checkpoint magic: 0x{magic:X8}.");
+
+        int version = reader.ReadInt32();
+        if (version != CheckpointVersion)
+            throw new InvalidDataException($"Unsupported MoE checkpoint version: {version}.");
+
+        int dimension = reader.ReadInt32();
+        int rank = reader.ReadInt32();
+        int maxExperts = reader.ReadInt32();
+        int activeCount = reader.ReadInt32();
+
+        if (activeCount < 0 || activeCount > maxExperts)
+            throw new InvalidDataException($"Corrupt active expert count {activeCount} (max={maxExperts}).");
+
+        var bank = new PreallocatedMoeExpansionBank(dimension, rank, maxExperts);
+        try
+        {
+            int aCount = dimension * rank;
+            int bCount = rank * dimension;
+
+            for (int i = 0; i < activeCount; i++)
+            {
+                MoeSlotStatus status = (MoeSlotStatus)reader.ReadByte();
+                float temp = reader.ReadSingle();
+
+                ref MoeExpertSlotDescriptor desc = ref bank._descriptors[i];
+                desc.Status = status;
+                desc.RouterTemperature = temp;
+
+                ReadExactBytes(reader.BaseStream, new Span<byte>((byte*)desc.CentroidPointer, dimension * sizeof(float)));
+                ReadExactBytes(reader.BaseStream, new Span<byte>((byte*)desc.MatrixAPointer, aCount * sizeof(float)));
+                ReadExactBytes(reader.BaseStream, new Span<byte>((byte*)desc.MatrixBPointer, bCount * sizeof(float)));
+            }
+
+            bank._activeExpertCount = activeCount;
+            return bank;
+        }
+        catch
+        {
+            bank.Dispose();
+            throw;
+        }
+    }
+
+    private static void ReadExactBytes(Stream stream, Span<byte> destination)
+    {
+        int totalRead = 0;
+        while (totalRead < destination.Length)
+        {
+            int read = stream.Read(destination.Slice(totalRead));
+            if (read == 0) throw new EndOfStreamException("Unexpected end of MoE checkpoint stream.");
+            totalRead += read;
+        }
+    }
+
     private static long AlignUp(long value, long alignment) => (value + alignment - 1) & ~(alignment - 1);
 
     public void Dispose()
