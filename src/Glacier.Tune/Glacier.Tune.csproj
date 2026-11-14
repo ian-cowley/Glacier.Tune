@@ -14,7 +14,7 @@
 
     <!-- NuGet Package Properties -->
     <PackageId>Glacier.Tune</PackageId>
-    <Version>1.1.0</Version>
+    <Version>1.2.0</Version>
     <Authors>Ian Cowley</Authors>
     <Company>Glacier High-Performance Ecosystem</Company>
     <Description>Pure C# .NET 10 LLM fine-tuning, PEFT (LoRA / QLoRA), continual learning Sleep consolidation, pre-allocated MoE expansion, and model alignment engine. Direct GGUF zero-copy memory-mapping, zero-allocation Autograd backpropagation, and instant adapter fusion.</Description>
@@ -38,7 +38,7 @@
     <ProjectReference Include="..\..\..\Glacier.Inference\src\Glacier.Inference\Glacier.Inference.csproj" Condition="Exists('..\..\..\Glacier.Inference\src\Glacier.Inference\Glacier.Inference.csproj') and '$(UseLocalProjectReferences)' == 'true'" />
   </ItemGroup>
   <ItemGroup Condition="!Exists('..\..\..\Glacier.Inference\src\Glacier.Inference\Glacier.Inference.csproj') or '$(UseLocalProjectReferences)' != 'true'">
-    <PackageReference Include="Glacier.Inference" Version="1.6.0" Condition="!Exists('..\..\..\Glacier.Inference\src\Glacier.Inference\Glacier.Inference.csproj') or '$(UseLocalProjectReferences)' != 'true'" />
+    <PackageReference Include="Glacier.Inference" Version="1.7.0" Condition="!Exists('..\..\..\Glacier.Inference\src\Glacier.Inference\Glacier.Inference.csproj') or '$(UseLocalProjectReferences)' != 'true'" />
   </ItemGroup>
 
   <ItemGroup Condition="Exists('..\..\..\Glacier.Tensor\src\Glacier.Tensor\Glacier.Tensor.csproj') and '$(UseLocalProjectReferences)' == 'true'">

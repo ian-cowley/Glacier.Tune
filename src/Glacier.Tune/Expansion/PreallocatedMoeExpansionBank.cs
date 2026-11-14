@@ -6,6 +6,7 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
+using Glacier.Inference.Model;
 
 /// <summary>
 /// Status of a pre-allocated low-rank Mixture-of-Experts (MoE) slot in the expansion bank.
@@ -59,7 +60,7 @@ public unsafe struct MoeExpertSlotDescriptor
 /// Enables unlocking dormant low-rank expert slots ($A_e \in \mathbb{R}^{d \times r}, B_e \in \mathbb{R}^{r \times d}$)
 /// during offline sleep cycles without reallocating buffers or mutating frozen foundational base weights.
 /// </summary>
-public sealed unsafe class PreallocatedMoeExpansionBank : IDisposable
+public sealed unsafe class PreallocatedMoeExpansionBank : ISleepExpansionRouter, IDisposable
 {
     private const nuint CacheLineAlignment = 64;
 
