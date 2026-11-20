@@ -30,6 +30,8 @@ public sealed unsafe class GgufLoraModel : IDisposable
     private readonly GpuTarget _target;
     private readonly Glacier.Tune.Gpu.GpuLoraEngine? _gpuEngine;
     private readonly List<TransformerBlock> _blocks = [];
+    private readonly List<GdnBlock> _gdnBlocks = [];
+    private readonly List<ITuneBlock> _layerBlocks = [];
     private readonly List<Tensor<float>> _trainableParameters = [];
     private bool _disposed;
 
@@ -39,7 +41,9 @@ public sealed unsafe class GgufLoraModel : IDisposable
     public LoraConfig Config => _config;
     public GpuTarget Target => _target;
     public IReadOnlyList<TransformerBlock> Blocks => _blocks;
+    public IReadOnlyList<GdnBlock> GdnBlocks => _gdnBlocks;
     public IReadOnlyList<Tensor<float>> TrainableParameters => _trainableParameters;
+    public bool IsHybrid => _gdnBlocks.Count > 0;
     public bool IsGpuAccelerated => _gpuEngine != null;
 
     public int LayerCount => _weights.BlockCount;
@@ -59,20 +63,68 @@ public sealed unsafe class GgufLoraModel : IDisposable
 
         if ((target is GpuTarget.Nvidia or GpuTarget.NvidiaTensorCore or GpuTarget.Auto) && Glacier.Inference.Gpu.GpuContext.IsSupported)
         {
-            try
+            if (SupportsGpuEngine(weights))
             {
-                _gpuEngine = new Glacier.Tune.Gpu.GpuLoraEngine(weights);
-                for (int l = 0; l < _blocks.Count; l++)
+                try
                 {
-                    _blocks[l].ConnectGpuWeights(_gpuEngine);
+                    _gpuEngine = new Glacier.Tune.Gpu.GpuLoraEngine(weights);
+                    for (int l = 0; l < _layerBlocks.Count; l++)
+                    {
+                        _layerBlocks[l].ConnectGpuWeights(_gpuEngine);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    GlacierDiagnostics.LogWarning($"[GPU WARNING] Failed to initialize GPU VRAM base engine ({ex.Message}). Falling back to CPU memory-mapped base execution.", ex);
+                    _gpuEngine = null;
                 }
             }
-            catch (Exception ex)
+            else
             {
-                GlacierDiagnostics.LogWarning($"[GPU WARNING] Failed to initialize GPU VRAM base engine ({ex.Message}). Falling back to CPU memory-mapped base execution.", ex);
-                _gpuEngine = null;
+                GlacierDiagnostics.LogInformation("[INFO] Architecture uses hybrid GDN / Q-Gate / QK-Norm / partial-RoPE / fused-QKV features; executing in pure-C# CPU mode.");
             }
         }
+    }
+
+    private static bool SupportsGpuEngine(ModelWeights weights)
+    {
+        if (weights.IsHybridSsm || weights.IsMoe || weights.IsMla || weights.IsDsa || weights.HasRopeFreqs)
+        {
+            return false;
+        }
+
+        if (weights.RopeDimensionCount > 0 && weights.HeadDim > 0 && weights.RopeDimensionCount < weights.HeadDim)
+        {
+            return false;
+        }
+
+        for (int l = 0; l < weights.BlockCount; l++)
+        {
+            var lw = weights.Layers[l];
+            if (lw == null ||
+                lw.IsGdn ||
+                lw.HasQGate ||
+                lw.QWeight == null ||
+                lw.KWeight == null ||
+                lw.VWeight == null ||
+                lw.AttnQNormWeight != null ||
+                lw.AttnKNormWeight != null ||
+                lw.AttnSinksWeight != null ||
+                lw.HasFusedGateUp ||
+                lw.FfnGateWeight == null ||
+                lw.FfnUpWeight == null ||
+                lw.FfnDownWeight == null ||
+                (lw.HeadDim > 0 && weights.HeadDim > 0 && lw.HeadDim != weights.HeadDim) ||
+                (lw.HeadsKv > 0 && lw.HeadsKv != weights.HeadCountKv) ||
+                lw.HasHyperConnections ||
+                lw.IsQsa ||
+                lw.HasPle)
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     public static GgufLoraModel Load(string ggufPath, LoraConfig? config = null, string? device = "auto")
@@ -112,27 +164,52 @@ public sealed unsafe class GgufLoraModel : IDisposable
 
     private void InitializeBlocks()
     {
-        int headDim = _weights.HeadDim > 0
+        int defaultHeadDim = _weights.HeadDim > 0
             ? _weights.HeadDim
             : (_weights.HeadCount > 0 ? _weights.EmbeddingLength / _weights.HeadCount : 128);
 
         for (int l = 0; l < _weights.BlockCount; l++)
         {
-            var block = new TransformerBlock(
-                layerIndex: l,
-                weights: _weights.Layers[l],
-                hiddenDim: _weights.EmbeddingLength,
-                ffnDim: _weights.FeedForwardLength,
-                nHeadsQ: _weights.HeadCount,
-                nHeadsKv: _weights.HeadCountKv,
-                headDim: headDim,
-                ropeFreqBase: _weights.RopeFreqBase,
-                rmsNormEps: _weights.RmsNormEps,
-                config: _config,
-                target: _target);
+            var lw = _weights.Layers[l] ?? throw new InvalidDataException($"Missing layer weights for block {l}.");
 
-            _blocks.Add(block);
-            _trainableParameters.AddRange(block.TrainableParameters);
+            if (lw.IsGdn)
+            {
+                var gdn = new GdnBlock(
+                    layerIndex: l,
+                    weights: lw,
+                    modelWeights: _weights,
+                    config: _config,
+                    target: _target);
+
+                _gdnBlocks.Add(gdn);
+                _layerBlocks.Add(gdn);
+                _trainableParameters.AddRange(gdn.TrainableParameters);
+            }
+            else
+            {
+                int layerHeadDim = lw.HeadDim > 0 ? lw.HeadDim : defaultHeadDim;
+                int layerHeadsKv = lw.HeadsKv > 0 ? lw.HeadsKv : _weights.HeadCountKv;
+                int ropeDim = _weights.RopeDimensionCount > 0 ? Math.Min(_weights.RopeDimensionCount, layerHeadDim) : layerHeadDim;
+
+                var block = new TransformerBlock(
+                    layerIndex: l,
+                    weights: lw,
+                    hiddenDim: _weights.EmbeddingLength,
+                    ffnDim: _weights.FeedForwardLength,
+                    nHeadsQ: _weights.HeadCount,
+                    nHeadsKv: layerHeadsKv,
+                    headDim: layerHeadDim,
+                    ropeFreqBase: _weights.RopeFreqBase,
+                    rmsNormEps: _weights.RmsNormEps,
+                    config: _config,
+                    target: _target,
+                    ropeDim: ropeDim,
+                    ropeFreqs: _weights.RopeFreqsWeight);
+
+                _blocks.Add(block);
+                _layerBlocks.Add(block);
+                _trainableParameters.AddRange(block.TrainableParameters);
+            }
         }
     }
 
@@ -166,9 +243,9 @@ public sealed unsafe class GgufLoraModel : IDisposable
             QuantKernels.ExtractEmbedding(_weights.EmbdType, _weights.EmbdWeight, inputTokens[t], pX0 + (long)t * HiddenDim, HiddenDim);
         }
 
-        for (int l = 0; l < LayerCount; l++)
+        for (int l = 0; l < _layerBlocks.Count; l++)
         {
-            var nextX = _blocks[l].Forward(currentX, seqLen, saveActivations: false, out _);
+            var nextX = _layerBlocks[l].Forward(currentX, seqLen, saveActivations: false, out _);
             currentX.Dispose();
             currentX = nextX;
         }
@@ -205,6 +282,150 @@ public sealed unsafe class GgufLoraModel : IDisposable
         }
 
         return logits;
+    }
+
+    /// <summary>
+    /// Computes forward-only vocabulary logits [1, VocabSize] for the final token position only,
+    /// avoiding full-sequence LM-head projection during autoregressive decoding.
+    /// </summary>
+    public Tensor<float> ForwardLastTokenLogits(ReadOnlySpan<int> inputTokens)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (inputTokens.IsEmpty)
+        {
+            throw new ArgumentException("Input token sequence must not be empty.", nameof(inputTokens));
+        }
+
+        int seqLen = inputTokens.Length;
+        for (int t = 0; t < seqLen; t++)
+        {
+            int token = inputTokens[t];
+            if ((uint)token >= (uint)VocabSize)
+            {
+                throw new ArgumentOutOfRangeException(
+                    nameof(inputTokens),
+                    $"Input token ID {token} at index {t} is outside vocabulary bounds [0, {VocabSize}).");
+            }
+        }
+
+        var currentX = new Tensor<float>(seqLen, HiddenDim);
+        float* pX0 = (float*)currentX.DataPointer;
+        for (int t = 0; t < seqLen; t++)
+        {
+            QuantKernels.ExtractEmbedding(_weights.EmbdType, _weights.EmbdWeight, inputTokens[t], pX0 + (long)t * HiddenDim, HiddenDim);
+        }
+
+        for (int l = 0; l < _layerBlocks.Count; l++)
+        {
+            var nextX = _layerBlocks[l].Forward(currentX, seqLen, saveActivations: false, out _);
+            currentX.Dispose();
+            currentX = nextX;
+        }
+
+        using var lastHidden = new Tensor<float>(1, HiddenDim);
+        float* pLastSrc = (float*)currentX.DataPointer + (long)(seqLen - 1) * HiddenDim;
+        Buffer.MemoryCopy(pLastSrc, (float*)lastHidden.DataPointer, (ulong)(HiddenDim * sizeof(float)), (ulong)(HiddenDim * sizeof(float)));
+        currentX.Dispose();
+
+        using var finalNormOut = new Tensor<float>(1, HiddenDim);
+        using (var wFinalNorm = Tensor<float>.FromSpan(new ReadOnlySpan<float>(_weights.OutNormWeight, HiddenDim), [HiddenDim]))
+        {
+            ElementwiseKernels.RMSNorm(lastHidden, wFinalNorm, finalNormOut, _weights.RmsNormEps);
+        }
+
+        var logits = new Tensor<float>(1, VocabSize);
+        if (_gpuEngine != null && _gpuEngine.LmHeadWeight != IntPtr.Zero && _gpuEngine.SupportsForwardGemm(_weights.OutType))
+        {
+            _gpuEngine.ComputeLmHeadLogits(
+                _weights.OutType,
+                _gpuEngine.LmHeadWeight,
+                (float*)finalNormOut.DataPointer,
+                (float*)logits.DataPointer,
+                HiddenDim,
+                VocabSize,
+                1);
+        }
+        else
+        {
+            QuantKernels.MatMulBatch(
+                _weights.OutType,
+                _weights.OutWeight,
+                (float*)finalNormOut.DataPointer,
+                (float*)logits.DataPointer,
+                HiddenDim,
+                VocabSize,
+                1);
+        }
+
+        return logits;
+    }
+
+    /// <summary>
+    /// Computes forward-only cross-entropy validation loss over <paramref name="inputTokens"/> and <paramref name="targetTokens"/>
+    /// without allocating or mutating gradient buffers.
+    /// </summary>
+    public float EvaluateLoss(int[] inputTokens, int[] targetTokens)
+        => EvaluateLoss(inputTokens, targetTokens, out _);
+
+    /// <summary>
+    /// Computes forward-only cross-entropy validation loss over <paramref name="inputTokens"/> and <paramref name="targetTokens"/>
+    /// without allocating or mutating gradient buffers, returning the count of valid supervised tokens.
+    /// </summary>
+    public unsafe float EvaluateLoss(int[] inputTokens, int[] targetTokens, out int validTokenCount)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        ArgumentNullException.ThrowIfNull(inputTokens);
+        ArgumentNullException.ThrowIfNull(targetTokens);
+
+        int seqLen = inputTokens.Length;
+        if (seqLen < 2)
+        {
+            validTokenCount = 0;
+            return 0f;
+        }
+
+        for (int t = 0; t < seqLen; t++)
+        {
+            int token = inputTokens[t];
+            if ((uint)token >= (uint)VocabSize)
+            {
+                throw new ArgumentOutOfRangeException(
+                    nameof(inputTokens),
+                    $"Input token ID {token} at index {t} is outside vocabulary bounds [0, {VocabSize}).");
+            }
+        }
+
+        var currentX = new Tensor<float>(seqLen, HiddenDim);
+        float* pX0 = (float*)currentX.DataPointer;
+        for (int t = 0; t < seqLen; t++)
+        {
+            QuantKernels.ExtractEmbedding(_weights.EmbdType, _weights.EmbdWeight, inputTokens[t], pX0 + (long)t * HiddenDim, HiddenDim);
+        }
+
+        for (int l = 0; l < _layerBlocks.Count; l++)
+        {
+            var nextX = _layerBlocks[l].Forward(currentX, seqLen, saveActivations: false, out _);
+            currentX.Dispose();
+            currentX = nextX;
+        }
+
+        using var finalNormOut = new Tensor<float>(seqLen, HiddenDim);
+        using (var wFinalNorm = Tensor<float>.FromSpan(new ReadOnlySpan<float>(_weights.OutNormWeight, HiddenDim), [HiddenDim]))
+        {
+            ElementwiseKernels.RMSNorm(currentX, wFinalNorm, finalNormOut, _weights.RmsNormEps);
+        }
+        currentX.Dispose();
+
+        return FusedCrossEntropyLoss.ComputeLoss(
+            (float*)finalNormOut.DataPointer,
+            targetTokens,
+            _weights.OutType,
+            _weights.OutWeight,
+            seqLen,
+            HiddenDim,
+            VocabSize,
+            out validTokenCount,
+            _gpuEngine);
     }
 
     /// <summary>
@@ -245,13 +466,13 @@ public sealed unsafe class GgufLoraModel : IDisposable
         // 2. Forward pass through all layers
         var swFwd = Stopwatch.StartNew();
         var layerInputs = new Tensor<float>[LayerCount];
-        var layerStates = new BlockActivationState?[LayerCount];
+        var layerStates = new IDisposable?[LayerCount];
         Tensor<float> currentX = x0;
 
         for (int l = 0; l < LayerCount; l++)
         {
             layerInputs[l] = currentX;
-            currentX = _blocks[l].Forward(currentX, seqLen, saveActivations: !checkpointActivations, out layerStates[l]);
+            currentX = _layerBlocks[l].Forward(currentX, seqLen, saveActivations: !checkpointActivations, out layerStates[l]);
         }
         swFwd.Stop();
 
@@ -295,12 +516,12 @@ public sealed unsafe class GgufLoraModel : IDisposable
         for (int l = LayerCount - 1; l >= 0; l--)
         {
             var xIn = layerInputs[l];
-            BlockActivationState state;
+            IDisposable state;
 
             if (checkpointActivations)
             {
                 swRecompute.Start();
-                using var recomputedOut = _blocks[l].Forward(xIn, seqLen, saveActivations: true, out var st);
+                using var recomputedOut = _layerBlocks[l].Forward(xIn, seqLen, saveActivations: true, out var st);
                 swRecompute.Stop();
                 state = st!;
             }
@@ -311,7 +532,7 @@ public sealed unsafe class GgufLoraModel : IDisposable
 
             // Backpropagate through layer l, updating adapters and computing dXIn
             swBwd.Start();
-            var dXPrev = _blocks[l].Backward(currentDX, state, xIn, seqLen);
+            var dXPrev = _layerBlocks[l].Backward(currentDX, state, xIn, seqLen);
             swBwd.Stop();
             state.Dispose();
 
@@ -345,17 +566,39 @@ public sealed unsafe class GgufLoraModel : IDisposable
             trainable += count;
         }
 
-        int headDim = _weights.HeadDim > 0
+        int defaultHeadDim = _weights.HeadDim > 0
             ? _weights.HeadDim
             : (_weights.HeadCount > 0 ? _weights.EmbeddingLength / _weights.HeadCount : 128);
-        int qDim = _weights.HeadCount * headDim;
-        int kvDim = _weights.HeadCountKv * headDim;
 
-        long totalBase = (long)_weights.BlockCount * (
-            ((long)_weights.EmbeddingLength * qDim * 2) +
-            ((long)_weights.EmbeddingLength * kvDim * 2) +
-            ((long)_weights.EmbeddingLength * _weights.FeedForwardLength * 3)
-        );
+        long totalBase = 0;
+        for (int l = 0; l < _weights.BlockCount; l++)
+        {
+            var lw = _weights.Layers[l];
+            if (lw != null && lw.IsGdn)
+            {
+                long gdnConvChannels = ((long)_weights.SsmGroupCount * 2 + _weights.SsmTimeStepRank) * _weights.SsmStateSize;
+                long ssmInner = _weights.SsmInnerSize > 0
+                    ? _weights.SsmInnerSize
+                    : (long)_weights.SsmTimeStepRank * _weights.SsmStateSize;
+                totalBase += ((long)HiddenDim * gdnConvChannels) +
+                             ((long)HiddenDim * ssmInner) +
+                             ((long)HiddenDim * _weights.SsmTimeStepRank * 2) +
+                             (ssmInner * HiddenDim) +
+                             ((long)HiddenDim * FfnDim * 3);
+            }
+            else
+            {
+                int lHeadDim = lw != null && lw.HeadDim > 0 ? lw.HeadDim : defaultHeadDim;
+                int lHeadsKv = lw != null && lw.HeadsKv > 0 ? lw.HeadsKv : _weights.HeadCountKv;
+                long qDim = (long)_weights.HeadCount * lHeadDim;
+                long qProjOut = lw != null && lw.HasQGate ? 2 * qDim : qDim;
+                long kvDim = (long)lHeadsKv * lHeadDim;
+                totalBase += ((long)HiddenDim * qProjOut) +
+                             (qDim * HiddenDim) +
+                             ((long)HiddenDim * kvDim * 2) +
+                             ((long)HiddenDim * FfnDim * 3);
+            }
+        }
 
         double pct = totalBase + trainable > 0 ? (double)trainable / (totalBase + trainable) * 100.0 : 0.0;
         return (trainable, totalBase, pct);
@@ -386,16 +629,9 @@ public sealed unsafe class GgufLoraModel : IDisposable
         WriteAdapterConfigJson(Path.Combine(outputDir, "adapter_config.json"));
 
         int enabledTensorCount = 0;
-        for (int l = 0; l < _blocks.Count; l++)
+        for (int l = 0; l < _layerBlocks.Count; l++)
         {
-            var b = _blocks[l];
-            if (b.QProj.IsEnabled) enabledTensorCount += 2;
-            if (b.KProj.IsEnabled) enabledTensorCount += 2;
-            if (b.VProj.IsEnabled) enabledTensorCount += 2;
-            if (b.OProj.IsEnabled) enabledTensorCount += 2;
-            if (b.GateProj.IsEnabled) enabledTensorCount += 2;
-            if (b.UpProj.IsEnabled) enabledTensorCount += 2;
-            if (b.DownProj.IsEnabled) enabledTensorCount += 2;
+            enabledTensorCount += _layerBlocks[l].CountEnabledTensors();
         }
 
         using (var fs = File.Create(binPath))
@@ -404,68 +640,26 @@ public sealed unsafe class GgufLoraModel : IDisposable
             // Magic 0x41524F4C ('LORA'), Version 1
             bw.Write((uint)0x41524F4C);
             bw.Write((uint)1);
-            bw.Write(_blocks.Count);
+            bw.Write(_layerBlocks.Count);
             bw.Write(_config.Rank);
             bw.Write(_config.Alpha);
             bw.Write(enabledTensorCount);
 
-            for (int l = 0; l < _blocks.Count; l++)
+            for (int l = 0; l < _layerBlocks.Count; l++)
             {
-                var b = _blocks[l];
-                if (b.QProj.IsEnabled)
-                {
-                    WriteTensor(bw, $"blk.{l}.attn_q.lora_a.weight", b.QProj.AdapterA);
-                    WriteTensor(bw, $"blk.{l}.attn_q.lora_b.weight", b.QProj.AdapterB);
-                }
-                if (b.KProj.IsEnabled)
-                {
-                    WriteTensor(bw, $"blk.{l}.attn_k.lora_a.weight", b.KProj.AdapterA);
-                    WriteTensor(bw, $"blk.{l}.attn_k.lora_b.weight", b.KProj.AdapterB);
-                }
-                if (b.VProj.IsEnabled)
-                {
-                    WriteTensor(bw, $"blk.{l}.attn_v.lora_a.weight", b.VProj.AdapterA);
-                    WriteTensor(bw, $"blk.{l}.attn_v.lora_b.weight", b.VProj.AdapterB);
-                }
-                if (b.OProj.IsEnabled)
-                {
-                    WriteTensor(bw, $"blk.{l}.attn_output.lora_a.weight", b.OProj.AdapterA);
-                    WriteTensor(bw, $"blk.{l}.attn_output.lora_b.weight", b.OProj.AdapterB);
-                }
-                if (b.GateProj.IsEnabled)
-                {
-                    WriteTensor(bw, $"blk.{l}.ffn_gate.lora_a.weight", b.GateProj.AdapterA);
-                    WriteTensor(bw, $"blk.{l}.ffn_gate.lora_b.weight", b.GateProj.AdapterB);
-                }
-                if (b.UpProj.IsEnabled)
-                {
-                    WriteTensor(bw, $"blk.{l}.ffn_up.lora_a.weight", b.UpProj.AdapterA);
-                    WriteTensor(bw, $"blk.{l}.ffn_up.lora_b.weight", b.UpProj.AdapterB);
-                }
-                if (b.DownProj.IsEnabled)
-                {
-                    WriteTensor(bw, $"blk.{l}.ffn_down.lora_a.weight", b.DownProj.AdapterA);
-                    WriteTensor(bw, $"blk.{l}.ffn_down.lora_b.weight", b.DownProj.AdapterB);
-                }
+                _layerBlocks[l].WriteAdapterTensors(bw);
             }
         }
 
         string manifestPath = Path.Combine(outputDir, "adapter_manifest.txt");
         using var writer = new StreamWriter(manifestPath);
         writer.WriteLine($"# Glacier.Tune LoRA Adapter Manifest");
-        writer.WriteLine($"# Total Layers: {_blocks.Count}");
+        writer.WriteLine($"# Total Layers: {_layerBlocks.Count}");
         writer.WriteLine($"# Total Trainable Tensors: {_trainableParameters.Count}");
         writer.WriteLine($"# Binary Weights: {Path.GetFileName(binPath)}");
-        for (int l = 0; l < _blocks.Count; l++)
+        for (int l = 0; l < _layerBlocks.Count; l++)
         {
-            var b = _blocks[l];
-            if (b.QProj.IsEnabled) writer.WriteLine($"blk.{l}.q_proj: A=[{b.QProj.AdapterA.Shape[0]},{b.QProj.AdapterA.Shape[1]}], B=[{b.QProj.AdapterB.Shape[0]},{b.QProj.AdapterB.Shape[1]}]");
-            if (b.KProj.IsEnabled) writer.WriteLine($"blk.{l}.k_proj: A=[{b.KProj.AdapterA.Shape[0]},{b.KProj.AdapterA.Shape[1]}], B=[{b.KProj.AdapterB.Shape[0]},{b.KProj.AdapterB.Shape[1]}]");
-            if (b.VProj.IsEnabled) writer.WriteLine($"blk.{l}.v_proj: A=[{b.VProj.AdapterA.Shape[0]},{b.VProj.AdapterA.Shape[1]}], B=[{b.VProj.AdapterB.Shape[0]},{b.VProj.AdapterB.Shape[1]}]");
-            if (b.OProj.IsEnabled) writer.WriteLine($"blk.{l}.o_proj: A=[{b.OProj.AdapterA.Shape[0]},{b.OProj.AdapterA.Shape[1]}], B=[{b.OProj.AdapterB.Shape[0]},{b.OProj.AdapterB.Shape[1]}]");
-            if (b.GateProj.IsEnabled) writer.WriteLine($"blk.{l}.gate_proj: A=[{b.GateProj.AdapterA.Shape[0]},{b.GateProj.AdapterA.Shape[1]}], B=[{b.GateProj.AdapterB.Shape[0]},{b.GateProj.AdapterB.Shape[1]}]");
-            if (b.UpProj.IsEnabled) writer.WriteLine($"blk.{l}.up_proj: A=[{b.UpProj.AdapterA.Shape[0]},{b.UpProj.AdapterA.Shape[1]}], B=[{b.UpProj.AdapterB.Shape[0]},{b.UpProj.AdapterB.Shape[1]}]");
-            if (b.DownProj.IsEnabled) writer.WriteLine($"blk.{l}.down_proj: A=[{b.DownProj.AdapterA.Shape[0]},{b.DownProj.AdapterA.Shape[1]}], B=[{b.DownProj.AdapterB.Shape[0]},{b.DownProj.AdapterB.Shape[1]}]");
+            _layerBlocks[l].WriteManifestEntries(writer);
         }
     }
 
@@ -497,7 +691,7 @@ public sealed unsafe class GgufLoraModel : IDisposable
 
     /// <summary>
     /// Loads saved LoRA adapter weights from an adapter binary file (or directory containing adapter_model.bin)
-    /// into all transformer blocks for training resumption or evaluation.
+    /// into all transformer / GDN blocks for training resumption or evaluation.
     /// Supports both native Glacier [inDim, rank] / [rank, outDim] and PEFT [rank, inDim] / [outDim, rank] layouts.
     /// </summary>
     public void LoadAdapter(string adapterFilePath)
@@ -535,6 +729,10 @@ public sealed unsafe class GgufLoraModel : IDisposable
         int tensorCount = br.ReadInt32();
         if (tensorCount < 0)
             throw new InvalidDataException($"Invalid negative LoRA tensor count: {tensorCount}");
+        if (rank != _config.Rank)
+            throw new InvalidDataException($"LoRA adapter rank mismatch: file specifies rank {rank}, model is configured with rank {_config.Rank}.");
+        if (rank > 0 && (!float.IsFinite(alpha) || alpha <= 0f))
+            throw new InvalidDataException($"Invalid LoRA adapter alpha value: {alpha}.");
 
         int loadedCount = 0;
 
@@ -579,31 +777,35 @@ public sealed unsafe class GgufLoraModel : IDisposable
             }
         }
 
-        GlacierDiagnostics.LogInformation($"[LORA] Successfully loaded {loadedCount}/{tensorCount} adapter tensors across {Math.Min(layerCount, _blocks.Count)} layers (rank={rank}, alpha={alpha}).");
+        if (tensorCount > 0 && loadedCount == 0)
+        {
+            throw new InvalidDataException($"LoRA adapter '{binPath}' matched 0/{tensorCount} tensors in the current model.");
+        }
+
+        if (rank > 0 && MathF.Abs(alpha - _config.Alpha) > 1e-6f)
+        {
+            _config.Alpha = alpha;
+            foreach (var block in _layerBlocks)
+            {
+                if (block is TransformerBlock tb) tb.UpdateAlpha(alpha);
+                else if (block is GdnBlock gb) gb.UpdateAlpha(alpha);
+            }
+        }
+
+        GlacierDiagnostics.LogInformation($"[LORA] Successfully loaded {loadedCount}/{tensorCount} adapter tensors across {Math.Min(layerCount, _layerBlocks.Count)} layers (rank={rank}, alpha={alpha}).");
     }
 
     private Tensor<float>? FindTargetTensor(string name, int dim0, int dim1, out bool needsTranspose)
     {
         needsTranspose = false;
         var parts = name.Split('.');
-        if (parts.Length >= 5 && parts[0] == "blk" && int.TryParse(parts[1], out int layerIdx) && layerIdx >= 0 && layerIdx < _blocks.Count)
+        if (parts.Length >= 5 && parts[0] == "blk" && int.TryParse(parts[1], out int layerIdx) && layerIdx >= 0 && layerIdx < _layerBlocks.Count)
         {
-            var b = _blocks[layerIdx];
+            var block = _layerBlocks[layerIdx];
             string proj = parts[2];
             string matrix = parts[3];
 
-            LoraAdapter? adapter = proj switch
-            {
-                "attn_q" or "q_proj" => b.QProj,
-                "attn_k" or "k_proj" => b.KProj,
-                "attn_v" or "v_proj" => b.VProj,
-                "attn_output" or "o_proj" => b.OProj,
-                "ffn_gate" or "gate_proj" => b.GateProj,
-                "ffn_up" or "up_proj" => b.UpProj,
-                "ffn_down" or "down_proj" => b.DownProj,
-                _ => null
-            };
-
+            LoraAdapter? adapter = block.FindAdapter(proj);
             if (adapter != null && adapter.IsEnabled)
             {
                 Tensor<float>? tensor = matrix switch
@@ -632,24 +834,16 @@ public sealed unsafe class GgufLoraModel : IDisposable
         return null;
     }
 
-    private static void WriteTensor(BinaryWriter bw, string name, Tensor<float> tensor)
-    {
-        bw.Write(name);
-        bw.Write(tensor.Shape[0]);
-        bw.Write(tensor.Shape[1]);
-        var span = tensor.AsSpan();
-        var byteSpan = MemoryMarshal.AsBytes(span);
-        bw.Write(byteSpan);
-    }
-
     public void Dispose()
     {
         if (!_disposed)
         {
             _disposed = true;
             _gpuEngine?.Dispose();
-            foreach (var b in _blocks) b.Dispose();
+            foreach (var b in _layerBlocks) b.Dispose();
+            _layerBlocks.Clear();
             _blocks.Clear();
+            _gdnBlocks.Clear();
             _trainableParameters.Clear();
             _gguf.Dispose();
         }

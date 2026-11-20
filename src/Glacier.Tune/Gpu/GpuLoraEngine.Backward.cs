@@ -92,6 +92,111 @@ public sealed unsafe partial class GpuLoraEngine
     }
 
     /// <summary>
+    /// Computes exact tiled online streaming Cross-Entropy loss in GPU VRAM without computing or uploading gradients.
+    /// Keeps peak logit VRAM buffer bounded to [validCount x vocabTileSize].
+    /// </summary>
+    public float ComputeTiledLmHeadLoss(
+        GgufType lmHeadType,
+        float* pValidHidden,
+        int* validTargetIds,
+        int hiddenDim,
+        int vocabSize,
+        int validCount,
+        int vocabTileSize,
+        delegate*<float*, int, float> vectorizedMax,
+        delegate*<float*, int, float, double> vectorizedSumExp)
+    {
+        int actualTileSize = Math.Min(vocabTileSize, vocabSize);
+        int numTiles = (vocabSize + actualTileSize - 1) / actualTileSize;
+        int rowBytes = (int)GgufTypes.GetRowBytes(lmHeadType, hiddenDim);
+
+        nuint hiddenBytes = (nuint)((long)validCount * hiddenDim * sizeof(float));
+        nuint tileLogitBytes = (nuint)((long)validCount * actualTileSize * sizeof(float));
+        float invValid = 1.0f / validCount;
+
+        float* pTileLogits = (float*)NativeMemory.Alloc((nuint)((long)validCount * actualTileSize), sizeof(float));
+        float* runningMax = (float*)NativeMemory.Alloc((nuint)validCount, sizeof(float));
+        double* runningSumExp = (double*)NativeMemory.Alloc((nuint)validCount, sizeof(double));
+        float* targetLogits = (float*)NativeMemory.Alloc((nuint)validCount, sizeof(float));
+
+        try
+        {
+            for (int i = 0; i < validCount; i++)
+            {
+                runningMax[i] = float.NegativeInfinity;
+                runningSumExp[i] = 0.0;
+                targetLogits[i] = 0.0f;
+            }
+
+            double totalLoss = 0.0;
+
+            lock (_scratchLock)
+            {
+                EnsureFfnCapacity(hiddenBytes, tileLogitBytes);
+                if (tileLogitBytes > _scratchYCap)
+                {
+                    _gpu.FreeDevice(_dScratchY);
+                    _dScratchY = _gpu.AllocateDevice(tileLogitBytes * 2);
+                    _scratchYCap = tileLogitBytes * 2;
+                }
+
+                _gpu.CopyToDevice(_dFfnNormX, (IntPtr)pValidHidden, hiddenBytes);
+
+                for (int tile = 0; tile < numTiles; tile++)
+                {
+                    int vStart = tile * actualTileSize;
+                    int vCount = Math.Min(actualTileSize, vocabSize - vStart);
+                    IntPtr dTileW = _dLmHeadWeight + (nint)((long)vStart * rowBytes);
+                    nuint curTileBytes = (nuint)((long)validCount * vCount * sizeof(float));
+
+                    LaunchGemmBatch(lmHeadType, _dScratchY, _dFfnNormX, dTileW, hiddenDim, vCount, validCount);
+                    _gpu.CopyToHost((IntPtr)pTileLogits, _dScratchY, curTileBytes);
+
+                    for (int i = 0; i < validCount; i++)
+                    {
+                        float* logits = pTileLogits + (long)i * vCount;
+                        int targetId = validTargetIds[i];
+                        if (targetId >= vStart && targetId < vStart + vCount)
+                        {
+                            targetLogits[i] = logits[targetId - vStart];
+                        }
+
+                        float tileMax = vectorizedMax(logits, vCount);
+                        if (float.IsNegativeInfinity(runningMax[i]))
+                        {
+                            runningMax[i] = tileMax;
+                            runningSumExp[i] = vectorizedSumExp(logits, vCount, tileMax);
+                        }
+                        else
+                        {
+                            float mNew = MathF.Max(runningMax[i], tileMax);
+                            double factor = Math.Exp((double)runningMax[i] - mNew);
+                            double tileSum = vectorizedSumExp(logits, vCount, mNew);
+                            runningSumExp[i] = runningSumExp[i] * factor + tileSum;
+                            runningMax[i] = mNew;
+                        }
+                    }
+                }
+            }
+
+            for (int i = 0; i < validCount; i++)
+            {
+                double lse = runningMax[i] + Math.Log(runningSumExp[i]);
+                totalLoss += lse - targetLogits[i];
+            }
+
+            return (float)(totalLoss * invValid);
+        }
+        finally
+        {
+            NativeMemory.Free(pTileLogits);
+            NativeMemory.Free(runningMax);
+            NativeMemory.Free(runningSumExp);
+            NativeMemory.Free(targetLogits);
+        }
+    }
+
+    /// <summary>
     /// Computes exact tiled online streaming Cross-Entropy loss and hidden-state gradients in GPU VRAM.
     /// Keeps peak logit VRAM buffer bounded to [validCount x vocabTileSize] (&lt; 16 MB instead of 622 MB).
     /// </summary>

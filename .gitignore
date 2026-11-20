@@ -47,3 +47,6 @@ scratch/
 PROJECT_SOURCE.md
 Glacier.Tensor.md
 tune_output/
+data/
+[Tt]est[Rr]esults/
+*.dmp

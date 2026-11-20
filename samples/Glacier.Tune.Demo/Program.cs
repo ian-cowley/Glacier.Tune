@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.IO;
 using Glacier.Tune.Config;
 using Glacier.Tune.Data;
+using Glacier.Tune.Evaluation;
 using Glacier.Tune.Export;
 using Glacier.Tune.Model;
 using Glacier.Tune.Trainer;
@@ -31,6 +32,55 @@ if (args.Length > 0 && (args[0] == "--merge" || args[0] == "-m"))
     Console.ResetColor();
 
     GgufMerger.Merge(baseModel, adapterPath, outModel);
+    return;
+}
+
+if (args.Length > 0 && (args[0] == "--eval" || args[0] == "-e"))
+{
+    string evalDevice = "auto";
+    int evalMaxTokens = 64;
+    string? outJsonPath = null;
+    var positional = new System.Collections.Generic.List<string>(3);
+
+    for (int i = 1; i < args.Length; i++)
+    {
+        if ((args[i] == "--device" || args[i] == "-d") && i + 1 < args.Length)
+        {
+            evalDevice = args[++i];
+        }
+        else if ((args[i] == "--max-tokens" || args[i] == "-n") && i + 1 < args.Length)
+        {
+            evalMaxTokens = int.Parse(args[++i]);
+        }
+        else if ((args[i] == "--out" || args[i] == "-o") && i + 1 < args.Length)
+        {
+            outJsonPath = args[++i];
+        }
+        else if (!args[i].StartsWith('-'))
+        {
+            positional.Add(args[i]);
+        }
+    }
+
+    if (positional.Count < 3)
+    {
+        Console.WriteLine("Usage: dotnet run --project samples/Glacier.Tune.Demo -- --eval <base.gguf> <adapter.bin> <eval.jsonl> [--device cpu|gpu|auto] [--max-tokens N] [--out report.json]");
+        return;
+    }
+
+    var evalReport = PostTuneEvaluator.Evaluate(
+        positional[0],
+        positional[1],
+        positional[2],
+        new EvalOptions { MaxNewTokens = evalMaxTokens },
+        device: evalDevice);
+
+    Console.WriteLine(evalReport.FormatSummary());
+    if (!string.IsNullOrWhiteSpace(outJsonPath))
+    {
+        File.WriteAllText(outJsonPath, evalReport.ToJson());
+        Console.WriteLine($"Report JSON saved to: {outJsonPath}");
+    }
     return;
 }
 

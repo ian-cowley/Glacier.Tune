@@ -8,10 +8,11 @@ public sealed class LoraConfig
     public int Rank { get; set; } = 16;
     public float Alpha { get; set; } = 32f;
     public float Dropout { get; set; } = 0.05f;
-    public string[] TargetModules { get; set; } = 
+    public string[] TargetModules { get; set; } =
     [
-        "q_proj", "k_proj", "v_proj", "o_proj", 
-        "gate_proj", "up_proj", "down_proj"
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_proj", "up_proj", "down_proj",
+        "attn_qkv", "attn_gate", "ssm_out", "ssm_alpha", "ssm_beta"
     ];
     public string Bias { get; set; } = "none";
     public int? Seed { get; set; } = 42;

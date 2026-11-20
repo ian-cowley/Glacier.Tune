@@ -34,6 +34,8 @@ public sealed class LoraTrainer : IDisposable
     public GgufLoraModel Model => _model;
     public TrainingArguments Args => _args;
     public AdamW Optimizer => _optimizer;
+    public float? BestValidationLoss { get; private set; }
+    public float? LastValidationLoss { get; private set; }
 
     public int StartingStep
     {
@@ -66,6 +68,7 @@ public sealed class LoraTrainer : IDisposable
     /// </summary>
     public void ResumeFromCheckpoint(string adapterFilePath, float? annealedLearningRate = null, int startingStep = 0)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         GlacierDiagnostics.LogInformation($"[RESUME] Loading adapter checkpoint from {adapterFilePath}...");
         _model.LoadAdapter(adapterFilePath);
         _startingStep = Math.Max(0, startingStep);
@@ -87,31 +90,68 @@ public sealed class LoraTrainer : IDisposable
         float? annealedLearningRate = null,
         int startingStep = 0,
         int? additionalSteps = null,
-        Action<TrainingStepResult>? onStep = null)
+        Action<TrainingStepResult>? onStep = null,
+        ChatMlDataset? evalDataset = null)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        ArgumentNullException.ThrowIfNull(dataset);
         ResumeFromCheckpoint(adapterFilePath, annealedLearningRate, startingStep);
-        int? totalSteps = additionalSteps.HasValue ? startingStep + additionalSteps.Value : null;
-        Train(dataset, onStep, startingStepOverride: startingStep, learningRateOverride: annealedLearningRate, totalStepsOverride: totalSteps);
+        int effectiveStartingStep = Math.Max(0, startingStep);
+        int? totalSteps = additionalSteps.HasValue ? effectiveStartingStep + Math.Max(0, additionalSteps.Value) : null;
+        TrainCore(dataset, onStep, startingStepOverride: effectiveStartingStep, learningRateOverride: annealedLearningRate, totalStepsOverride: totalSteps, evalDataset: evalDataset, preservePriorBestCheckpoint: true);
     }
 
     /// <summary>
     /// Executes fine-tuning across the provided dataset, optionally starting from a custom step
-    /// with an annealed learning rate and custom total step budget.
+    /// with an annealed learning rate, custom total step budget, and optional validation split.
     /// </summary>
     public void Train(
         ChatMlDataset dataset,
         Action<TrainingStepResult>? onStep = null,
         int? startingStepOverride = null,
         float? learningRateOverride = null,
-        int? totalStepsOverride = null)
+        int? totalStepsOverride = null,
+        ChatMlDataset? evalDataset = null)
     {
+        TrainCore(dataset, onStep, startingStepOverride, learningRateOverride, totalStepsOverride, evalDataset, preservePriorBestCheckpoint: false);
+    }
+
+    private void TrainCore(
+        ChatMlDataset dataset,
+        Action<TrainingStepResult>? onStep,
+        int? startingStepOverride,
+        float? learningRateOverride,
+        int? totalStepsOverride,
+        ChatMlDataset? evalDataset,
+        bool preservePriorBestCheckpoint)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        ArgumentNullException.ThrowIfNull(dataset);
+
         int gradAccumSteps = Math.Max(1, _args.GradientAccumulationSteps);
-        int initialStep = startingStepOverride ?? _startingStep;
+        int initialStep = Math.Max(0, startingStepOverride ?? _startingStep);
         float baseLr = learningRateOverride ?? _resumedLearningRate ?? _args.LearningRate;
 
         int datasetSteps = (dataset.Count + gradAccumSteps - 1) / gradAccumSteps;
-        int totalSteps = totalStepsOverride ?? _args.MaxSteps ?? (initialStep + (_args.Epochs * datasetSteps));
+        int? maxStepsLimit = totalStepsOverride ?? _args.MaxSteps;
+        int totalSteps = maxStepsLimit ?? (initialStep + (_args.Epochs * datasetSteps));
         int globalStep = initialStep;
+
+        BestValidationLoss = null;
+        LastValidationLoss = null;
+        float bestValLoss = float.PositiveInfinity;
+        string bestPath = Path.Combine(_args.OutputDir, "best_adapter.bin");
+        string bestLossPath = Path.Combine(_args.OutputDir, "best_adapter.loss");
+        if (preservePriorBestCheckpoint && File.Exists(bestPath) && File.Exists(bestLossPath))
+        {
+            string rawLoss = File.ReadAllText(bestLossPath).Trim();
+            if (float.TryParse(rawLoss, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float priorBest) &&
+                float.IsFinite(priorBest))
+            {
+                bestValLoss = priorBest;
+                BestValidationLoss = priorBest;
+            }
+        }
 
         GlacierDiagnostics.LogInformation("================================================================================");
         GlacierDiagnostics.LogInformation("                GLACIER.TUNE: PURE C# .NET 10 LLM FINE-TUNING                   ");
@@ -123,6 +163,10 @@ public sealed class LoraTrainer : IDisposable
         GlacierDiagnostics.LogInformation($"  Base Model Params:    {total:N0} parameters (FROZEN in unmanaged memory)");
         GlacierDiagnostics.LogInformation($"  Trainable Parameters: {trainable:N0} ({pct:F2}% trainable - {100.0 - pct:F2}% parameter reduction)");
         GlacierDiagnostics.LogInformation($"  Dataset Size:         {dataset.Count} examples across {_args.Epochs} epochs");
+        if (evalDataset != null && _args.EvalSteps > 0)
+        {
+            GlacierDiagnostics.LogInformation($"  Validation Split:     {evalDataset.Count} examples (every {_args.EvalSteps} steps)");
+        }
         GlacierDiagnostics.LogInformation($"  Gradient Accum Steps: {gradAccumSteps}");
         GlacierDiagnostics.LogInformation($"  Base Learning Rate:   {baseLr:E2} ({_args.LrSchedulerType} decay)");
         if (initialStep > 0)
@@ -141,23 +185,31 @@ public sealed class LoraTrainer : IDisposable
 
         for (int epoch = 1; epoch <= _args.Epochs; epoch++)
         {
+            if (maxStepsLimit.HasValue && globalStep >= maxStepsLimit.Value)
+            {
+                break;
+            }
+
             int accumCounter = 0;
+            accumulatedLoss = 0f;
+            accumulatedTokens = 0;
             _optimizer.ZeroGrad();
 
             for (int i = 0; i < dataset.Count; i++)
             {
                 var example = dataset.Examples[i];
-                if (example.InputIds.Length < 2) continue;
+                if (example.InputIds.Length >= 2)
+                {
+                    accumCounter++;
+                    GlacierDiagnostics.LogDebug($"[Epoch {epoch,2}/{_args.Epochs}] Step {globalStep + 1,4}/{totalSteps} | Microbatch {accumCounter}/{gradAccumSteps} (tokens: {example.InputIds.Length})...");
 
-                accumCounter++;
-                GlacierDiagnostics.LogDebug($"[Epoch {epoch,2}/{_args.Epochs}] Step {globalStep + 1,4}/{totalSteps} | Microbatch {accumCounter}/{gradAccumSteps} (tokens: {example.InputIds.Length})...");
+                    // Compute loss over example using LoRA projection adapters
+                    float lossVal = TrainMicroBatch(example);
+                    accumulatedLoss += lossVal;
+                    accumulatedTokens += example.InputIds.Length;
+                }
 
-                // Compute loss over example using LoRA projection adapters
-                float lossVal = TrainMicroBatch(example);
-                accumulatedLoss += lossVal;
-                accumulatedTokens += example.InputIds.Length;
-
-                if (accumCounter >= gradAccumSteps || i == dataset.Count - 1)
+                if (accumCounter > 0 && (accumCounter >= gradAccumSteps || i == dataset.Count - 1))
                 {
                     globalStep++;
 
@@ -214,19 +266,40 @@ public sealed class LoraTrainer : IDisposable
                         GlacierDiagnostics.LogInformation($"[CHECKPOINT] Saved intermediate LoRA checkpoint to {checkpointDir}");
                     }
 
+                    if (evalDataset != null && evalDataset.Count > 0 && _args.EvalSteps > 0 && globalStep % _args.EvalSteps == 0)
+                    {
+                        float valLoss = Evaluate(evalDataset);
+                        if (float.IsFinite(valLoss))
+                        {
+                            LastValidationLoss = valLoss;
+                            if (valLoss < bestValLoss)
+                            {
+                                bestValLoss = valLoss;
+                                BestValidationLoss = valLoss;
+                                _model.SaveAdapter(bestPath);
+                                File.WriteAllText(bestLossPath, valLoss.ToString("R", System.Globalization.CultureInfo.InvariantCulture));
+                                GlacierDiagnostics.LogInformation($"[EVAL] Step {globalStep}: ValLoss={valLoss:F4} (new best -> {bestPath})");
+                            }
+                            else
+                            {
+                                GlacierDiagnostics.LogInformation($"[EVAL] Step {globalStep}: ValLoss={valLoss:F4} (best={bestValLoss:F4})");
+                            }
+                        }
+                    }
+
                     accumCounter = 0;
                     accumulatedLoss = 0f;
                     accumulatedTokens = 0;
                     swGlobalStep.Restart();
 
-                    if (_args.MaxSteps.HasValue && globalStep >= _args.MaxSteps.Value)
+                    if (maxStepsLimit.HasValue && globalStep >= maxStepsLimit.Value)
                     {
                         break;
                     }
                 }
             }
 
-            if (_args.MaxSteps.HasValue && globalStep >= _args.MaxSteps.Value)
+            if (maxStepsLimit.HasValue && globalStep >= maxStepsLimit.Value)
             {
                 break;
             }
@@ -241,6 +314,36 @@ public sealed class LoraTrainer : IDisposable
         GlacierDiagnostics.LogInformation("[SUCCESS] Model adapter saved successfully.");
     }
 
+    /// <summary>
+    /// Computes forward-only mean validation loss across all valid examples in <paramref name="evalDataset"/>
+    /// without mutating adapter gradients or optimizer state.
+    /// </summary>
+    public float Evaluate(ChatMlDataset evalDataset)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (evalDataset == null || evalDataset.Count == 0)
+        {
+            return float.NaN;
+        }
+
+        double totalLoss = 0.0;
+        int evaluatedCount = 0;
+        for (int i = 0; i < evalDataset.Count; i++)
+        {
+            var example = evalDataset.Examples[i];
+            if (example.InputIds.Length < 2) continue;
+
+            float loss = _model.EvaluateLoss(example.InputIds, example.Labels, out int validTokens);
+            if (validTokens > 0 && float.IsFinite(loss))
+            {
+                totalLoss += loss;
+                evaluatedCount++;
+            }
+        }
+
+        return evaluatedCount > 0 ? (float)(totalLoss / evaluatedCount) : float.NaN;
+    }
+
     private float TrainMicroBatch(TrainingExample example)
     {
         return _model.ForwardLossAndBackward(example.InputIds, example.Labels, _args.CheckpointActivations);
@@ -248,6 +351,7 @@ public sealed class LoraTrainer : IDisposable
 
     public void ScaleAccumulatedGradients(float scale)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         if (scale == 1.0f) return;
 
         foreach (var p in _model.TrainableParameters)
@@ -290,6 +394,7 @@ public sealed class LoraTrainer : IDisposable
 
     public float ClipGradients(float maxNorm)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         if (maxNorm <= 0f) return 0f;
 
         double totalNormSq = 0.0;
@@ -300,33 +405,31 @@ public sealed class LoraTrainer : IDisposable
             int n = gradSpan.Length;
 
             double sumSq = 0.0;
-            int i = 0;
-            if (Vector256.IsHardwareAccelerated && n >= 8)
+            for (int i = 0; i < n; i++)
             {
-                var vSum = Vector256<float>.Zero;
-                for (; i <= n - 8; i += 8)
-                {
-                    var vG = Vector256.LoadUnsafe(ref gradSpan[i]);
-                    vSum = Vector256.Add(vSum, Vector256.Multiply(vG, vG));
-                }
-                sumSq += Vector256.Sum(vSum);
-            }
-            for (; i < n; i++)
-            {
-                float g = gradSpan[i];
+                double g = gradSpan[i];
                 sumSq += g * g;
             }
             totalNormSq += sumSq;
         }
 
-        float totalNorm = MathF.Sqrt((float)totalNormSq);
-        if (totalNorm > maxNorm)
+        double totalNormD = Math.Sqrt(totalNormSq);
+        if (!double.IsFinite(totalNormD))
         {
-            float scale = maxNorm / (totalNorm + 1e-6f);
+            foreach (var p in _model.TrainableParameters)
+            {
+                p.Grad?.AsSpan().Clear();
+            }
+            return 0f;
+        }
+
+        if (totalNormD > maxNorm)
+        {
+            float scale = (float)(maxNorm / (totalNormD + 1e-6));
             ScaleAccumulatedGradients(scale);
         }
 
-        return totalNorm;
+        return (float)Math.Min(totalNormD, float.MaxValue);
     }
 
     public void Dispose()

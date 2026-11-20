@@ -13,13 +13,14 @@ public static unsafe class RoPEKernel
         float* q, float* k,
         int seqLen,
         int nHeadsQ, int nHeadsKv, int headDim,
-        float freqBase, float freqScale = 1.0f)
+        float freqBase, float freqScale = 1.0f,
+        int ropeDim = -1, float* ropeFreqs = null)
     {
         for (int pos = 0; pos < seqLen; pos++)
         {
             float* posQ = q + (long)pos * nHeadsQ * headDim;
             float* posK = k + (long)pos * nHeadsKv * headDim;
-            ApplyRoPE(posQ, posK, nHeadsQ, nHeadsKv, headDim, pos, freqBase, freqScale, inverse: false);
+            ApplyRoPE(posQ, posK, nHeadsQ, nHeadsKv, headDim, pos, freqBase, freqScale, inverse: false, ropeDim, ropeFreqs);
         }
     }
 
@@ -27,14 +28,15 @@ public static unsafe class RoPEKernel
         float* dq, float* dk,
         int seqLen,
         int nHeadsQ, int nHeadsKv, int headDim,
-        float freqBase, float freqScale = 1.0f)
+        float freqBase, float freqScale = 1.0f,
+        int ropeDim = -1, float* ropeFreqs = null)
     {
         for (int pos = 0; pos < seqLen; pos++)
         {
             float* posDq = dq + (long)pos * nHeadsQ * headDim;
             float* posDk = dk + (long)pos * nHeadsKv * headDim;
             // Reverse rotation has negated sine (-sin(theta))
-            ApplyRoPE(posDq, posDk, nHeadsQ, nHeadsKv, headDim, pos, freqBase, freqScale, inverse: true);
+            ApplyRoPE(posDq, posDk, nHeadsQ, nHeadsKv, headDim, pos, freqBase, freqScale, inverse: true, ropeDim, ropeFreqs);
         }
     }
 
@@ -44,9 +46,13 @@ public static unsafe class RoPEKernel
         int nHeadsQ, int nHeadsKv,
         int headDim, int pos,
         float freqBase, float freqScale,
-        bool inverse)
+        bool inverse,
+        int ropeDim = -1,
+        float* ropeFreqs = null)
     {
-        int halfDim = headDim / 2;
+        int effectiveRopeDim = (ropeDim > 0 && ropeDim <= headDim) ? ropeDim : headDim;
+        int halfDim = effectiveRopeDim / 2;
+        if (halfDim <= 0) return;
 
         Span<float> cosTable = halfDim <= 128 ? stackalloc float[halfDim] : new float[halfDim];
         Span<float> sinTable = halfDim <= 128 ? stackalloc float[halfDim] : new float[halfDim];
@@ -55,7 +61,8 @@ public static unsafe class RoPEKernel
 
         for (int i = 0; i < halfDim; i++)
         {
-            float freq = 1.0f / MathF.Pow(freqBase, (float)(2 * i) / headDim);
+            float baseFreq = 1.0f / MathF.Pow(freqBase, (float)(2 * i) / effectiveRopeDim);
+            float freq = ropeFreqs != null ? (baseFreq / ropeFreqs[i]) : baseFreq;
             float theta = pos * freq * freqScale;
             cosTable[i] = MathF.Cos(theta);
             sinTable[i] = MathF.Sin(theta) * sinSign;

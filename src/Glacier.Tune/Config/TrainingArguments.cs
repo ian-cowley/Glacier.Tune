@@ -13,6 +13,7 @@ public sealed class TrainingArguments
     public float WarmupRatio { get; set; } = 0.03f;
     public int LoggingSteps { get; set; } = 5;
     public int SaveSteps { get; set; } = 15;
+    public int EvalSteps { get; set; } = 0;
     public string OutputDir { get; set; } = "./output";
     public string LrSchedulerType { get; set; } = "cosine";
     public string Device { get; set; } = "auto";

@@ -2,6 +2,7 @@ namespace Glacier.Tune.Export;
 
 using System;
 using System.Buffers;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.CompilerServices;
@@ -10,7 +11,6 @@ using System.Runtime.Intrinsics;
 using System.Text;
 using System.Threading.Tasks;
 using Glacier.Inference.Gguf;
-using Glacier.Inference.Model;
 using Glacier.Inference.Quant;
 using Glacier.Tune.Diagnostics;
 
@@ -103,7 +103,7 @@ public static unsafe class GgufMerger
         var sw = Stopwatch.StartNew();
         progress($"[1/4] Loading unmanaged base GGUF model and LoRA adapter...");
         using var baseGguf = new GgufFile(baseGgufPath);
-        var adapter = LoraAdapterWeights.Load(adapterBinPath);
+        var adapter = ParsedLoraAdapter.Load(adapterBinPath);
 
         if (adapter.Rank <= 0)
         {
@@ -120,7 +120,7 @@ public static unsafe class GgufMerger
         var newTypes = new GgufType[tensorCount];
         var newOffsets = new ulong[tensorCount];
         var newByteSizes = new ulong[tensorCount];
-        var isAdaptedList = new bool[tensorCount];
+        var mergePlans = new List<RowSliceMerge>?[tensorCount];
 
         int adaptedCount = 0;
         int nonAdaptedCount = 0;
@@ -145,20 +145,9 @@ public static unsafe class GgufMerger
         for (int i = 0; i < tensorCount; i++)
         {
             var t = baseGguf.TensorList[i];
-            bool isAdapted = false;
-            if (t.DimensionsCount == 2 && TryGetLoraProjection(t.Name, out int layer, out LoraProjection proj) && layer < adapter.LayerCount)
-            {
-                var slot = adapter.GetProjections(layer).Get(proj);
-                if (slot.A != null || slot.B != null)
-                {
-                    int inDim = (int)t.Dimensions[0];
-                    int outDim = (int)t.Dimensions[1];
-                    ValidateAndResolveSlotLayout(t.Name, slot.A, slot.B, slot.inDim, slot.outDim, inDim, outDim, adapter.Rank, out _, out _);
-                    isAdapted = true;
-                }
-            }
-
-            isAdaptedList[i] = isAdapted;
+            var slices = ResolveMergeSlices(baseGguf, t, adapter);
+            bool isAdapted = slices != null && slices.Count > 0;
+            mergePlans[i] = slices;
 
             GgufType newType;
             ulong newSize;
@@ -251,7 +240,8 @@ public static unsafe class GgufMerger
                 outFs.Write(new byte[(int)padNeeded]);
             }
 
-            if (!isAdaptedList[i])
+            var slices = mergePlans[i];
+            if (slices == null || slices.Count == 0)
             {
                 byte* srcPtr = baseGguf.GetTensorPointer(t);
                 ulong bytesRemaining = newByteSizes[i];
@@ -267,8 +257,7 @@ public static unsafe class GgufMerger
             }
             else
             {
-                TryGetLoraProjection(t.Name, out int layer, out LoraProjection proj);
-                if (layer != lastReportedLayer)
+                if (TryParseLayerName(t.Name, out int layer, out _) && layer != lastReportedLayer)
                 {
                     lastReportedLayer = layer;
                     progress($"  Fusing Transformer Block {layer:D2}/{baseGguf.BlockCount - 1}...");
@@ -283,92 +272,121 @@ public static unsafe class GgufMerger
                 byte* pDst = (byte*)NativeMemory.Alloc((nuint)totalTensorBytes);
                 try
                 {
-                    var (A, B, slotInDim, slotOutDim) = adapter.GetProjections(layer).Get(proj);
                     int rank = adapter.Rank;
                     float scaling = adapter.Scaling;
-                    ValidateAndResolveSlotLayout(t.Name, A, B, slotInDim, slotOutDim, inDim, outDim, rank, out bool isAPeftRowMajor, out bool isBPeftRowMajor);
-
                     IntPtr ptrBaseData = (IntPtr)baseGguf.GetTensorPointer(t);
                     IntPtr ptrDst = (IntPtr)pDst;
                     GgufType baseType = t.Type;
 
-                    fixed (float* pA = A, pB = B)
+                    var pinnedSlices = new PinnedRowSlice[slices.Count];
+                    for (int s = 0; s < slices.Count; s++)
                     {
-                        IntPtr ptrA = (IntPtr)pA;
-                        IntPtr ptrB = (IntPtr)pB;
+                        var sl = slices[s];
+                        var hA = GCHandle.Alloc(sl.Slot.A!, GCHandleType.Pinned);
+                        var hB = GCHandle.Alloc(sl.Slot.B!, GCHandleType.Pinned);
+                        pinnedSlices[s] = new PinnedRowSlice(
+                            sl.RowStart,
+                            sl.RowCount,
+                            hA,
+                            hB,
+                            hA.AddrOfPinnedObject(),
+                            hB.AddrOfPinnedObject(),
+                            sl.IsAPeftRowMajor,
+                            sl.IsBPeftRowMajor);
+                    }
 
+                    try
+                    {
                         Parallel.For(0, outDim, parallelOpts, () => ArrayPool<float>.Shared.Rent(inDim + rank), (r, loopState, workArr) =>
                         {
                             fixed (float* pWork = workArr)
                             {
                                 float* rowFloats = pWork;
                                 float* b_r = pWork + inDim;
-                                float* curA = (float*)ptrA;
-                                float* curB = (float*)ptrB;
                                 byte* curBase = (byte*)ptrBaseData;
                                 byte* curDst = (byte*)ptrDst;
 
                                 // 1. Dequantize base weight row r -> rowFloats[0 .. inDim - 1]
                                 QuantKernels.ExtractEmbedding(baseType, curBase, r, rowFloats, inDim);
 
-                                // 2. Extract scaled rank vector for output row r
-                                if (isBPeftRowMajor)
+                                // 2 & 3. Find covering LoRA slice (if any) and accumulate LoRA delta
+                                for (int s = 0; s < pinnedSlices.Length; s++)
                                 {
-                                    // PEFT layout B: [outDim, rank], row-major
-                                    float* bRow = curB + (long)r * rank;
-                                    for (int k = 0; k < rank; k++)
+                                    var slice = pinnedSlices[s];
+                                    if (r >= slice.RowStart && r < slice.RowStart + slice.RowCount)
                                     {
-                                        b_r[k] = scaling * bRow[k];
-                                    }
-                                }
-                                else
-                                {
-                                    // Glacier layout B: [rank, outDim], row-major
-                                    for (int k = 0; k < rank; k++)
-                                    {
-                                        b_r[k] = scaling * curB[(long)k * outDim + r];
-                                    }
-                                }
+                                        int localRow = r - slice.RowStart;
+                                        int sliceOutDim = slice.RowCount;
+                                        float* curA = (float*)slice.PtrA;
+                                        float* curB = (float*)slice.PtrB;
 
-                                // 3. Accumulate LoRA delta into rowFloats with identical IEEE-754 summation order across layouts
-                                if (isAPeftRowMajor)
-                                {
-                                    // Transposed layout A: [rank, inDim], row-major
-                                    for (int c = 0; c < inDim; c++)
-                                    {
-                                        float delta = 0f;
-                                        for (int k = 0; k < rank; k++)
+                                        if (slice.IsBPeftRowMajor)
                                         {
-                                            delta += b_r[k] * curA[(long)k * inDim + c];
+                                            float* bRow = curB + (long)localRow * rank;
+                                            for (int k = 0; k < rank; k++)
+                                            {
+                                                b_r[k] = scaling * bRow[k];
+                                            }
                                         }
-                                        rowFloats[c] += delta;
-                                    }
-                                }
-                                else if (Vector256.IsHardwareAccelerated && rank == 16)
-                                {
-                                    // Glacier layout A: [inDim, 16], row-major fast SIMD path
-                                    Vector256<float> br0 = Vector256.Load(b_r);
-                                    Vector256<float> br1 = Vector256.Load(b_r + 8);
-                                    for (int c = 0; c < inDim; c++)
-                                    {
-                                        float* aRow = curA + (long)c * 16;
-                                        Vector256<float> a0 = Vector256.Load(aRow);
-                                        Vector256<float> a1 = Vector256.Load(aRow + 8);
-                                        rowFloats[c] += Vector256.Sum((br0 * a0) + (br1 * a1));
-                                    }
-                                }
-                                else
-                                {
-                                    // Glacier layout A: [inDim, rank], general rank path
-                                    for (int c = 0; c < inDim; c++)
-                                    {
-                                        float* aRow = curA + (long)c * rank;
-                                        float delta = 0f;
-                                        for (int k = 0; k < rank; k++)
+                                        else
                                         {
-                                            delta += b_r[k] * aRow[k];
+                                            for (int k = 0; k < rank; k++)
+                                            {
+                                                b_r[k] = scaling * curB[(long)k * sliceOutDim + localRow];
+                                            }
                                         }
-                                        rowFloats[c] += delta;
+
+                                        if (slice.IsAPeftRowMajor)
+                                        {
+                                            for (int c = 0; c < inDim; c++)
+                                            {
+                                                float delta = 0f;
+                                                for (int k = 0; k < rank; k++)
+                                                {
+                                                    delta += b_r[k] * curA[(long)k * inDim + c];
+                                                }
+                                                rowFloats[c] += delta;
+                                            }
+                                        }
+                                        else if (Vector256.IsHardwareAccelerated && rank == 16)
+                                        {
+                                            Vector256<float> br0 = Vector256.Load(b_r);
+                                            Vector256<float> br1 = Vector256.Load(b_r + 8);
+                                            for (int c = 0; c < inDim; c++)
+                                            {
+                                                float* aRow = curA + (long)c * 16;
+                                                Vector256<float> a0 = Vector256.Load(aRow);
+                                                Vector256<float> a1 = Vector256.Load(aRow + 8);
+                                                rowFloats[c] += Vector256.Sum((br0 * a0) + (br1 * a1));
+                                            }
+                                        }
+                                        else if (Vector256.IsHardwareAccelerated && rank >= 8 && (rank & 7) == 0)
+                                        {
+                                            for (int c = 0; c < inDim; c++)
+                                            {
+                                                float* aRow = curA + (long)c * rank;
+                                                Vector256<float> acc = Vector256<float>.Zero;
+                                                for (int k = 0; k < rank; k += 8)
+                                                {
+                                                    acc += Vector256.Load(b_r + k) * Vector256.Load(aRow + k);
+                                                }
+                                                rowFloats[c] += Vector256.Sum(acc);
+                                            }
+                                        }
+                                        else
+                                        {
+                                            for (int c = 0; c < inDim; c++)
+                                            {
+                                                float* aRow = curA + (long)c * rank;
+                                                float delta = 0f;
+                                                for (int k = 0; k < rank; k++)
+                                                {
+                                                    delta += b_r[k] * aRow[k];
+                                                }
+                                                rowFloats[c] += delta;
+                                            }
+                                        }
+                                        break;
                                     }
                                 }
 
@@ -395,6 +413,14 @@ public static unsafe class GgufMerger
                             return workArr;
                         },
                         workArr => ArrayPool<float>.Shared.Return(workArr));
+                    }
+                    finally
+                    {
+                        for (int s = 0; s < pinnedSlices.Length; s++)
+                        {
+                            pinnedSlices[s].HandleA.Free();
+                            pinnedSlices[s].HandleB.Free();
+                        }
                     }
 
                     byte* pWrite = pDst;
@@ -766,28 +792,285 @@ public static unsafe class GgufMerger
         }
     }
 
-    private static bool TryGetLoraProjection(string tensorName, out int layerIndex, out LoraProjection projection)
+    private static bool TryParseLayerName(string tensorName, out int layerIndex, out string rawProj)
     {
         layerIndex = -1;
-        projection = (LoraProjection)(-1);
-
+        rawProj = string.Empty;
         var parts = tensorName.Split('.');
         if (parts.Length == 4 && parts[0] == "blk" && int.TryParse(parts[1], out layerIndex) && parts[3] == "weight")
         {
-            projection = parts[2] switch
-            {
-                "attn_q" => LoraProjection.Q,
-                "attn_k" => LoraProjection.K,
-                "attn_v" => LoraProjection.V,
-                "attn_output" => LoraProjection.AttnOut,
-                "ffn_gate" => LoraProjection.Gate,
-                "ffn_up" => LoraProjection.Up,
-                "ffn_down" => LoraProjection.Down,
-                _ => (LoraProjection)(-1)
-            };
-            return (int)projection >= 0;
+            rawProj = parts[2];
+            return true;
+        }
+        return false;
+    }
+
+    private static List<RowSliceMerge>? ResolveMergeSlices(GgufFile baseGguf, GgufTensorInfo t, ParsedLoraAdapter adapter)
+    {
+        if (!TryParseLayerName(t.Name, out int layer, out string rawProj) || layer < 0 || layer >= adapter.LayerCount)
+        {
+            return null;
         }
 
-        return false;
+        string? canonical = CanonicalizeProjection(rawProj);
+        if (canonical != null && adapter.TryGetSlot(layer, canonical, out var directSlot) && (directSlot.A != null || directSlot.B != null))
+        {
+            if (t.DimensionsCount != 2)
+            {
+                throw new InvalidDataException($"LoRA target tensor '{t.Name}' must be 2D, got {t.DimensionsCount}D.");
+            }
+            int inDim = (int)t.Dimensions[0];
+            int outDim = (int)t.Dimensions[1];
+            ValidateAndResolveSlotLayout(t.Name, directSlot.A, directSlot.B, directSlot.InDim, directSlot.OutDim, inDim, outDim, adapter.Rank, out bool isAPeft, out bool isBPeft);
+            return [new RowSliceMerge(0, outDim, directSlot, isAPeft, isBPeft)];
+        }
+
+        // Composite / fused GGUF tensor handling
+        if (rawProj == "attn_qkv" && !baseGguf.Tensors.ContainsKey($"blk.{layer}.ssm_out.weight"))
+        {
+            bool hasQ = adapter.TryGetSlot(layer, "attn_q", out var qSlot) && (qSlot.A != null || qSlot.B != null);
+            bool hasK = adapter.TryGetSlot(layer, "attn_k", out var kSlot) && (kSlot.A != null || kSlot.B != null);
+            bool hasV = adapter.TryGetSlot(layer, "attn_v", out var vSlot) && (vSlot.A != null || vSlot.B != null);
+            if (!hasQ && !hasK && !hasV) return null;
+
+            if (t.DimensionsCount != 2)
+                throw new InvalidDataException($"LoRA target tensor '{t.Name}' must be 2D, got {t.DimensionsCount}D.");
+
+            int inDim = (int)t.Dimensions[0];
+            int outDim = (int)t.Dimensions[1];
+            int headDim = (baseGguf.TryGetTensor($"blk.{layer}.attn_q_norm.weight", out var qNorm) && qNorm != null && qNorm.Dimensions.Length > 0)
+                ? (int)qNorm.Dimensions[0]
+                : (baseGguf.HeadDim > 0 ? baseGguf.HeadDim : (baseGguf.HeadCount > 0 ? baseGguf.EmbeddingLength / baseGguf.HeadCount : 128));
+            int layerHeadsKv = (baseGguf.HeadCountKvPattern != null && layer < baseGguf.HeadCountKvPattern.Length)
+                ? baseGguf.HeadCountKvPattern[layer]
+                : baseGguf.HeadCountKv;
+            int qDim = baseGguf.HeadCount * headDim;
+            int kvDim = layerHeadsKv * headDim;
+            int qRows = outDim == 2 * qDim + 2 * kvDim ? 2 * qDim : (outDim == qDim + 2 * kvDim ? qDim : -1);
+            if (qRows <= 0 || qRows + 2 * kvDim != outDim)
+            {
+                throw new NotSupportedException($"Cannot split fused full-attention '{t.Name}' (outDim={outDim}) into Q({qDim}/{2 * qDim})+K({kvDim})+V({kvDim}).");
+            }
+
+            var slices = new List<RowSliceMerge>(3);
+            if (hasQ)
+            {
+                ValidateAndResolveSlotLayout(t.Name + "[q]", qSlot.A, qSlot.B, qSlot.InDim, qSlot.OutDim, inDim, qRows, adapter.Rank, out bool isAPeft, out bool isBPeft);
+                slices.Add(new RowSliceMerge(0, qRows, qSlot, isAPeft, isBPeft));
+            }
+            if (hasK)
+            {
+                ValidateAndResolveSlotLayout(t.Name + "[k]", kSlot.A, kSlot.B, kSlot.InDim, kSlot.OutDim, inDim, kvDim, adapter.Rank, out bool isAPeft, out bool isBPeft);
+                slices.Add(new RowSliceMerge(qRows, kvDim, kSlot, isAPeft, isBPeft));
+            }
+            if (hasV)
+            {
+                ValidateAndResolveSlotLayout(t.Name + "[v]", vSlot.A, vSlot.B, vSlot.InDim, vSlot.OutDim, inDim, kvDim, adapter.Rank, out bool isAPeft, out bool isBPeft);
+                slices.Add(new RowSliceMerge(qRows + kvDim, kvDim, vSlot, isAPeft, isBPeft));
+            }
+            return slices;
+        }
+
+        if (rawProj == "attn_qkv_gate")
+        {
+            bool hasQkv = adapter.TryGetSlot(layer, "attn_qkv", out var qkvSlot) && (qkvSlot.A != null || qkvSlot.B != null);
+            bool hasGate = adapter.TryGetSlot(layer, "attn_gate", out var gateSlot) && (gateSlot.A != null || gateSlot.B != null);
+            if (!hasQkv && !hasGate) return null;
+
+            if (t.DimensionsCount != 2)
+                throw new InvalidDataException($"LoRA target tensor '{t.Name}' must be 2D, got {t.DimensionsCount}D.");
+
+            int inDim = (int)t.Dimensions[0];
+            int outDim = (int)t.Dimensions[1];
+            int nZ = baseGguf.SsmInnerSize > 0 ? baseGguf.SsmInnerSize : baseGguf.SsmStateSize * baseGguf.SsmTimeStepRank;
+            int nQkv = outDim - nZ;
+            if (nQkv <= 0 || nZ <= 0)
+            {
+                throw new NotSupportedException($"Cannot split fused GDN '{t.Name}' (outDim={outDim}, nZ={nZ}).");
+            }
+
+            var slices = new List<RowSliceMerge>(2);
+            if (hasQkv)
+            {
+                ValidateAndResolveSlotLayout(t.Name + "[qkv]", qkvSlot.A, qkvSlot.B, qkvSlot.InDim, qkvSlot.OutDim, inDim, nQkv, adapter.Rank, out bool isAPeft, out bool isBPeft);
+                slices.Add(new RowSliceMerge(0, nQkv, qkvSlot, isAPeft, isBPeft));
+            }
+            if (hasGate)
+            {
+                ValidateAndResolveSlotLayout(t.Name + "[gate]", gateSlot.A, gateSlot.B, gateSlot.InDim, gateSlot.OutDim, inDim, nZ, adapter.Rank, out bool isAPeft, out bool isBPeft);
+                slices.Add(new RowSliceMerge(nQkv, nZ, gateSlot, isAPeft, isBPeft));
+            }
+            return slices;
+        }
+
+        if (rawProj is "ssm_beta_alpha" or "ssm_ba")
+        {
+            bool hasBeta = adapter.TryGetSlot(layer, "ssm_beta", out var betaSlot) && (betaSlot.A != null || betaSlot.B != null);
+            bool hasAlpha = adapter.TryGetSlot(layer, "ssm_alpha", out var alphaSlot) && (alphaSlot.A != null || alphaSlot.B != null);
+            if (!hasBeta && !hasAlpha) return null;
+
+            if (t.DimensionsCount != 2)
+                throw new InvalidDataException($"LoRA target tensor '{t.Name}' must be 2D, got {t.DimensionsCount}D.");
+
+            int inDim = (int)t.Dimensions[0];
+            int outDim = (int)t.Dimensions[1];
+            int nBeta = outDim / 2;
+            int nAlpha = outDim - nBeta;
+            if (nBeta <= 0 || nAlpha <= 0) return null;
+
+            var slices = new List<RowSliceMerge>(2);
+            if (hasBeta)
+            {
+                ValidateAndResolveSlotLayout(t.Name + "[beta]", betaSlot.A, betaSlot.B, betaSlot.InDim, betaSlot.OutDim, inDim, nBeta, adapter.Rank, out bool isAPeft, out bool isBPeft);
+                slices.Add(new RowSliceMerge(0, nBeta, betaSlot, isAPeft, isBPeft));
+            }
+            if (hasAlpha)
+            {
+                ValidateAndResolveSlotLayout(t.Name + "[alpha]", alphaSlot.A, alphaSlot.B, alphaSlot.InDim, alphaSlot.OutDim, inDim, nAlpha, adapter.Rank, out bool isAPeft, out bool isBPeft);
+                slices.Add(new RowSliceMerge(nBeta, nAlpha, alphaSlot, isAPeft, isBPeft));
+            }
+            return slices;
+        }
+
+        return null;
+    }
+
+    private static string? CanonicalizeProjection(string projName)
+    {
+        return projName switch
+        {
+            "attn_q" or "q_proj" => "attn_q",
+            "attn_k" or "k_proj" => "attn_k",
+            "attn_v" or "v_proj" => "attn_v",
+            "attn_output" or "o_proj" => "attn_output",
+            "ffn_gate" or "gate_proj" => "ffn_gate",
+            "ffn_up" or "up_proj" => "ffn_up",
+            "ffn_down" or "down_proj" => "ffn_down",
+            "attn_qkv" or "in_proj_qkv" or "qkv_proj" => "attn_qkv",
+            "attn_gate" or "in_proj_z" => "attn_gate",
+            "ssm_alpha" or "in_proj_a" or "alpha_proj" => "ssm_alpha",
+            "ssm_beta" or "in_proj_b" or "beta_proj" => "ssm_beta",
+            "ssm_out" or "out_proj" => "ssm_out",
+            _ => null
+        };
+    }
+
+    private readonly record struct RowSliceMerge(int RowStart, int RowCount, AdapterSlot Slot, bool IsAPeftRowMajor, bool IsBPeftRowMajor);
+
+    private readonly record struct PinnedRowSlice(
+        int RowStart,
+        int RowCount,
+        GCHandle HandleA,
+        GCHandle HandleB,
+        IntPtr PtrA,
+        IntPtr PtrB,
+        bool IsAPeftRowMajor,
+        bool IsBPeftRowMajor);
+
+    private sealed class AdapterSlot
+    {
+        public float[]? A { get; set; }
+        public float[]? B { get; set; }
+        public int InDim { get; set; }
+        public int OutDim { get; set; }
+    }
+
+    private sealed class ParsedLoraAdapter
+    {
+        public int LayerCount { get; init; }
+        public int Rank { get; init; }
+        public float Alpha { get; init; }
+        public float Scaling => Rank > 0 ? Alpha / Rank : 1.0f;
+
+        private readonly Dictionary<(int Layer, string Proj), AdapterSlot> _slots = [];
+
+        public bool TryGetSlot(int layer, string canonicalProj, out AdapterSlot slot)
+            => _slots.TryGetValue((layer, canonicalProj), out slot!);
+
+        public static ParsedLoraAdapter Load(string adapterFilePath)
+        {
+            string binPath = adapterFilePath;
+            if (Directory.Exists(adapterFilePath))
+            {
+                string candidate = Path.Combine(adapterFilePath, "adapter_model.bin");
+                if (File.Exists(candidate)) binPath = candidate;
+            }
+
+            if (!File.Exists(binPath))
+                throw new FileNotFoundException($"LoRA adapter file not found: {adapterFilePath}");
+
+            using var fs = File.OpenRead(binPath);
+            using var br = new BinaryReader(fs);
+
+            uint magic = br.ReadUInt32();
+            if (magic != 0x41524F4C)
+                throw new InvalidDataException($"Invalid LoRA magic header: 0x{magic:X8} (expected 0x41524F4C 'LORA')");
+
+            uint version = br.ReadUInt32();
+            if (version != 1)
+                throw new InvalidDataException($"Unsupported LoRA adapter version: {version}");
+
+            int layerCount = br.ReadInt32();
+            int rank = br.ReadInt32();
+            float alpha = br.ReadSingle();
+            int tensorCount = br.ReadInt32();
+            if (tensorCount < 0)
+                throw new InvalidDataException($"Invalid negative LoRA tensor count: {tensorCount}");
+
+            var parsed = new ParsedLoraAdapter
+            {
+                LayerCount = layerCount,
+                Rank = rank,
+                Alpha = alpha
+            };
+
+            for (int t = 0; t < tensorCount; t++)
+            {
+                string name = br.ReadString();
+                int dim0 = br.ReadInt32();
+                int dim1 = br.ReadInt32();
+                if (dim0 <= 0 || dim1 <= 0)
+                    throw new InvalidDataException($"Invalid LoRA tensor dimensions [{dim0}, {dim1}] for '{name}'.");
+
+                long elemCount = (long)dim0 * dim1;
+                long byteCount = elemCount * sizeof(float);
+                if (byteCount > fs.Length - fs.Position)
+                    throw new InvalidDataException($"Truncated LoRA binary payload for '{name}': expected {byteCount} bytes, only {fs.Length - fs.Position} remaining.");
+
+                var parts = name.Split('.');
+                if (parts.Length >= 5 && parts[0] == "blk" && int.TryParse(parts[1], out int layerIdx))
+                {
+                    string? canonicalProj = CanonicalizeProjection(parts[2]);
+                    string matrix = parts[3];
+                    if (canonicalProj != null && (matrix == "lora_a" || matrix == "lora_b"))
+                    {
+                        float[] data = new float[elemCount];
+                        fs.ReadExactly(MemoryMarshal.AsBytes(data.AsSpan()));
+
+                        if (!parsed._slots.TryGetValue((layerIdx, canonicalProj), out var slot))
+                        {
+                            slot = new AdapterSlot();
+                            parsed._slots[(layerIdx, canonicalProj)] = slot;
+                        }
+
+                        if (matrix == "lora_a")
+                        {
+                            slot.A = data;
+                            slot.InDim = dim0;
+                        }
+                        else
+                        {
+                            slot.B = data;
+                            slot.OutDim = dim1;
+                        }
+                        continue;
+                    }
+                }
+
+                fs.Seek(byteCount, SeekOrigin.Current);
+            }
+
+            return parsed;
+        }
     }
 }

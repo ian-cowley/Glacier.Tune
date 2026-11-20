@@ -295,4 +295,48 @@ public unsafe class GgufMergerQuantizationTests
         Assert.True(gguf.TryGetTensor("blk.0.attn_q.weight", out var tensor) && tensor != null);
         Assert.Equal(GgufType.Q8_0, tensor.Type);
     }
+
+    [Fact]
+    public void GgufMerger_Merge_Rank64_F32_MatchesExactDelta()
+    {
+        using var fixture = SyntheticGgufFixture.CreateTinyQwenModel(layerCount: 1, hiddenDim: 128, ffnDim: 256, rank: 64, alpha: 128f, weightType: GgufType.F32);
+        string outputPath = Path.Combine(fixture.DirectoryPath, "fused_r64_f32.gguf");
+
+        var result = GgufMerger.Merge(
+            fixture.GgufPath,
+            fixture.AdapterPath,
+            outputPath,
+            new GgufMerger.MergeOptions { TargetQuantization = TargetQuantization.F32 });
+
+        Assert.True(File.Exists(outputPath));
+        Assert.Equal(7, result.AdaptedTensorCount);
+
+        using var baseGguf = new GgufFile(fixture.GgufPath);
+        using var fusedGguf = new GgufFile(outputPath);
+        var adapter = Glacier.Inference.Model.LoraAdapterWeights.Load(fixture.AdapterPath);
+        Assert.Equal(64, adapter.Rank);
+        Assert.Equal(128f, adapter.Alpha);
+
+        Assert.True(baseGguf.TryGetTensor("blk.0.attn_q.weight", out var tBase) && tBase != null);
+        Assert.True(fusedGguf.TryGetTensor("blk.0.attn_q.weight", out var tFused) && tFused != null);
+        float* pBase = (float*)baseGguf.GetTensorPointer(tBase);
+        float* pFused = (float*)fusedGguf.GetTensorPointer(tFused);
+
+        var (A, B, _, _) = adapter.GetProjections(0).Get(Glacier.Inference.Model.LoraProjection.Q);
+        int inDim = (int)tBase.Dimensions[0];
+        int outDim = (int)tBase.Dimensions[1];
+        for (int r = 0; r < outDim; r++)
+        {
+            for (int c = 0; c < inDim; c++)
+            {
+                float delta = 0f;
+                for (int k = 0; k < 64; k++)
+                {
+                    delta += (2.0f * B![k * outDim + r]) * A![c * 64 + k];
+                }
+                float expected = pBase[r * inDim + c] + delta;
+                Assert.True(MathF.Abs(pFused[r * inDim + c] - expected) < 1e-4f);
+            }
+        }
+    }
 }

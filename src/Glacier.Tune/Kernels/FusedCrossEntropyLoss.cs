@@ -17,6 +17,156 @@ public static unsafe class FusedCrossEntropyLoss
 {
     private const int VocabTileSize = 4096;
 
+    /// <summary>
+    /// Computes forward-only online streaming Cross-Entropy loss without allocating or mutating gradient buffers.
+    /// </summary>
+    public static float ComputeLoss(
+        float* finalHidden,
+        int[] targetTokens,
+        GgufType lmHeadType,
+        byte* lmHeadWeight,
+        int seqLen,
+        int hiddenDim,
+        int vocabSize,
+        Glacier.Tune.Gpu.GpuLoraEngine? gpuEngine = null)
+        => ComputeLoss(finalHidden, targetTokens, lmHeadType, lmHeadWeight, seqLen, hiddenDim, vocabSize, out _, gpuEngine);
+
+    /// <summary>
+    /// Computes forward-only online streaming Cross-Entropy loss without allocating or mutating gradient buffers,
+    /// returning the count of valid supervised tokens via <paramref name="validTokenCount"/>.
+    /// </summary>
+    public static float ComputeLoss(
+        float* finalHidden,
+        int[] targetTokens,
+        GgufType lmHeadType,
+        byte* lmHeadWeight,
+        int seqLen,
+        int hiddenDim,
+        int vocabSize,
+        out int validTokenCount,
+        Glacier.Tune.Gpu.GpuLoraEngine? gpuEngine = null)
+    {
+        int[] validSeqIndices = new int[seqLen];
+        int validCount = 0;
+        for (int t = 0; t < seqLen; t++)
+        {
+            if (t < targetTokens.Length && targetTokens[t] >= 0 && targetTokens[t] < vocabSize)
+            {
+                validSeqIndices[validCount++] = t;
+            }
+        }
+
+        validTokenCount = validCount;
+        if (validCount == 0) return 0.0f;
+
+        float invValid = 1.0f / validCount;
+        float* pValidHidden = (float*)NativeMemory.AlignedAlloc((nuint)((long)validCount * hiddenDim * sizeof(float)), 64);
+        int* validTargetIds = (int*)NativeMemory.Alloc((nuint)validCount, sizeof(int));
+
+        try
+        {
+            for (int i = 0; i < validCount; i++)
+            {
+                int t = validSeqIndices[i];
+                validTargetIds[i] = targetTokens[t];
+                float* src = finalHidden + (long)t * hiddenDim;
+                float* dst = pValidHidden + (long)i * hiddenDim;
+                Buffer.MemoryCopy(src, dst, (ulong)(hiddenDim * sizeof(float)), (ulong)(hiddenDim * sizeof(float)));
+            }
+
+            var gpu = gpuEngine;
+            if (gpu != null &&
+                gpu.LmHeadWeight != IntPtr.Zero &&
+                gpu.SupportsForwardGemm(lmHeadType))
+            {
+                return gpu.ComputeTiledLmHeadLoss(
+                    lmHeadType,
+                    pValidHidden,
+                    validTargetIds,
+                    hiddenDim,
+                    vocabSize,
+                    validCount,
+                    VocabTileSize,
+                    &VectorizedMax,
+                    &VectorizedSumExp);
+            }
+
+            int actualTileSize = Math.Min(VocabTileSize, vocabSize);
+            int numTiles = (vocabSize + actualTileSize - 1) / actualTileSize;
+            int rowBytes = (int)GgufTypes.GetRowBytes(lmHeadType, hiddenDim);
+
+            float* pTileLogits = (float*)NativeMemory.AlignedAlloc((nuint)((long)validCount * actualTileSize * sizeof(float)), 64);
+            float* runningMax = (float*)NativeMemory.Alloc((nuint)validCount, sizeof(float));
+            double* runningSumExp = (double*)NativeMemory.Alloc((nuint)validCount, sizeof(double));
+            float* targetLogits = (float*)NativeMemory.Alloc((nuint)validCount, sizeof(float));
+
+            try
+            {
+                for (int i = 0; i < validCount; i++)
+                {
+                    runningMax[i] = float.NegativeInfinity;
+                    runningSumExp[i] = 0.0;
+                    targetLogits[i] = 0.0f;
+                }
+
+                for (int tile = 0; tile < numTiles; tile++)
+                {
+                    int vStart = tile * actualTileSize;
+                    int vCount = Math.Min(actualTileSize, vocabSize - vStart);
+                    byte* tileWeight = lmHeadWeight + (long)vStart * rowBytes;
+
+                    QuantKernels.MatMulBatch(lmHeadType, tileWeight, pValidHidden, pTileLogits, hiddenDim, vCount, validCount);
+
+                    for (int i = 0; i < validCount; i++)
+                    {
+                        float* logits = pTileLogits + (long)i * vCount;
+                        int targetId = validTargetIds[i];
+                        if (targetId >= vStart && targetId < vStart + vCount)
+                        {
+                            targetLogits[i] = logits[targetId - vStart];
+                        }
+
+                        float tileMax = VectorizedMax(logits, vCount);
+                        if (float.IsNegativeInfinity(runningMax[i]))
+                        {
+                            runningMax[i] = tileMax;
+                            runningSumExp[i] = VectorizedSumExp(logits, vCount, tileMax);
+                        }
+                        else
+                        {
+                            float mNew = MathF.Max(runningMax[i], tileMax);
+                            double factor = Math.Exp((double)runningMax[i] - mNew);
+                            double tileSum = VectorizedSumExp(logits, vCount, mNew);
+                            runningSumExp[i] = runningSumExp[i] * factor + tileSum;
+                            runningMax[i] = mNew;
+                        }
+                    }
+                }
+
+                double totalLoss = 0.0;
+                for (int i = 0; i < validCount; i++)
+                {
+                    double lse = runningMax[i] + Math.Log(runningSumExp[i]);
+                    totalLoss += lse - targetLogits[i];
+                }
+
+                return (float)(totalLoss * invValid);
+            }
+            finally
+            {
+                NativeMemory.AlignedFree(pTileLogits);
+                NativeMemory.Free(runningMax);
+                NativeMemory.Free(runningSumExp);
+                NativeMemory.Free(targetLogits);
+            }
+        }
+        finally
+        {
+            NativeMemory.AlignedFree(pValidHidden);
+            NativeMemory.Free(validTargetIds);
+        }
+    }
+
     public static float ComputeLossAndGradients(
         float* finalHidden, // [seqLen, hiddenDim]
         int[] inputTokens,

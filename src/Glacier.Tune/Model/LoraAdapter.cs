@@ -20,7 +20,7 @@ public sealed unsafe class LoraAdapter : IDisposable
     private readonly int _inFeatures;
     private readonly int _outFeatures;
     private readonly int _rank;
-    private readonly float _scaling;
+    private float _scaling;
     private readonly bool _isEnabled;
     private readonly Tensor<float> _adapterA; // [InFeatures, Rank]
     private readonly Tensor<float> _adapterB; // [Rank, OutFeatures]
@@ -69,6 +69,11 @@ public sealed unsafe class LoraAdapter : IDisposable
             }
             return true;
         }
+    }
+
+    internal void UpdateAlpha(float alpha)
+    {
+        _scaling = _rank > 0 ? alpha / _rank : 0f;
     }
 
     public void SetGpuBaseWeights(Glacier.Tune.Gpu.GpuLoraEngine engine, IntPtr dBaseWeight, IntPtr dBaseBias = default)
