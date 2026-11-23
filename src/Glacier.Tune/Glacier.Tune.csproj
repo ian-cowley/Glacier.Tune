@@ -14,7 +14,7 @@
 
     <!-- NuGet Package Properties -->
     <PackageId>Glacier.Tune</PackageId>
-    <Version>1.4.1</Version>
+    <Version>1.5.0</Version>
     <Authors>Ian Cowley</Authors>
     <Company>Glacier High-Performance Ecosystem</Company>
     <Description>Pure C# .NET 10 LLM fine-tuning, PEFT (LoRA / QLoRA), continual learning Sleep consolidation, pre-allocated MoE expansion, and model alignment engine. Direct GGUF zero-copy memory-mapping, zero-allocation Autograd backpropagation, and instant adapter fusion.</Description>
@@ -24,7 +24,7 @@
     <RepositoryType>git</RepositoryType>
     <PackageTags>llm;fine-tuning;lora;qlora;peft;gguf;qwen;deep-learning;csharp;net10;glacier;continual-learning;sleep;gkd;moe</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
-    <PackageReleaseNotes>v1.1.0: Introduces Continual Learning Sleep Consolidation Pipeline and Pre-allocated MoE Parameter Expansion (arXiv:2606.03979). Implements PreallocatedMoeExpansionBank with 64-byte aligned unmanaged slots and SIMD Top-k routing, DreamQualityFilter with AVX2 SIMD Levenshtein edit distance and cosine similarity filtering, and SleepConsolidationTrainer with 3-phase biological consolidation (Dreaming, Generalized Knowledge Distillation / GKD with beta-divergence, and Synaptic Pruning). Updates Glacier.Inference dependency to v1.5.0 and Glacier.Tensor to v1.1.0.</PackageReleaseNotes>
+    <PackageReleaseNotes>v1.5.0: Adds pure-C# Inkling-2-Mini post-training support via Inkling2Dataset (official control tokens + completion masking) and Inkling2HeadLoraTrainer (resumable FP16 GPU hidden-state cache, exact FinalLogitSoftcapping + SiLU + KL-divergence regularized AdamW). Updates Glacier.Inference dependency to v1.9.0.</PackageReleaseNotes>
   </PropertyGroup>
 
   <ItemGroup>
@@ -38,7 +38,7 @@
     <ProjectReference Include="..\..\..\Glacier.Inference\src\Glacier.Inference\Glacier.Inference.csproj" Condition="Exists('..\..\..\Glacier.Inference\src\Glacier.Inference\Glacier.Inference.csproj') and '$(UseLocalProjectReferences)' != 'false'" />
   </ItemGroup>
   <ItemGroup Condition="!Exists('..\..\..\Glacier.Inference\src\Glacier.Inference\Glacier.Inference.csproj') or '$(UseLocalProjectReferences)' == 'false'">
-    <PackageReference Include="Glacier.Inference" Version="1.8.2" Condition="!Exists('..\..\..\Glacier.Inference\src\Glacier.Inference\Glacier.Inference.csproj') or '$(UseLocalProjectReferences)' == 'false'" />
+    <PackageReference Include="Glacier.Inference" Version="1.9.0" Condition="!Exists('..\..\..\Glacier.Inference\src\Glacier.Inference\Glacier.Inference.csproj') or '$(UseLocalProjectReferences)' == 'false'" />
   </ItemGroup>
 
   <ItemGroup Condition="Exists('..\..\..\Glacier.Tensor\src\Glacier.Tensor\Glacier.Tensor.csproj') and '$(UseLocalProjectReferences)' != 'false'">
