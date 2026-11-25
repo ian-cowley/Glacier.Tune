@@ -10,6 +10,7 @@ using System.Threading.Tasks;
 using Glacier.Inference.Gpu.D3D12;
 using Glacier.Inference.Model;
 using Glacier.Tune.Data;
+using Glacier.Tune.Kernels;
 
 /// <summary>
 /// Pure-C# .NET 10 post-Epilogue Head-LoRA trainer for Thinking Machines Lab's Inkling-2-Mini.
@@ -203,6 +204,10 @@ public sealed unsafe class Inkling2HeadLoraTrainer
         bool useKl = klBeta > 0.0f;
 
         // If KL regularization is enabled, compute frozen base distribution p_base = softmax(softcap(baseRawLogits))
+        int argMaxBase = 0;
+        double baseSumOther = 0.0;
+        double invSumBase = 1.0;
+        double baseLogZOffset = 0.0;
         if (useKl)
         {
             if (workBaseProbs.Length < vocab)
@@ -215,18 +220,25 @@ public sealed unsafe class Inkling2HeadLoraTrainer
                 float zb = baseRawLogits[v];
                 if (softcap > 0f) zb = softcap * MathF.Tanh(zb * invCapB);
                 workBaseProbs[v] = zb;
-                if (zb > maxBase) maxBase = zb;
+                if (v == 0 || zb > maxBase)
+                {
+                    maxBase = zb;
+                    argMaxBase = v;
+                }
             }
-            double sumBase = 0.0;
             for (int v = 0; v < vocab; v++)
             {
-                float e = MathF.Exp(workBaseProbs[v] - maxBase);
-                workBaseProbs[v] = e;
-                sumBase += e;
+                if (v != argMaxBase)
+                    baseSumOther += Math.Exp((double)workBaseProbs[v] - maxBase);
             }
-            float invSumBase = (float)(1.0 / sumBase);
+            baseLogZOffset = FusedCrossEntropyLoss.Log1p(baseSumOther);
+            invSumBase = 1.0 / (1.0 + baseSumOther);
             for (int v = 0; v < vocab; v++)
-                workBaseProbs[v] *= invSumBase;
+            {
+                workBaseProbs[v] = (v == argMaxBase)
+                    ? (float)invSumBase
+                    : (float)(Math.Exp((double)workBaseProbs[v] - maxBase) * invSumBase);
+            }
         }
 
         Span<float> u = rank <= 256 ? stackalloc float[rank] : new float[rank];
@@ -262,8 +274,9 @@ public sealed unsafe class Inkling2HeadLoraTrainer
             }
         }
 
-        // Apply FinalLogitSoftcapping and compute stable softmax + NLL (+ KL) loss
+        // Apply FinalLogitSoftcapping and compute Barron-stabilized split-sum softmax + NLL (+ KL) loss
         float maxLogit = float.NegativeInfinity;
+        int argMax = 0;
         float invCap = softcap > 0f ? 1.0f / softcap : 0f;
         for (int v = 0; v < vocab; v++)
         {
@@ -280,57 +293,70 @@ public sealed unsafe class Inkling2HeadLoraTrainer
                 workDzRaw[v] = 1.0f;
             }
             workLogits[v] = z;
-            if (z > maxLogit) maxLogit = z;
+            if (v == 0 || z > maxLogit)
+            {
+                maxLogit = z;
+                argMax = v;
+            }
         }
 
-        double sumExp = 0.0;
+        double sumOther = 0.0;
         for (int v = 0; v < vocab; v++)
         {
-            float e = MathF.Exp(workLogits[v] - maxLogit);
-            workLogits[v] = e;
-            sumExp += e;
+            if (v != argMax)
+                sumOther += Math.Exp((double)workLogits[v] - maxLogit);
         }
 
-        float invSum = (float)(1.0 / sumExp);
-        float targetProb = Math.Max(1e-12f, workLogits[targetToken] * invSum);
-        float loss = -MathF.Log(targetProb);
+        double logZOffset = FusedCrossEntropyLoss.Log1p(sumOther);
+        double invSum = 1.0 / (1.0 + sumOther);
+        double nll = (targetToken == argMax)
+            ? logZOffset
+            : (logZOffset + ((double)maxLogit - (double)workLogits[targetToken]));
+        double totalLoss = nll;
 
         if (useKl)
         {
             double klSum = 0.0;
             for (int v = 0; v < vocab; v++)
             {
-                float pb = workBaseProbs[v];
-                if (pb > 1e-12f)
+                double pb = (v == argMaxBase) ? invSumBase : workBaseProbs[v];
+                if (pb > 0.0)
                 {
-                    float pl = Math.Max(1e-12f, workLogits[v] * invSum);
-                    klSum += pb * Math.Log(pb / pl);
+                    double logBase = (v == argMaxBase) ? -baseLogZOffset : Math.Log(pb);
+                    double logP = (v == argMax)
+                        ? -logZOffset
+                        : (((double)workLogits[v] - maxLogit) - logZOffset);
+                    klSum += pb * (logBase - logP);
                 }
             }
-            loss += (float)(klBeta * klSum);
+            totalLoss += klBeta * Math.Max(0.0, klSum);
         }
 
+        float loss = (float)totalLoss;
         if (!accumulateGrad)
             return loss;
 
         // dz_raw = [(prob - one_hot(target)) + klBeta * (prob - p_base)] * dSoftcap
-        if (useKl)
+        for (int v = 0; v < vocab; v++)
         {
-            for (int v = 0; v < vocab; v++)
+            double prob = (v == argMax)
+                ? invSum
+                : Math.Exp((double)workLogits[v] - maxLogit) * invSum;
+
+            double ceGrad = (v == targetToken && v == argMax)
+                ? (-sumOther * invSum)
+                : (prob - (v == targetToken ? 1.0 : 0.0));
+
+            double dz = ceGrad;
+            if (useKl)
             {
-                float prob = workLogits[v] * invSum;
-                float dz = (v == targetToken ? (prob - 1.0f) : prob) + klBeta * (prob - workBaseProbs[v]);
-                workDzRaw[v] = dz * workDzRaw[v];
+                double klGrad = (v == argMax && v == argMaxBase)
+                    ? ((baseSumOther - sumOther) * invSum * invSumBase)
+                    : (prob - workBaseProbs[v]);
+                dz += klBeta * klGrad;
             }
-        }
-        else
-        {
-            for (int v = 0; v < vocab; v++)
-            {
-                float prob = workLogits[v] * invSum;
-                float dz = v == targetToken ? (prob - 1.0f) : prob;
-                workDzRaw[v] = dz * workDzRaw[v];
-            }
+
+            workDzRaw[v] = (float)(dz * workDzRaw[v]);
         }
 
         // Parallelize across rank rows for fast AVX-512 gradB += (scale * a[r]) * dz_raw and da[r] = scale * Dot(B[r], dz_raw)

@@ -6,6 +6,7 @@ using System.Threading.Tasks;
 using Glacier.Inference.Gguf;
 using Glacier.Inference.Gpu;
 using Glacier.Tensor.Core;
+using Glacier.Tune.Kernels;
 
 public sealed unsafe partial class GpuLoraEngine
 {
@@ -116,15 +117,19 @@ public sealed unsafe partial class GpuLoraEngine
 
         float* pTileLogits = (float*)NativeMemory.Alloc((nuint)((long)validCount * actualTileSize), sizeof(float));
         float* runningMax = (float*)NativeMemory.Alloc((nuint)validCount, sizeof(float));
-        double* runningSumExp = (double*)NativeMemory.Alloc((nuint)validCount, sizeof(double));
+        int* runningArgMax = (int*)NativeMemory.Alloc((nuint)validCount, sizeof(int));
+        double* runningSumOther = (double*)NativeMemory.Alloc((nuint)validCount, sizeof(double));
         float* targetLogits = (float*)NativeMemory.Alloc((nuint)validCount, sizeof(float));
 
         try
         {
+            _ = vectorizedMax;
+            _ = vectorizedSumExp;
             for (int i = 0; i < validCount; i++)
             {
                 runningMax[i] = float.NegativeInfinity;
-                runningSumExp[i] = 0.0;
+                runningArgMax[i] = -1;
+                runningSumOther[i] = 0.0;
                 targetLogits[i] = 0.0f;
             }
 
@@ -161,28 +166,14 @@ public sealed unsafe partial class GpuLoraEngine
                             targetLogits[i] = logits[targetId - vStart];
                         }
 
-                        float tileMax = vectorizedMax(logits, vCount);
-                        if (float.IsNegativeInfinity(runningMax[i]))
-                        {
-                            runningMax[i] = tileMax;
-                            runningSumExp[i] = vectorizedSumExp(logits, vCount, tileMax);
-                        }
-                        else
-                        {
-                            float mNew = MathF.Max(runningMax[i], tileMax);
-                            double factor = Math.Exp((double)runningMax[i] - mNew);
-                            double tileSum = vectorizedSumExp(logits, vCount, mNew);
-                            runningSumExp[i] = runningSumExp[i] * factor + tileSum;
-                            runningMax[i] = mNew;
-                        }
+                        FusedCrossEntropyLoss.UpdateOnlineTileStats(logits, vStart, vCount, ref runningMax[i], ref runningArgMax[i], ref runningSumOther[i]);
                     }
                 }
             }
 
             for (int i = 0; i < validCount; i++)
             {
-                double lse = runningMax[i] + Math.Log(runningSumExp[i]);
-                totalLoss += lse - targetLogits[i];
+                totalLoss += FusedCrossEntropyLoss.Log1p(runningSumOther[i]) + ((double)runningMax[i] - (double)targetLogits[i]);
             }
 
             return (float)(totalLoss * invValid);
@@ -191,7 +182,8 @@ public sealed unsafe partial class GpuLoraEngine
         {
             NativeMemory.Free(pTileLogits);
             NativeMemory.Free(runningMax);
-            NativeMemory.Free(runningSumExp);
+            NativeMemory.Free(runningArgMax);
+            NativeMemory.Free(runningSumOther);
             NativeMemory.Free(targetLogits);
         }
     }
@@ -224,16 +216,20 @@ public sealed unsafe partial class GpuLoraEngine
 
         float* pTileLogits = (float*)NativeMemory.Alloc((nuint)((long)validCount * actualTileSize), sizeof(float));
         float* runningMax = (float*)NativeMemory.Alloc((nuint)validCount, sizeof(float));
-        double* runningSumExp = (double*)NativeMemory.Alloc((nuint)validCount, sizeof(double));
+        int* runningArgMax = (int*)NativeMemory.Alloc((nuint)validCount, sizeof(int));
+        double* runningSumOther = (double*)NativeMemory.Alloc((nuint)validCount, sizeof(double));
         float* targetLogits = (float*)NativeMemory.Alloc((nuint)validCount, sizeof(float));
-        double* logSumExp = (double*)NativeMemory.Alloc((nuint)validCount, sizeof(double));
+        double* invDenom = (double*)NativeMemory.Alloc((nuint)validCount, sizeof(double));
 
         try
         {
+            _ = vectorizedMax;
+            _ = vectorizedSumExp;
             for (int i = 0; i < validCount; i++)
             {
                 runningMax[i] = float.NegativeInfinity;
-                runningSumExp[i] = 0.0;
+                runningArgMax[i] = -1;
+                runningSumOther[i] = 0.0;
                 targetLogits[i] = 0.0f;
             }
 
@@ -253,7 +249,7 @@ public sealed unsafe partial class GpuLoraEngine
                 _gpu.CopyToDevice(_dFfnNormX, (IntPtr)pValidHidden, hiddenBytes);
                 _gpu.CopyToDevice(_dFfnDownOut, (IntPtr)pValidGradOut, hiddenBytes);
 
-                // PASS 1: Tiled online Log-Sum-Exp in VRAM
+                // PASS 1: Tiled online Log-Sum-Exp in VRAM using Barron's Log1p argmax-excluded split sum
                 for (int tile = 0; tile < numTiles; tile++)
                 {
                     int vStart = tile * actualTileSize;
@@ -273,28 +269,14 @@ public sealed unsafe partial class GpuLoraEngine
                             targetLogits[i] = logits[targetId - vStart];
                         }
 
-                        float tileMax = vectorizedMax(logits, vCount);
-                        if (float.IsNegativeInfinity(runningMax[i]))
-                        {
-                            runningMax[i] = tileMax;
-                            runningSumExp[i] = vectorizedSumExp(logits, vCount, tileMax);
-                        }
-                        else
-                        {
-                            float mNew = MathF.Max(runningMax[i], tileMax);
-                            double factor = Math.Exp((double)runningMax[i] - mNew);
-                            double tileSum = vectorizedSumExp(logits, vCount, mNew);
-                            runningSumExp[i] = runningSumExp[i] * factor + tileSum;
-                            runningMax[i] = mNew;
-                        }
+                        FusedCrossEntropyLoss.UpdateOnlineTileStats(logits, vStart, vCount, ref runningMax[i], ref runningArgMax[i], ref runningSumOther[i]);
                     }
                 }
 
                 for (int i = 0; i < validCount; i++)
                 {
-                    double lse = runningMax[i] + Math.Log(runningSumExp[i]);
-                    logSumExp[i] = lse;
-                    totalLoss += lse - targetLogits[i];
+                    invDenom[i] = 1.0 / (1.0 + runningSumOther[i]);
+                    totalLoss += FusedCrossEntropyLoss.Log1p(runningSumOther[i]) + ((double)runningMax[i] - (double)targetLogits[i]);
                 }
 
                 // PASS 2: Exact unbiased analytical gradient backpropagation via VRAM transpose-GEMM
@@ -315,20 +297,16 @@ public sealed unsafe partial class GpuLoraEngine
                     int vCountSnap = vCount;
                     Parallel.For(0, validCount, i =>
                     {
-                        int targetId = validTargetIds[i];
-                        double lse = logSumExp[i];
-                        float* logits = pTileLogits + (long)i * vCountSnap;
-                        for (int v = 0; v < vCountSnap; v++)
-                        {
-                            if (vStartSnap + v == targetId)
-                            {
-                                logits[v] = (float)(Math.Exp(logits[v] - lse) - 1.0) * invValid;
-                            }
-                            else
-                            {
-                                logits[v] = MathF.Exp((float)(logits[v] - lse)) * invValid;
-                            }
-                        }
+                        FusedCrossEntropyLoss.WriteTiledSoftmaxCrossEntropyGradients(
+                            pTileLogits + (long)i * vCountSnap,
+                            vStartSnap,
+                            vCountSnap,
+                            validTargetIds[i],
+                            runningMax[i],
+                            runningArgMax[i],
+                            runningSumOther[i],
+                            invDenom[i],
+                            invValid);
                     });
 
                     _gpu.CopyToDevice(_dScratchY, (IntPtr)pTileLogits, curTileBytes);
@@ -345,9 +323,10 @@ public sealed unsafe partial class GpuLoraEngine
         {
             NativeMemory.Free(pTileLogits);
             NativeMemory.Free(runningMax);
-            NativeMemory.Free(runningSumExp);
+            NativeMemory.Free(runningArgMax);
+            NativeMemory.Free(runningSumOther);
             NativeMemory.Free(targetLogits);
-            NativeMemory.Free(logSumExp);
+            NativeMemory.Free(invDenom);
         }
     }
 

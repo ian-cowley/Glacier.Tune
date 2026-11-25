@@ -97,7 +97,8 @@ public static unsafe class FusedCrossEntropyLoss
 
             float* pTileLogits = (float*)NativeMemory.AlignedAlloc((nuint)((long)validCount * actualTileSize * sizeof(float)), 64);
             float* runningMax = (float*)NativeMemory.Alloc((nuint)validCount, sizeof(float));
-            double* runningSumExp = (double*)NativeMemory.Alloc((nuint)validCount, sizeof(double));
+            int* runningArgMax = (int*)NativeMemory.Alloc((nuint)validCount, sizeof(int));
+            double* runningSumOther = (double*)NativeMemory.Alloc((nuint)validCount, sizeof(double));
             float* targetLogits = (float*)NativeMemory.Alloc((nuint)validCount, sizeof(float));
 
             try
@@ -105,7 +106,8 @@ public static unsafe class FusedCrossEntropyLoss
                 for (int i = 0; i < validCount; i++)
                 {
                     runningMax[i] = float.NegativeInfinity;
-                    runningSumExp[i] = 0.0;
+                    runningArgMax[i] = -1;
+                    runningSumOther[i] = 0.0;
                     targetLogits[i] = 0.0f;
                 }
 
@@ -126,28 +128,14 @@ public static unsafe class FusedCrossEntropyLoss
                             targetLogits[i] = logits[targetId - vStart];
                         }
 
-                        float tileMax = VectorizedMax(logits, vCount);
-                        if (float.IsNegativeInfinity(runningMax[i]))
-                        {
-                            runningMax[i] = tileMax;
-                            runningSumExp[i] = VectorizedSumExp(logits, vCount, tileMax);
-                        }
-                        else
-                        {
-                            float mNew = MathF.Max(runningMax[i], tileMax);
-                            double factor = Math.Exp((double)runningMax[i] - mNew);
-                            double tileSum = VectorizedSumExp(logits, vCount, mNew);
-                            runningSumExp[i] = runningSumExp[i] * factor + tileSum;
-                            runningMax[i] = mNew;
-                        }
+                        UpdateOnlineTileStats(logits, vStart, vCount, ref runningMax[i], ref runningArgMax[i], ref runningSumOther[i]);
                     }
                 }
 
                 double totalLoss = 0.0;
                 for (int i = 0; i < validCount; i++)
                 {
-                    double lse = runningMax[i] + Math.Log(runningSumExp[i]);
-                    totalLoss += lse - targetLogits[i];
+                    totalLoss += Log1p(runningSumOther[i]) + ((double)runningMax[i] - (double)targetLogits[i]);
                 }
 
                 return (float)(totalLoss * invValid);
@@ -156,7 +144,8 @@ public static unsafe class FusedCrossEntropyLoss
             {
                 NativeMemory.AlignedFree(pTileLogits);
                 NativeMemory.Free(runningMax);
-                NativeMemory.Free(runningSumExp);
+                NativeMemory.Free(runningArgMax);
+                NativeMemory.Free(runningSumOther);
                 NativeMemory.Free(targetLogits);
             }
         }
@@ -245,20 +234,22 @@ public static unsafe class FusedCrossEntropyLoss
 
             float* pTileLogits = (float*)NativeMemory.AlignedAlloc((nuint)((long)validCount * actualTileSize * sizeof(float)), 64);
             float* runningMax = (float*)NativeMemory.Alloc((nuint)validCount, sizeof(float));
-            double* runningSumExp = (double*)NativeMemory.Alloc((nuint)validCount, sizeof(double));
+            int* runningArgMax = (int*)NativeMemory.Alloc((nuint)validCount, sizeof(int));
+            double* runningSumOther = (double*)NativeMemory.Alloc((nuint)validCount, sizeof(double));
             float* targetLogits = (float*)NativeMemory.Alloc((nuint)validCount, sizeof(float));
-            double* logSumExp = (double*)NativeMemory.Alloc((nuint)validCount, sizeof(double));
+            double* invDenom = (double*)NativeMemory.Alloc((nuint)validCount, sizeof(double));
 
             try
             {
                 for (int i = 0; i < validCount; i++)
                 {
                     runningMax[i] = float.NegativeInfinity;
-                    runningSumExp[i] = 0.0;
+                    runningArgMax[i] = -1;
+                    runningSumOther[i] = 0.0;
                     targetLogits[i] = 0.0f;
                 }
 
-                // PASS 1: Online Log-Sum-Exp computation streamed in tiles
+                // PASS 1: Online Log-Sum-Exp computation streamed in tiles using Barron's Log1p argmax-excluded split sum
                 for (int tile = 0; tile < numTiles; tile++)
                 {
                     int vStart = tile * actualTileSize;
@@ -276,29 +267,15 @@ public static unsafe class FusedCrossEntropyLoss
                             targetLogits[i] = logits[targetId - vStart];
                         }
 
-                        float tileMax = VectorizedMax(logits, vCount);
-                        if (float.IsNegativeInfinity(runningMax[i]))
-                        {
-                            runningMax[i] = tileMax;
-                            runningSumExp[i] = VectorizedSumExp(logits, vCount, tileMax);
-                        }
-                        else
-                        {
-                            float mNew = MathF.Max(runningMax[i], tileMax);
-                            double factor = Math.Exp((double)runningMax[i] - mNew);
-                            double tileSum = VectorizedSumExp(logits, vCount, mNew);
-                            runningSumExp[i] = runningSumExp[i] * factor + tileSum;
-                            runningMax[i] = mNew;
-                        }
+                        UpdateOnlineTileStats(logits, vStart, vCount, ref runningMax[i], ref runningArgMax[i], ref runningSumOther[i]);
                     }
                 }
 
                 double totalLoss = 0.0;
                 for (int i = 0; i < validCount; i++)
                 {
-                    double lse = runningMax[i] + Math.Log(runningSumExp[i]);
-                    logSumExp[i] = lse;
-                    totalLoss += lse - targetLogits[i];
+                    invDenom[i] = 1.0 / (1.0 + runningSumOther[i]);
+                    totalLoss += Log1p(runningSumOther[i]) + ((double)runningMax[i] - (double)targetLogits[i]);
                 }
 
                 // PASS 2: Exact unbiased analytical gradient backpropagation via tiled BaseBackward
@@ -317,20 +294,16 @@ public static unsafe class FusedCrossEntropyLoss
                     int vCountSnap = vCount;
                     Parallel.For(0, validCount, i =>
                     {
-                        int targetId = validTargetIds[i];
-                        double lse = logSumExp[i];
-                        float* logits = pTileLogits + (long)i * vCountSnap;
-                        for (int v = 0; v < vCountSnap; v++)
-                        {
-                            if (vStartSnap + v == targetId)
-                            {
-                                logits[v] = (float)(Math.Exp(logits[v] - lse) - 1.0) * invValid;
-                            }
-                            else
-                            {
-                                logits[v] = MathF.Exp((float)(logits[v] - lse)) * invValid;
-                            }
-                        }
+                        WriteTiledSoftmaxCrossEntropyGradients(
+                            pTileLogits + (long)i * vCountSnap,
+                            vStartSnap,
+                            vCountSnap,
+                            validTargetIds[i],
+                            runningMax[i],
+                            runningArgMax[i],
+                            runningSumOther[i],
+                            invDenom[i],
+                            invValid);
                     });
 
                     LoraKernels.AccumulateBaseBackward(
@@ -350,9 +323,10 @@ public static unsafe class FusedCrossEntropyLoss
             {
                 NativeMemory.AlignedFree(pTileLogits);
                 NativeMemory.Free(runningMax);
-                NativeMemory.Free(runningSumExp);
+                NativeMemory.Free(runningArgMax);
+                NativeMemory.Free(runningSumOther);
                 NativeMemory.Free(targetLogits);
-                NativeMemory.Free(logSumExp);
+                NativeMemory.Free(invDenom);
             }
         }
         finally
@@ -430,6 +404,94 @@ public static unsafe class FusedCrossEntropyLoss
             if (data[i] > maxVal) maxVal = data[i];
         }
         return maxVal;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static double Log1p(double x)
+    {
+        if (x == 0.0) return 0.0;
+        double u = 1.0 + x;
+        if (u == 1.0) return x;
+        return Math.Log(u) * (x / (u - 1.0));
+    }
+
+    internal static void UpdateOnlineTileStats(
+        float* logits,
+        int vStart,
+        int vCount,
+        ref float runningMax,
+        ref int runningArgMax,
+        ref double runningSumOther)
+    {
+        float tileMax = float.NegativeInfinity;
+        int tileLocalArgMax = 0;
+        for (int v = 0; v < vCount; v++)
+        {
+            float val = logits[v];
+            if (v == 0 || val > tileMax)
+            {
+                tileMax = val;
+                tileLocalArgMax = v;
+            }
+        }
+
+        if (runningArgMax < 0)
+        {
+            runningMax = tileMax;
+            runningArgMax = vStart + tileLocalArgMax;
+            runningSumOther = SumExpExcluding(logits, vCount, tileMax, tileLocalArgMax);
+        }
+        else if (tileMax > runningMax)
+        {
+            double factor = float.IsNegativeInfinity(runningMax) ? 0.0 : Math.Exp((double)runningMax - tileMax);
+            double tileSumOther = SumExpExcluding(logits, vCount, tileMax, tileLocalArgMax);
+            runningSumOther = (1.0 + runningSumOther) * factor + tileSumOther;
+            runningMax = tileMax;
+            runningArgMax = vStart + tileLocalArgMax;
+        }
+        else
+        {
+            runningSumOther += SumExpExcluding(logits, vCount, runningMax, excludeLocalIdx: -1);
+        }
+    }
+
+    internal static double SumExpExcluding(float* data, int count, float maxVal, int excludeLocalIdx)
+    {
+        if (float.IsNegativeInfinity(maxVal))
+            return 0.0;
+
+        double sum = 0.0;
+        for (int i = 0; i < count; i++)
+        {
+            if (i != excludeLocalIdx)
+                sum += Math.Exp((double)data[i] - maxVal);
+        }
+        return sum;
+    }
+
+    internal static void WriteTiledSoftmaxCrossEntropyGradients(
+        float* logits,
+        int vStart,
+        int vCount,
+        int targetId,
+        float maxLogit,
+        int globalArgMax,
+        double sumOther,
+        double invDenom,
+        float invValid)
+    {
+        for (int v = 0; v < vCount; v++)
+        {
+            int vGlobal = vStart + v;
+            if (vGlobal == targetId && vGlobal == globalArgMax)
+                logits[v] = (float)(-sumOther * invDenom * invValid);
+            else if (vGlobal == targetId)
+                logits[v] = (float)((Math.Exp((double)logits[v] - maxLogit) * invDenom - 1.0) * invValid);
+            else if (vGlobal == globalArgMax)
+                logits[v] = (float)(invDenom * invValid);
+            else
+                logits[v] = (float)(Math.Exp((double)logits[v] - maxLogit) * invDenom * invValid);
+        }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
