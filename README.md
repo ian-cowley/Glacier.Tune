@@ -196,6 +196,12 @@ dotnet run -c Release --project samples/Glacier.Tune.Demo -- --merge \
 
 ---
 
+## 🆕 What's New in v1.7.0
+
+- **Native C# Direct Preference Optimization (`DpoTrainer` / `DpoLoss` / `DpoDataset`)** — Numerically stable DPO & conservative cDPO alignment trainer in `Glacier.Tune.Trainer` with JSONL preference loading, exact reward margins, cached initial reference log-probabilities, `AdamW` gradient clipping, and Native AOT `DpoJsonContext` support.
+
+---
+
 ## 🆕 What's New in v1.1.0
 
 - **Sleep Consolidation Framework & MoE Parameter Expansion (arXiv:2606.03979)** — Added biological 3-phase offline memory consolidation pipeline:
