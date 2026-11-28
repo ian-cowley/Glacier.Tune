@@ -275,7 +275,11 @@ public sealed class StatefulAdamW : IOptimizer
         }
         catch
         {
-            try { if (File.Exists(tmpPath)) File.Delete(tmpPath); } catch { }
+            try { if (File.Exists(tmpPath)) File.Delete(tmpPath); }
+            catch (Exception cleanupEx) when (cleanupEx is IOException or UnauthorizedAccessException)
+            {
+                System.Diagnostics.Trace.TraceWarning($"[StatefulAdamW] Failed to clean temp file '{tmpPath}': {cleanupEx.Message}");
+            }
             throw;
         }
     }

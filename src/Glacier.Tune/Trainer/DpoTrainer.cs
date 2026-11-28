@@ -514,7 +514,11 @@ public sealed class DpoTrainer : IDisposable
         }
         catch
         {
-            try { if (File.Exists(tmpPath)) File.Delete(tmpPath); } catch { }
+            try { if (File.Exists(tmpPath)) File.Delete(tmpPath); }
+            catch (Exception cleanupEx) when (cleanupEx is IOException or UnauthorizedAccessException)
+            {
+                System.Diagnostics.Trace.TraceWarning($"[DpoTrainer] Failed to clean temp file '{tmpPath}': {cleanupEx.Message}");
+            }
             throw;
         }
     }

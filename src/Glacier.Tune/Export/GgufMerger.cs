@@ -455,7 +455,11 @@ public static unsafe class GgufMerger
         }
         catch
         {
-            try { if (File.Exists(tmpOutPath)) File.Delete(tmpOutPath); } catch { }
+            try { if (File.Exists(tmpOutPath)) File.Delete(tmpOutPath); }
+            catch (Exception cleanupEx) when (cleanupEx is IOException or UnauthorizedAccessException)
+            {
+                System.Diagnostics.Trace.TraceWarning($"[GgufMerger] Failed to clean temp file '{tmpOutPath}': {cleanupEx.Message}");
+            }
             throw;
         }
         sw.Stop();

@@ -978,7 +978,11 @@ public sealed unsafe class GgufLoraModel : IDisposable
         }
         catch
         {
-            try { if (File.Exists(binTmp)) File.Delete(binTmp); } catch { }
+            try { if (File.Exists(binTmp)) File.Delete(binTmp); }
+            catch (Exception cleanupEx) when (cleanupEx is IOException or UnauthorizedAccessException)
+            {
+                System.Diagnostics.Trace.TraceWarning($"[GgufLoraModel] Failed to clean temp file '{binTmp}': {cleanupEx.Message}");
+            }
             throw;
         }
 
@@ -1002,7 +1006,11 @@ public sealed unsafe class GgufLoraModel : IDisposable
         }
         catch
         {
-            try { if (File.Exists(manifestTmp)) File.Delete(manifestTmp); } catch { }
+            try { if (File.Exists(manifestTmp)) File.Delete(manifestTmp); }
+            catch (Exception cleanupEx) when (cleanupEx is IOException or UnauthorizedAccessException)
+            {
+                System.Diagnostics.Trace.TraceWarning($"[GgufLoraModel] Failed to clean temp file '{manifestTmp}': {cleanupEx.Message}");
+            }
             throw;
         }
     }
@@ -1041,7 +1049,11 @@ public sealed unsafe class GgufLoraModel : IDisposable
         }
         catch
         {
-            try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }
+            try { if (File.Exists(tmp)) File.Delete(tmp); }
+            catch (Exception cleanupEx) when (cleanupEx is IOException or UnauthorizedAccessException)
+            {
+                System.Diagnostics.Trace.TraceWarning($"[GgufLoraModel] Failed to clean temp file '{tmp}': {cleanupEx.Message}");
+            }
             throw;
         }
     }

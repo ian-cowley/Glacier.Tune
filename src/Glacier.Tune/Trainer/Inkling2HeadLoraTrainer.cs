@@ -79,7 +79,11 @@ public sealed unsafe class Inkling2HeadLoraTrainer
             }
             catch
             {
-                try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }
+                try { if (File.Exists(tmp)) File.Delete(tmp); }
+                catch (Exception cleanupEx) when (cleanupEx is IOException or UnauthorizedAccessException)
+                {
+                    System.Diagnostics.Trace.TraceWarning($"[Inkling2HeadLoraTrainer] Failed to clean temp file '{tmp}': {cleanupEx.Message}");
+                }
                 throw;
             }
         }
