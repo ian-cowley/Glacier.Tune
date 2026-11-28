@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
@@ -13,9 +14,59 @@ public static unsafe partial class LoraKernels
     private const int BaseTileRows = 64;
     private const int BaseColBlock = 256;
 
+    private sealed class NativeTileBuffer : IDisposable
+    {
+        public float* Ptr;
+        public nuint CapacityFloats;
+
+        public NativeTileBuffer(nuint initialFloats)
+        {
+            Ptr = (float*)NativeMemory.AlignedAlloc(checked(initialFloats * sizeof(float)), 64);
+            CapacityFloats = initialFloats;
+        }
+
+        public float* Ensure(nuint neededFloats)
+        {
+            if (neededFloats > CapacityFloats)
+            {
+                NativeMemory.AlignedFree(Ptr);
+                Ptr = null;
+                Ptr = (float*)NativeMemory.AlignedAlloc(checked(neededFloats * sizeof(float)), 64);
+                CapacityFloats = neededFloats;
+            }
+            return Ptr;
+        }
+
+        ~NativeTileBuffer() => Dispose();
+
+        public void Dispose()
+        {
+            if (Ptr != null)
+            {
+                NativeMemory.AlignedFree(Ptr);
+                Ptr = null;
+                CapacityFloats = 0;
+            }
+            GC.SuppressFinalize(this);
+        }
+    }
+
+    private static readonly ConcurrentBag<NativeTileBuffer> s_tilePool = new();
+
+    static LoraKernels()
+    {
+        AppDomain.CurrentDomain.ProcessExit += (_, _) =>
+        {
+            while (s_tilePool.TryTake(out var buf))
+            {
+                buf.Dispose();
+            }
+        };
+    }
+
     /// <summary>
     /// Accumulates frozen base-weight input gradients: dXInput[seqLen, inFeatures] += dY[seqLen, outFeatures] * W_base[outFeatures, inFeatures].
-    /// Streams quantized rows once per tile into 64-byte aligned cache memory and executes lock-free SIMD FMA across sequence and feature tiles.
+    /// Streams quantized rows once per tile into pooled 64-byte aligned cache memory and executes lock-free SIMD FMA across sequence and feature tiles.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public static void AccumulateBaseBackward(
@@ -32,19 +83,22 @@ public static unsafe partial class LoraKernels
             return;
         }
 
-        int colBlocks = (inFeatures + BaseColBlock - 1) / BaseColBlock;
-        int totalSlices = seqLen * colBlocks;
-
         // Direct zero-dequantization FP32 fast path
         if (baseType == GgufType.F32)
         {
+#if GLACIER_TENSOR_LOCAL
+            Glacier.Tensor.Compute.TensorBackwardKernels.AccumulateBaseBackward(
+                (float*)baseWeightData, pDY, pDXInput, seqLen, inFeatures, outFeatures);
+#else
+            int fpColBlocks = (inFeatures + BaseColBlock - 1) / BaseColBlock;
+            int fpTotalSlices = checked(seqLen * fpColBlocks);
             float* pW = (float*)baseWeightData;
-            if (totalSlices >= 2 && (long)seqLen * inFeatures * outFeatures >= 16384)
+            if (fpTotalSlices >= 2 && (long)seqLen * inFeatures * outFeatures >= 16384)
             {
-                Parallel.For(0, totalSlices, workIdx =>
+                Parallel.For(0, fpTotalSlices, workIdx =>
                 {
-                    int s = workIdx / colBlocks;
-                    int colStart = (workIdx % colBlocks) * BaseColBlock;
+                    int s = workIdx / fpColBlocks;
+                    int colStart = (workIdx % fpColBlocks) * BaseColBlock;
                     int colLen = Math.Min(BaseColBlock, inFeatures - colStart);
                     float* pDXSlice = pDXInput + (long)s * inFeatures + colStart;
                     float* pDYRow = pDY + (long)s * outFeatures;
@@ -71,12 +125,22 @@ public static unsafe partial class LoraKernels
                     }
                 }
             }
+#endif
             return;
         }
 
+        int colBlocks = (inFeatures + BaseColBlock - 1) / BaseColBlock;
+        int totalSlices = checked(seqLen * colBlocks);
+
         // Tiled quantized streaming path (supports Q4_K, Q6_K, Q8_0, Q4_0, F16, Q5_K, IQ4, etc.)
         int maxTile = Math.Min(BaseTileRows, outFeatures);
-        float* pTileW = (float*)NativeMemory.AlignedAlloc((nuint)((long)maxTile * inFeatures * sizeof(float)), 64);
+        nuint neededFloats = checked((nuint)maxTile * (nuint)inFeatures);
+        if (!s_tilePool.TryTake(out var tileBuf))
+        {
+            tileBuf = new NativeTileBuffer(neededFloats);
+        }
+
+        float* pTileW = tileBuf.Ensure(neededFloats);
         int* activeRows = stackalloc int[maxTile];
 
         try
@@ -86,7 +150,6 @@ public static unsafe partial class LoraKernels
                 int tileCount = Math.Min(BaseTileRows, outFeatures - oStart);
                 int activeCount = 0;
 
-                // Identify rows in this tile that have at least one non-zero upstream gradient across seqLen
                 for (int r = 0; r < tileCount; r++)
                 {
                     int o = oStart + r;
@@ -168,13 +231,23 @@ public static unsafe partial class LoraKernels
         }
         finally
         {
-            NativeMemory.AlignedFree(pTileW);
+            if (s_tilePool.Count < Environment.ProcessorCount * 2)
+            {
+                s_tilePool.Add(tileBuf);
+            }
+            else
+            {
+                tileBuf.Dispose();
+            }
         }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
     internal static void AccumulateScaledSimd(float* dst, float* src, float scale, int count)
     {
+#if GLACIER_TENSOR_LOCAL
+        Glacier.Tensor.Compute.TensorBackwardKernels.AccumulateScaledSimd(dst, src, scale, count);
+#else
         int i = 0;
         if (Vector512.IsHardwareAccelerated && count >= Vector512<float>.Count)
         {
@@ -188,7 +261,7 @@ public static unsafe partial class LoraKernels
                 Vector512.FusedMultiplyAdd(vSrc, vScale, vDst).Store(dst + i);
             }
         }
-        else if (Vector256.IsHardwareAccelerated && count >= Vector256<float>.Count)
+        if (Vector256.IsHardwareAccelerated && count - i >= Vector256<float>.Count)
         {
             var vScale = Vector256.Create(scale);
             int step = Vector256<float>.Count;
@@ -200,7 +273,7 @@ public static unsafe partial class LoraKernels
                 Vector256.FusedMultiplyAdd(vSrc, vScale, vDst).Store(dst + i);
             }
         }
-        else if (Vector128.IsHardwareAccelerated && count >= Vector128<float>.Count)
+        if (Vector128.IsHardwareAccelerated && count - i >= Vector128<float>.Count)
         {
             var vScale = Vector128.Create(scale);
             int step = Vector128<float>.Count;
@@ -216,5 +289,6 @@ public static unsafe partial class LoraKernels
         {
             dst[i] += scale * src[i];
         }
+#endif
     }
 }

@@ -15,7 +15,7 @@ public sealed class Tier5SecurityCheckTests
         var dir = new DirectoryInfo(AppContext.BaseDirectory);
         while (dir != null)
         {
-            if (File.Exists(Path.Combine(dir.FullName, "Glacier.sln")) &&
+            if ((File.Exists(Path.Combine(dir.FullName, "Glacier.sln")) || File.Exists(Path.Combine(dir.FullName, "Glacier.slnx"))) &&
                 File.Exists(Path.Combine(dir.FullName, "scripts", "security_check.py")))
             {
                 return dir.FullName;
@@ -54,6 +54,49 @@ public sealed class Tier5SecurityCheckTests
         return (proc.ExitCode, stdoutTask.GetAwaiter().GetResult(), stderrTask.GetAwaiter().GetResult());
     }
 
+    private static (int ExitCode, string StdOut, string StdErr)? TryRunGlacierCliSecurityCheck(string repoRoot, string targetPath)
+    {
+        string preferredCfg = AppContext.BaseDirectory.Contains($"{Path.DirectorySeparatorChar}Release{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase)
+            ? "Release"
+            : "Debug";
+        string? cliDll = null;
+        foreach (string cfg in new[] { preferredCfg, preferredCfg == "Release" ? "Debug" : "Release" })
+        {
+            string candidate = Path.Combine(repoRoot, "Glacier.Cli", "src", "Glacier.Cli", "bin", cfg, "net10.0", "glacier.dll");
+            if (File.Exists(candidate) && File.Exists(Path.ChangeExtension(candidate, ".runtimeconfig.json")))
+            {
+                cliDll = candidate;
+                break;
+            }
+        }
+        if (cliDll is null) return null;
+
+        var psi = new ProcessStartInfo
+        {
+            FileName = "dotnet",
+            WorkingDirectory = repoRoot,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            StandardOutputEncoding = Encoding.UTF8,
+            StandardErrorEncoding = Encoding.UTF8
+        };
+        psi.ArgumentList.Add(cliDll);
+        psi.ArgumentList.Add("security-check");
+        psi.ArgumentList.Add(targetPath);
+
+        using var proc = Process.Start(psi) ?? throw new InvalidOperationException("Failed to start dotnet glacier.dll process.");
+        var stdoutTask = proc.StandardOutput.ReadToEndAsync();
+        var stderrTask = proc.StandardError.ReadToEndAsync();
+        if (!proc.WaitForExit(60_000))
+        {
+            try { proc.Kill(entireProcessTree: true); } catch { }
+            throw new TimeoutException("glacier security-check timed out.");
+        }
+        return (proc.ExitCode, stdoutTask.GetAwaiter().GetResult(), stderrTask.GetAwaiter().GetResult());
+    }
+
     private static string CreateTempDir(string prefix)
     {
         string dir = Path.Combine(Path.GetTempPath(), prefix + Guid.NewGuid().ToString("N"));
@@ -76,6 +119,12 @@ public sealed class Tier5SecurityCheckTests
             var (exitCode, stdout, stderr) = RunSecurityCheck(repoRoot, tempDir);
             Assert.True(exitCode == 0, $"Expected BenchmarkDotNet.Artifacts to be pruned (exit {exitCode}):\n{stdout}\n{stderr}");
             Assert.Contains("Scanned 0 files.", stdout);
+
+            if (TryRunGlacierCliSecurityCheck(repoRoot, tempDir) is { } cli)
+            {
+                Assert.True(cli.ExitCode == 0, $"Expected glacier security-check to prune BenchmarkDotNet.Artifacts (exit {cli.ExitCode}):\n{cli.StdOut}\n{cli.StdErr}");
+                Assert.Contains("Scanned 0 files.", cli.StdOut);
+            }
         }
         finally
         {
@@ -101,6 +150,13 @@ public sealed class Tier5SecurityCheckTests
             Assert.NotEqual(0, exitCode);
             Assert.Contains("bypass.py:1", stdout);
             Assert.Contains("bypass.py:2", stdout);
+
+            if (TryRunGlacierCliSecurityCheck(repoRoot, tempDir) is { } cli)
+            {
+                Assert.NotEqual(0, cli.ExitCode);
+                Assert.Contains("bypass.py:1", cli.StdOut);
+                Assert.Contains("bypass.py:2", cli.StdOut);
+            }
         }
         finally
         {
@@ -124,6 +180,12 @@ public sealed class Tier5SecurityCheckTests
             var (exitCode, stdout, _) = RunSecurityCheck(repoRoot, tempDir);
             Assert.NotEqual(0, exitCode);
             Assert.Contains("win_config.ps1", stdout);
+
+            if (TryRunGlacierCliSecurityCheck(repoRoot, tempDir) is { } cli)
+            {
+                Assert.NotEqual(0, cli.ExitCode);
+                Assert.Contains("win_config.ps1", cli.StdOut);
+            }
         }
         finally
         {
@@ -147,6 +209,13 @@ public sealed class Tier5SecurityCheckTests
             Assert.NotEqual(0, exitCode);
             Assert.Contains("prod.env", stdout);
             Assert.Contains("secrets.yaml", stdout);
+
+            if (TryRunGlacierCliSecurityCheck(repoRoot, tempDir) is { } cli)
+            {
+                Assert.NotEqual(0, cli.ExitCode);
+                Assert.Contains("prod.env", cli.StdOut);
+                Assert.Contains("secrets.yaml", cli.StdOut);
+            }
         }
         finally
         {
@@ -179,6 +248,15 @@ public sealed class Tier5SecurityCheckTests
             Assert.Contains("provider_leaks.py:3", stdout);
             Assert.Contains("provider_leaks.py:4", stdout);
 
+            if (TryRunGlacierCliSecurityCheck(repoRoot, tempDir) is { } cliFail)
+            {
+                Assert.NotEqual(0, cliFail.ExitCode);
+                Assert.Contains("provider_leaks.py:1", cliFail.StdOut);
+                Assert.Contains("provider_leaks.py:2", cliFail.StdOut);
+                Assert.Contains("provider_leaks.py:3", cliFail.StdOut);
+                Assert.Contains("provider_leaks.py:4", cliFail.StdOut);
+            }
+
             string safeDir = CreateTempDir("glacier_t5_safe_");
             try
             {
@@ -190,6 +268,11 @@ public sealed class Tier5SecurityCheckTests
                     $"const string Explicit = \"{aizaDummyFixture}\";\n");
                 var (safeExit, safeOut, safeErr) = RunSecurityCheck(repoRoot, safeDir);
                 Assert.True(safeExit == 0, $"Expected explicit fixtures to stay allowlisted (exit {safeExit}):\n{safeOut}\n{safeErr}");
+
+                if (TryRunGlacierCliSecurityCheck(repoRoot, safeDir) is { } cliSafe)
+                {
+                    Assert.True(cliSafe.ExitCode == 0, $"Expected glacier security-check fixtures allowlisted (exit {cliSafe.ExitCode}):\n{cliSafe.StdOut}\n{cliSafe.StdErr}");
+                }
             }
             finally
             {

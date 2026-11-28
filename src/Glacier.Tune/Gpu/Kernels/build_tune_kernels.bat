@@ -5,19 +5,21 @@ echo ===================================================
 echo Glacier.Tune CUDA Kernel Fatbinary Builder
 echo ===================================================
 
+for %%C in (
+    "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.5\bin"
+    "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4\bin"
+    "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin"
+    "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin"
+    "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9\bin"
+    "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin"
+) do (
+    if exist "%%~C\nvcc.exe" (
+        set "PATH=%%~C;!PATH!"
+        goto :FoundNvcc
+    )
+)
 where nvcc >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
-    for %%C in (
-        "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin"
-        "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9\bin"
-        "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin"
-        "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4\bin"
-    ) do (
-        if exist "%%~C\nvcc.exe" (
-            set "PATH=%%~C;!PATH!"
-            goto :FoundNvcc
-        )
-    )
     echo [ERROR] nvcc.exe not found.
     exit /b 1
 )

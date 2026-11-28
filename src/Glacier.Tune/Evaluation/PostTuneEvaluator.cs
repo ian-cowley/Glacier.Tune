@@ -547,15 +547,7 @@ public static unsafe class PostTuneEvaluator
 
         using var fs = File.OpenRead(binPath);
         using var br = new BinaryReader(fs);
-        uint magic = br.ReadUInt32();
-        if (magic != 0x41524F4C)
-            throw new InvalidDataException($"Invalid LoRA magic header: 0x{magic:X8}");
-        uint version = br.ReadUInt32();
-        if (version != 1)
-            throw new InvalidDataException($"Unsupported LoRA adapter version: {version}");
-        _ = br.ReadInt32(); // layerCount
-        int rank = br.ReadInt32();
-        float alpha = br.ReadSingle();
+        Glacier.Tune.Model.LoraBinaryFormat.ValidateAndReadHeader(fs, br, out _, out int rank, out float alpha, out _);
         return (rank, alpha);
     }
 

@@ -11,7 +11,14 @@ public sealed record DreamCandidate(
     float SemanticSimilarity,
     float LevenshteinRatio,
     float CompositeScore
-);
+)
+{
+    /// <summary>
+    /// Optional explicit embedding of <see cref="GeneratedDream"/> used for cosine quality gating
+    /// against <see cref="TargetTeacherOutput"/>. When <see langword="null"/>, <see cref="QueryVector"/> is used.
+    /// </summary>
+    public float[]? DreamEmbedding { get; init; }
+}
 
 /// <summary>
 /// Telemetry results produced by a completed Sleep consolidation cycle.

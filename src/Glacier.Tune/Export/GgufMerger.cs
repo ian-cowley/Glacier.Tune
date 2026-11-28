@@ -8,11 +8,14 @@ using System.IO;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 using System.Text;
 using System.Threading.Tasks;
 using Glacier.Inference.Gguf;
 using Glacier.Inference.Quant;
 using Glacier.Tune.Diagnostics;
+using Glacier.Tune.Kernels;
+using Glacier.Tune.Model;
 
 /// <summary>
 /// Target quantization representation for adapted LoRA projections.
@@ -20,7 +23,7 @@ using Glacier.Tune.Diagnostics;
 public enum TargetQuantization
 {
     /// <summary>
-    /// Auto-select quantization based on base tensor type (defaults to Q4_K for Q4_K/Q6_K).
+    /// Auto-select quantization preserving base tensor type (Q6_K, F16, BF16, F32, Q4_0, Q8_0; others default to Q4_K).
     /// </summary>
     Auto,
 
@@ -28,6 +31,11 @@ public enum TargetQuantization
     /// Super-block 4-bit k-quantization (256 weights in 144 bytes, 4.5 bpw).
     /// </summary>
     Q4_K,
+
+    /// <summary>
+    /// Super-block 6-bit k-quantization (256 weights in 210 bytes, 6.5625 bpw).
+    /// </summary>
+    Q6_K,
 
     /// <summary>
     /// Standard 4-bit quantization (32 weights in 18 bytes, 4.5 bpw).
@@ -38,6 +46,16 @@ public enum TargetQuantization
     /// Standard 8-bit quantization (32 weights in 34 bytes, 8.5 bpw).
     /// </summary>
     Q8_0,
+
+    /// <summary>
+    /// IEEE 754 binary16 half-precision representation (16 bpw).
+    /// </summary>
+    F16,
+
+    /// <summary>
+    /// Brain floating-point 16-bit representation (16 bpw).
+    /// </summary>
+    BF16,
 
     /// <summary>
     /// Uncompressed IEEE 754 32-bit floating-point representation (32 bpw).
@@ -191,258 +209,255 @@ public static unsafe class GgufMerger
         progress($"  Header End Offset:   {totalHeaderBytes:N0} bytes");
         progress($"  Tensor Data Offset:  {tensorDataOffset:N0} bytes (aligned to {baseGguf.Alignment} bytes)");
 
-        // 2. Open Output Stream and Write Header + Metadata + Directory
+        // 2. Open Atomic Temp Output Stream and Write Header + Metadata + Directory
         progress($"[3/4] Writing merged GGUF header, metadata, and tensor directory...");
-        using var outFs = new FileStream(outputGgufPath, FileMode.Create, FileAccess.Write, FileShare.None, bufferSize: 1024 * 1024);
-        using var bw = new BinaryWriter(outFs, Encoding.UTF8, leaveOpen: true);
-
-        // Copy raw Header + Metadata byte-for-byte from base GGUF (preserves tokenizer & KV metadata intact)
-        byte* pBase = baseGguf.BasePointer;
-        ulong metadataBytes = baseGguf.MetadataEndOffset;
-        outFs.Write(new ReadOnlySpan<byte>(pBase, (int)metadataBytes));
-
-        // Write Tensor Directory entries
-        for (int i = 0; i < tensorCount; i++)
+        string tmpOutPath = LoraBinaryFormat.CreateTempSiblingPath(outputGgufPath);
+        try
         {
-            var t = baseGguf.TensorList[i];
-            byte[] nameBytes = Encoding.UTF8.GetBytes(t.Name);
-            bw.Write((ulong)nameBytes.Length);
-            bw.Write(nameBytes);
-            bw.Write(t.DimensionsCount);
-            for (int d = 0; d < (int)t.DimensionsCount; d++)
+            using (var outFs = new FileStream(tmpOutPath, FileMode.Create, FileAccess.Write, FileShare.None, bufferSize: 1024 * 1024))
+            using (var bw = new BinaryWriter(outFs, Encoding.UTF8, leaveOpen: true))
             {
-                bw.Write(t.Dimensions[d]);
-            }
-            bw.Write((uint)newTypes[i]);
-            bw.Write(newOffsets[i]);
-        }
-        bw.Flush();
+                // Copy raw Header + Metadata byte-for-byte from base GGUF (preserves tokenizer & KV metadata intact)
+                byte* pBase = baseGguf.BasePointer;
+                ulong metadataBytes = baseGguf.MetadataEndOffset;
+                outFs.Write(new ReadOnlySpan<byte>(pBase, checked((int)metadataBytes)));
 
-        long currentPos = outFs.Position;
-        int headerPad = (int)(tensorDataOffset - (ulong)currentPos);
-        if (headerPad > 0)
-        {
-            outFs.Write(new byte[headerPad]);
-        }
-
-        // 3. Process and Stream Tensor Data
-        progress($"[4/4] Streaming and fusing weights into {outputGgufPath}...");
-        int lastReportedLayer = -1;
-        var parallelOpts = new ParallelOptions { MaxDegreeOfParallelism = options?.MaxDegreeOfParallelism ?? Environment.ProcessorCount };
-
-        for (int i = 0; i < tensorCount; i++)
-        {
-            var t = baseGguf.TensorList[i];
-            long targetPos = (long)(tensorDataOffset + newOffsets[i]);
-            long padNeeded = targetPos - outFs.Position;
-            if (padNeeded > 0)
-            {
-                outFs.Write(new byte[(int)padNeeded]);
-            }
-
-            var slices = mergePlans[i];
-            if (slices == null || slices.Count == 0)
-            {
-                byte* srcPtr = baseGguf.GetTensorPointer(t);
-                ulong bytesRemaining = newByteSizes[i];
-                byte[] copyBuffer = new byte[Math.Min(16 * 1024 * 1024, (int)Math.Min((ulong)int.MaxValue, Math.Max(1UL, bytesRemaining)))];
-                while (bytesRemaining > 0)
+                // Write Tensor Directory entries
+                for (int i = 0; i < tensorCount; i++)
                 {
-                    int toCopy = (int)Math.Min((ulong)copyBuffer.Length, bytesRemaining);
-                    Marshal.Copy((IntPtr)srcPtr, copyBuffer, 0, toCopy);
-                    outFs.Write(copyBuffer, 0, toCopy);
-                    srcPtr += toCopy;
-                    bytesRemaining -= (ulong)toCopy;
+                    var t = baseGguf.TensorList[i];
+                    byte[] nameBytes = Encoding.UTF8.GetBytes(t.Name);
+                    bw.Write((ulong)nameBytes.Length);
+                    bw.Write(nameBytes);
+                    bw.Write(t.DimensionsCount);
+                    for (int d = 0; d < (int)t.DimensionsCount; d++)
+                    {
+                        bw.Write(t.Dimensions[d]);
+                    }
+                    bw.Write((uint)newTypes[i]);
+                    bw.Write(newOffsets[i]);
                 }
-            }
-            else
-            {
-                if (TryParseLayerName(t.Name, out int layer, out _) && layer != lastReportedLayer)
+                bw.Flush();
+
+                long currentPos = outFs.Position;
+                int headerPad = (int)(tensorDataOffset - (ulong)currentPos);
+                if (headerPad > 0)
                 {
-                    lastReportedLayer = layer;
-                    progress($"  Fusing Transformer Block {layer:D2}/{baseGguf.BlockCount - 1}...");
+                    WriteZeroPadding(outFs, headerPad);
                 }
 
-                int inDim = (int)t.Dimensions[0];
-                int outDim = (int)t.Dimensions[1];
-                GgufType targetType = newTypes[i];
-                int rowBytes = GetRowByteSize(targetType, inDim);
-                ulong totalTensorBytes = (ulong)outDim * (ulong)rowBytes;
+                // 3. Process and Stream Tensor Data via Bounded <= 16 MB Row Strips
+                progress($"[4/4] Streaming and fusing weights into {outputGgufPath}...");
+                int lastReportedLayer = -1;
+                var parallelOpts = new ParallelOptions { MaxDegreeOfParallelism = options?.MaxDegreeOfParallelism ?? Environment.ProcessorCount };
+                const int maxStripBytes = 16 * 1024 * 1024;
 
-                byte* pDst = (byte*)NativeMemory.Alloc((nuint)totalTensorBytes);
-                try
+                for (int i = 0; i < tensorCount; i++)
                 {
-                    int rank = adapter.Rank;
-                    float scaling = adapter.Scaling;
-                    IntPtr ptrBaseData = (IntPtr)baseGguf.GetTensorPointer(t);
-                    IntPtr ptrDst = (IntPtr)pDst;
-                    GgufType baseType = t.Type;
-
-                    var pinnedSlices = new PinnedRowSlice[slices.Count];
-                    for (int s = 0; s < slices.Count; s++)
+                    var t = baseGguf.TensorList[i];
+                    long targetPos = (long)(tensorDataOffset + newOffsets[i]);
+                    long padNeeded = targetPos - outFs.Position;
+                    if (padNeeded > 0)
                     {
-                        var sl = slices[s];
-                        var hA = GCHandle.Alloc(sl.Slot.A!, GCHandleType.Pinned);
-                        var hB = GCHandle.Alloc(sl.Slot.B!, GCHandleType.Pinned);
-                        pinnedSlices[s] = new PinnedRowSlice(
-                            sl.RowStart,
-                            sl.RowCount,
-                            hA,
-                            hB,
-                            hA.AddrOfPinnedObject(),
-                            hB.AddrOfPinnedObject(),
-                            sl.IsAPeftRowMajor,
-                            sl.IsBPeftRowMajor);
+                        WriteZeroPadding(outFs, (int)padNeeded);
                     }
 
-                    try
+                    var slices = mergePlans[i];
+                    if (slices == null || slices.Count == 0)
                     {
-                        Parallel.For(0, outDim, parallelOpts, () => ArrayPool<float>.Shared.Rent(inDim + rank), (r, loopState, workArr) =>
+                        byte* srcPtr = baseGguf.GetTensorPointer(t);
+                        ulong bytesRemaining = newByteSizes[i];
+                        while (bytesRemaining > 0)
                         {
-                            fixed (float* pWork = workArr)
-                            {
-                                float* rowFloats = pWork;
-                                float* b_r = pWork + inDim;
-                                byte* curBase = (byte*)ptrBaseData;
-                                byte* curDst = (byte*)ptrDst;
-
-                                // 1. Dequantize base weight row r -> rowFloats[0 .. inDim - 1]
-                                QuantKernels.ExtractEmbedding(baseType, curBase, r, rowFloats, inDim);
-
-                                // 2 & 3. Find covering LoRA slice (if any) and accumulate LoRA delta
-                                for (int s = 0; s < pinnedSlices.Length; s++)
-                                {
-                                    var slice = pinnedSlices[s];
-                                    if (r >= slice.RowStart && r < slice.RowStart + slice.RowCount)
-                                    {
-                                        int localRow = r - slice.RowStart;
-                                        int sliceOutDim = slice.RowCount;
-                                        float* curA = (float*)slice.PtrA;
-                                        float* curB = (float*)slice.PtrB;
-
-                                        if (slice.IsBPeftRowMajor)
-                                        {
-                                            float* bRow = curB + (long)localRow * rank;
-                                            for (int k = 0; k < rank; k++)
-                                            {
-                                                b_r[k] = scaling * bRow[k];
-                                            }
-                                        }
-                                        else
-                                        {
-                                            for (int k = 0; k < rank; k++)
-                                            {
-                                                b_r[k] = scaling * curB[(long)k * sliceOutDim + localRow];
-                                            }
-                                        }
-
-                                        if (slice.IsAPeftRowMajor)
-                                        {
-                                            for (int c = 0; c < inDim; c++)
-                                            {
-                                                float delta = 0f;
-                                                for (int k = 0; k < rank; k++)
-                                                {
-                                                    delta += b_r[k] * curA[(long)k * inDim + c];
-                                                }
-                                                rowFloats[c] += delta;
-                                            }
-                                        }
-                                        else if (Vector256.IsHardwareAccelerated && rank == 16)
-                                        {
-                                            Vector256<float> br0 = Vector256.Load(b_r);
-                                            Vector256<float> br1 = Vector256.Load(b_r + 8);
-                                            for (int c = 0; c < inDim; c++)
-                                            {
-                                                float* aRow = curA + (long)c * 16;
-                                                Vector256<float> a0 = Vector256.Load(aRow);
-                                                Vector256<float> a1 = Vector256.Load(aRow + 8);
-                                                rowFloats[c] += Vector256.Sum((br0 * a0) + (br1 * a1));
-                                            }
-                                        }
-                                        else if (Vector256.IsHardwareAccelerated && rank >= 8 && (rank & 7) == 0)
-                                        {
-                                            for (int c = 0; c < inDim; c++)
-                                            {
-                                                float* aRow = curA + (long)c * rank;
-                                                Vector256<float> acc = Vector256<float>.Zero;
-                                                for (int k = 0; k < rank; k += 8)
-                                                {
-                                                    acc += Vector256.Load(b_r + k) * Vector256.Load(aRow + k);
-                                                }
-                                                rowFloats[c] += Vector256.Sum(acc);
-                                            }
-                                        }
-                                        else
-                                        {
-                                            for (int c = 0; c < inDim; c++)
-                                            {
-                                                float* aRow = curA + (long)c * rank;
-                                                float delta = 0f;
-                                                for (int k = 0; k < rank; k++)
-                                                {
-                                                    delta += b_r[k] * aRow[k];
-                                                }
-                                                rowFloats[c] += delta;
-                                            }
-                                        }
-                                        break;
-                                    }
-                                }
-
-                                // 4. Quantize or copy fused row to target representation
-                                byte* dstRow = curDst + (long)r * rowBytes;
-                                switch (targetType)
-                                {
-                                    case GgufType.Q4_K:
-                                        QuantizeRowQ4_K(rowFloats, (BlockQ4_K*)dstRow, inDim);
-                                        break;
-                                    case GgufType.Q4_0:
-                                        QuantizeRowQ4_0(rowFloats, (BlockQ4_0*)dstRow, inDim);
-                                        break;
-                                    case GgufType.Q8_0:
-                                        QuantizeRowQ8_0(rowFloats, (BlockQ8_0*)dstRow, inDim);
-                                        break;
-                                    case GgufType.F32:
-                                        Buffer.MemoryCopy(rowFloats, dstRow, (ulong)rowBytes, (ulong)rowBytes);
-                                        break;
-                                    default:
-                                        throw new NotSupportedException($"Unsupported target quantization: {targetType}");
-                                }
-                            }
-                            return workArr;
-                        },
-                        workArr => ArrayPool<float>.Shared.Return(workArr));
-                    }
-                    finally
-                    {
-                        for (int s = 0; s < pinnedSlices.Length; s++)
-                        {
-                            pinnedSlices[s].HandleA.Free();
-                            pinnedSlices[s].HandleB.Free();
+                            int toCopy = (int)Math.Min((ulong)maxStripBytes, bytesRemaining);
+                            outFs.Write(new ReadOnlySpan<byte>(srcPtr, toCopy));
+                            srcPtr += toCopy;
+                            bytesRemaining -= (ulong)toCopy;
                         }
                     }
-
-                    byte* pWrite = pDst;
-                    ulong remaining = totalTensorBytes;
-                    byte[] streamBuf = new byte[Math.Min(16 * 1024 * 1024, (int)Math.Min((ulong)int.MaxValue, Math.Max(1UL, remaining)))];
-                    while (remaining > 0)
+                    else
                     {
-                        int toWrite = (int)Math.Min((ulong)streamBuf.Length, remaining);
-                        Marshal.Copy((IntPtr)pWrite, streamBuf, 0, toWrite);
-                        outFs.Write(streamBuf, 0, toWrite);
-                        pWrite += toWrite;
-                        remaining -= (ulong)toWrite;
+                        if (TryParseLayerName(t.Name, out int layer, out _) && layer != lastReportedLayer)
+                        {
+                            lastReportedLayer = layer;
+                            progress($"  Fusing Transformer Block {layer:D2}/{baseGguf.BlockCount - 1}...");
+                        }
+
+                        int inDim = (int)t.Dimensions[0];
+                        int outDim = (int)t.Dimensions[1];
+                        GgufType targetType = newTypes[i];
+                        int rowBytes = GetRowByteSize(targetType, inDim);
+                        int stripRows = Math.Max(1, Math.Min(outDim, maxStripBytes / Math.Max(1, rowBytes)));
+                        nuint stripAllocBytes = checked((nuint)stripRows * (nuint)rowBytes);
+
+                        byte* pStrip = (byte*)NativeMemory.Alloc(stripAllocBytes);
+                        try
+                        {
+                            int rank = adapter.Rank;
+                            float scaling = adapter.Scaling;
+                            IntPtr ptrBaseData = (IntPtr)baseGguf.GetTensorPointer(t);
+                            IntPtr ptrStrip = (IntPtr)pStrip;
+                            GgufType baseType = t.Type;
+
+                            var pinnedSlices = new PinnedRowSlice[slices.Count];
+                            var transposedABufs = new List<float[]>();
+                            for (int s = 0; s < slices.Count; s++)
+                            {
+                                var sl = slices[s];
+                                float[] aArr = sl.Slot.A!;
+                                bool isAPeft = sl.IsAPeftRowMajor;
+                                if (isAPeft)
+                                {
+                                    // Convert [rank, inDim] -> [inDim, rank] once per adapted tensor so both layouts run identical SIMD DotSimd (bit-exact output).
+                                    float[] nativeA = ArrayPool<float>.Shared.Rent(checked(inDim * rank));
+                                    transposedABufs.Add(nativeA);
+                                    for (int c = 0; c < inDim; c++)
+                                    {
+                                        int dstOff = c * rank;
+                                        for (int k = 0; k < rank; k++)
+                                        {
+                                            nativeA[dstOff + k] = aArr[k * inDim + c];
+                                        }
+                                    }
+                                    aArr = nativeA;
+                                    isAPeft = false;
+                                }
+
+                                var hA = GCHandle.Alloc(aArr, GCHandleType.Pinned);
+                                var hB = GCHandle.Alloc(sl.Slot.B!, GCHandleType.Pinned);
+                                pinnedSlices[s] = new PinnedRowSlice(
+                                    sl.RowStart,
+                                    sl.RowCount,
+                                    hA,
+                                    hB,
+                                    hA.AddrOfPinnedObject(),
+                                    hB.AddrOfPinnedObject(),
+                                    isAPeft,
+                                    sl.IsBPeftRowMajor);
+                            }
+
+                            try
+                            {
+                                for (int rowBase = 0; rowBase < outDim; rowBase += stripRows)
+                                {
+                                    int curStripRows = Math.Min(stripRows, outDim - rowBase);
+                                    int rowBaseLocal = rowBase;
+
+                                    Parallel.For(0, curStripRows, parallelOpts, () => ArrayPool<float>.Shared.Rent(inDim + rank), (localRowIdx, loopState, workArr) =>
+                                    {
+                                        int r = rowBaseLocal + localRowIdx;
+                                        fixed (float* pWork = workArr)
+                                        {
+                                            float* rowFloats = pWork;
+                                            float* b_r = pWork + inDim;
+                                            byte* curBase = (byte*)ptrBaseData;
+                                            byte* curDst = (byte*)ptrStrip;
+
+                                            // 1. Dequantize base weight row r -> rowFloats[0 .. inDim - 1]
+                                            QuantKernels.ExtractEmbedding(baseType, curBase, r, rowFloats, inDim);
+
+                                            // 2 & 3. Find covering LoRA slice (if any) and accumulate LoRA delta
+                                            for (int s = 0; s < pinnedSlices.Length; s++)
+                                            {
+                                                var slice = pinnedSlices[s];
+                                                if (r >= slice.RowStart && r < slice.RowStart + slice.RowCount)
+                                                {
+                                                    int localRow = r - slice.RowStart;
+                                                    int sliceOutDim = slice.RowCount;
+                                                    float* curA = (float*)slice.PtrA;
+                                                    float* curB = (float*)slice.PtrB;
+
+                                                    if (slice.IsBPeftRowMajor)
+                                                    {
+                                                        float* bRow = curB + (long)localRow * rank;
+                                                        for (int k = 0; k < rank; k++)
+                                                        {
+                                                            b_r[k] = scaling * bRow[k];
+                                                        }
+                                                    }
+                                                    else
+                                                    {
+                                                        for (int k = 0; k < rank; k++)
+                                                        {
+                                                            b_r[k] = scaling * curB[(long)k * sliceOutDim + localRow];
+                                                        }
+                                                    }
+
+                                                    for (int c = 0; c < inDim; c++)
+                                                    {
+                                                        rowFloats[c] += LoraKernels.DotSimd(b_r, curA + (long)c * rank, rank);
+                                                    }
+                                                    break;
+                                                }
+                                            }
+
+                                            // 4. Quantize or copy fused row to target representation
+                                            byte* dstRow = curDst + (long)localRowIdx * rowBytes;
+                                            switch (targetType)
+                                            {
+                                                case GgufType.Q4_K:
+                                                    QuantizeRowQ4_K(rowFloats, (BlockQ4_K*)dstRow, inDim);
+                                                    break;
+                                                case GgufType.Q6_K:
+                                                    QuantizeRowQ6_K(rowFloats, (BlockQ6_K*)dstRow, inDim);
+                                                    break;
+                                                case GgufType.Q4_0:
+                                                    QuantizeRowQ4_0(rowFloats, (BlockQ4_0*)dstRow, inDim);
+                                                    break;
+                                                case GgufType.Q8_0:
+                                                    QuantizeRowQ8_0(rowFloats, (BlockQ8_0*)dstRow, inDim);
+                                                    break;
+                                                case GgufType.F16:
+                                                    QuantizeRowF16(rowFloats, (Half*)dstRow, inDim);
+                                                    break;
+                                                case GgufType.BF16:
+                                                    QuantizeRowBF16(rowFloats, (ushort*)dstRow, inDim);
+                                                    break;
+                                                case GgufType.F32:
+                                                    Buffer.MemoryCopy(rowFloats, dstRow, (ulong)rowBytes, (ulong)rowBytes);
+                                                    break;
+                                                default:
+                                                    throw new NotSupportedException($"Unsupported target quantization: {targetType}");
+                                            }
+                                        }
+                                        return workArr;
+                                    },
+                                    workArr => ArrayPool<float>.Shared.Return(workArr));
+
+                                    int bytesToWrite = checked(curStripRows * rowBytes);
+                                    outFs.Write(new ReadOnlySpan<byte>(pStrip, bytesToWrite));
+                                }
+                            }
+                            finally
+                            {
+                                for (int s = 0; s < pinnedSlices.Length; s++)
+                                {
+                                    pinnedSlices[s].HandleA.Free();
+                                    pinnedSlices[s].HandleB.Free();
+                                }
+                                for (int iBuf = 0; iBuf < transposedABufs.Count; iBuf++)
+                                {
+                                    ArrayPool<float>.Shared.Return(transposedABufs[iBuf]);
+                                }
+                            }
+                        }
+                        finally
+                        {
+                            NativeMemory.Free(pStrip);
+                        }
                     }
                 }
-                finally
-                {
-                    NativeMemory.Free(pDst);
-                }
-            }
-        }
 
-        outFs.Flush();
+                outFs.Flush(true);
+            }
+
+            File.Move(tmpOutPath, outputGgufPath, overwrite: true);
+        }
+        catch
+        {
+            try { if (File.Exists(tmpOutPath)) File.Delete(tmpOutPath); } catch { }
+            throw;
+        }
         sw.Stop();
 
         long finalLength = new FileInfo(outputGgufPath).Length;
@@ -520,6 +535,87 @@ public static unsafe class GgufMerger
         }
     }
 
+    private static void WriteZeroPadding(FileStream fs, int padBytes)
+    {
+        Span<byte> zeroChunk = padBytes <= 256 ? stackalloc byte[padBytes] : stackalloc byte[256];
+        zeroChunk.Clear();
+        int remaining = padBytes;
+        while (remaining > 0)
+        {
+            int n = Math.Min(remaining, zeroChunk.Length);
+            fs.Write(zeroChunk.Slice(0, n));
+            remaining -= n;
+        }
+    }
+
+    private static float BlockMaxAbs32(float* blockSrc)
+    {
+        if (Vector512.IsHardwareAccelerated)
+        {
+            var v0 = Vector512.Abs(Vector512.Load(blockSrc));
+            var v1 = Vector512.Abs(Vector512.Load(blockSrc + 16));
+            var vmax = Vector512.Max(v0, v1);
+            float m = 0f;
+            for (int k = 0; k < 16; k++)
+            {
+                float e = vmax[k];
+                if (e > m) m = e;
+            }
+            return m;
+        }
+        if (Vector256.IsHardwareAccelerated)
+        {
+            var v0 = Vector256.Abs(Vector256.Load(blockSrc));
+            var v1 = Vector256.Abs(Vector256.Load(blockSrc + 8));
+            var v2 = Vector256.Abs(Vector256.Load(blockSrc + 16));
+            var v3 = Vector256.Abs(Vector256.Load(blockSrc + 24));
+            var vmax = Vector256.Max(Vector256.Max(v0, v1), Vector256.Max(v2, v3));
+            float m = 0f;
+            for (int k = 0; k < 8; k++)
+            {
+                float e = vmax[k];
+                if (e > m) m = e;
+            }
+            return m;
+        }
+        float maxAbs = 0f;
+        for (int i = 0; i < 32; i++)
+        {
+            float val = MathF.Abs(blockSrc[i]);
+            if (val > maxAbs) maxAbs = val;
+        }
+        return maxAbs;
+    }
+
+    private static void BlockMinMax32(float* blockSrc, out float minVal, out float maxVal)
+    {
+        if (Vector256.IsHardwareAccelerated)
+        {
+            var x0 = Vector256.Load(blockSrc);
+            var x1 = Vector256.Load(blockSrc + 8);
+            var x2 = Vector256.Load(blockSrc + 16);
+            var x3 = Vector256.Load(blockSrc + 24);
+            var vmin = Vector256.Min(Vector256.Min(x0, x1), Vector256.Min(x2, x3));
+            var vmax = Vector256.Max(Vector256.Max(x0, x1), Vector256.Max(x2, x3));
+            minVal = vmin[0];
+            maxVal = vmax[0];
+            for (int k = 1; k < 8; k++)
+            {
+                if (vmin[k] < minVal) minVal = vmin[k];
+                if (vmax[k] > maxVal) maxVal = vmax[k];
+            }
+            return;
+        }
+        minVal = blockSrc[0];
+        maxVal = blockSrc[0];
+        for (int i = 1; i < 32; i++)
+        {
+            float v = blockSrc[i];
+            if (v < minVal) minVal = v;
+            if (v > maxVal) maxVal = v;
+        }
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void QuantizeRowQ8_0(float* src, BlockQ8_0* dst, int n)
     {
@@ -529,12 +625,7 @@ public static unsafe class GgufMerger
             float* blockSrc = src + b * 32;
             BlockQ8_0* blockDst = dst + b;
 
-            float maxAbs = 0f;
-            for (int i = 0; i < 32; i++)
-            {
-                float val = MathF.Abs(blockSrc[i]);
-                if (val > maxAbs) maxAbs = val;
-            }
+            float maxAbs = BlockMaxAbs32(blockSrc);
 
             if (maxAbs == 0f)
             {
@@ -556,22 +647,173 @@ public static unsafe class GgufMerger
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void QuantizeRowF16(float* src, Half* dst, int n)
+    {
+        for (int i = 0; i < n; i++)
+        {
+            dst[i] = (Half)src[i];
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static void QuantizeRowBF16(float* src, ushort* dst, int n)
+    {
+        int i = 0;
+        if (Vector256.IsHardwareAccelerated && n >= 8)
+        {
+            var vOne = Vector256.Create(1u);
+            var vRoundBase = Vector256.Create(0x7FFFu);
+            var vAbsMask = Vector256.Create(0x7FFFFFFFu);
+            var vInf = Vector256.Create(0x7F800000u);
+            var vQNaN = Vector256.Create(0x0040u);
+
+            for (; i <= n - 8; i += 8)
+            {
+                var bits = Vector256.Load((uint*)(src + i));
+                var absBits = bits & vAbsMask;
+                var isNan = Vector256.GreaterThan(absBits, vInf);
+                var lsb = (bits >> 16) & vOne;
+                var rounded = (bits + vRoundBase + lsb) >> 16;
+                var nanVal = (bits >> 16) | vQNaN;
+                var bf32 = Vector256.ConditionalSelect(isNan, nanVal, rounded);
+                for (int k = 0; k < 8; k++)
+                {
+                    dst[i + k] = (ushort)bf32[k];
+                }
+            }
+        }
+        for (; i < n; i++)
+        {
+            uint bits = BitConverter.SingleToUInt32Bits(src[i]);
+            if ((bits & 0x7FFFFFFFu) > 0x7F800000u)
+            {
+                dst[i] = (ushort)((bits >> 16) | 0x0040u);
+            }
+            else
+            {
+                uint roundingBias = 0x7FFFu + ((bits >> 16) & 1u);
+                dst[i] = (ushort)((bits + roundingBias) >> 16);
+            }
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static void QuantizeRowQ6_K(float* src, BlockQ6_K* dst, int n)
+    {
+        int numSuperBlocks = n / 256;
+        float* subScale = stackalloc float[16];
+        sbyte* sc = stackalloc sbyte[16];
+        byte* qBias = stackalloc byte[256];
+
+        for (int sb = 0; sb < numSuperBlocks; sb++)
+        {
+            float* sbSrc = src + sb * 256;
+            BlockQ6_K* sbDst = dst + sb;
+
+            float maxScale = 0f;
+            for (int ib = 0; ib < 16; ib++)
+            {
+                float* bSrc = sbSrc + ib * 16;
+                float bMaxAbs = 0f;
+                for (int i = 0; i < 16; i++)
+                {
+                    float v = MathF.Abs(bSrc[i]);
+                    if (v > bMaxAbs) bMaxAbs = v;
+                }
+                float scale = bMaxAbs / 31.0f;
+                subScale[ib] = scale;
+                if (scale > maxScale) maxScale = scale;
+            }
+
+            if (maxScale == 0f)
+            {
+                sbDst->Delta = (Half)0f;
+                new Span<sbyte>(sbDst->Scales, 16).Clear();
+                new Span<byte>(sbDst->Ql, 128).Clear();
+                new Span<byte>(sbDst->Qh, 64).Clear();
+                continue;
+            }
+
+            float superD = maxScale / 127.0f;
+            float invSuperScale = 127.0f / maxScale;
+            sbDst->Delta = (Half)superD;
+            float actualD = (float)sbDst->Delta;
+
+            for (int ib = 0; ib < 16; ib++)
+            {
+                int scQ = (int)MathF.Round(subScale[ib] * invSuperScale);
+                sc[ib] = (sbyte)Math.Clamp(scQ, 0, 127);
+                sbDst->Scales[ib] = sc[ib];
+
+                float effScale = actualD * sc[ib];
+                float invEff = effScale > 0f ? 1.0f / effScale : 0f;
+                float* bSrc = sbSrc + ib * 16;
+                byte* bQ = qBias + ib * 16;
+
+                for (int i = 0; i < 16; i++)
+                {
+                    int q = invEff > 0f ? (int)MathF.Round(bSrc[i] * invEff) : 0;
+                    q = Math.Clamp(q, -32, 31);
+                    bQ[i] = (byte)(q + 32);
+                }
+            }
+
+            for (int half = 0; half < 2; half++)
+            {
+                byte* qHalf = qBias + half * 128;
+                byte* ql = sbDst->Ql + half * 64;
+                byte* qh = sbDst->Qh + half * 32;
+
+                for (int l = 0; l < 32; l++)
+                {
+                    int q1 = qHalf[l + 0];
+                    int q2 = qHalf[l + 32];
+                    int q3 = qHalf[l + 64];
+                    int q4 = qHalf[l + 96];
+
+                    ql[l + 0] = (byte)((q1 & 0x0F) | ((q3 & 0x0F) << 4));
+                    ql[l + 32] = (byte)((q2 & 0x0F) | ((q4 & 0x0F) << 4));
+                    qh[l] = (byte)(((q1 >> 4) & 3) | (((q2 >> 4) & 3) << 2) | (((q3 >> 4) & 3) << 4) | (((q4 >> 4) & 3) << 6));
+                }
+            }
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void DequantizeRowQ6_K(BlockQ6_K* src, float* dst, int n)
+    {
+        QuantKernels.DequantizeQ6_K(src, dst, n);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static GgufType ResolveTargetType(TargetQuantization target, GgufType baseType, int inDim)
     {
         GgufType resolved = target switch
         {
             TargetQuantization.Q4_K => GgufType.Q4_K,
+            TargetQuantization.Q6_K => GgufType.Q6_K,
             TargetQuantization.Q4_0 => GgufType.Q4_0,
             TargetQuantization.Q8_0 => GgufType.Q8_0,
+            TargetQuantization.F16 => GgufType.F16,
+            TargetQuantization.BF16 => GgufType.BF16,
             TargetQuantization.F32 => GgufType.F32,
             TargetQuantization.Auto => baseType switch
             {
+                GgufType.Q6_K => GgufType.Q6_K,
                 GgufType.Q4_0 => GgufType.Q4_0,
                 GgufType.Q8_0 => GgufType.Q8_0,
+                GgufType.F16 => GgufType.F16,
+                GgufType.BF16 => GgufType.BF16,
+                GgufType.F32 => GgufType.F32,
                 _ => GgufType.Q4_K
             },
             _ => GgufType.Q4_K
         };
+
+        if (resolved == GgufType.Q6_K && inDim % 256 != 0)
+        {
+            resolved = inDim % 32 == 0 ? GgufType.Q8_0 : GgufType.F16;
+        }
 
         if (resolved == GgufType.Q4_K && inDim % 256 != 0)
         {
@@ -592,8 +834,11 @@ public static unsafe class GgufMerger
         return type switch
         {
             GgufType.Q4_K => (inDim / 256) * sizeof(BlockQ4_K),
+            GgufType.Q6_K => (inDim / 256) * sizeof(BlockQ6_K),
             GgufType.Q4_0 => (inDim / 32) * sizeof(BlockQ4_0),
             GgufType.Q8_0 => (inDim / 32) * sizeof(BlockQ8_0),
+            GgufType.F16 => inDim * sizeof(ushort),
+            GgufType.BF16 => inDim * sizeof(ushort),
             GgufType.F32 => inDim * sizeof(float),
             _ => throw new NotSupportedException($"Target quantization type {type} is not supported for LoRA fusion.")
         };
@@ -683,14 +928,7 @@ public static unsafe class GgufMerger
             for (int ib = 0; ib < 8; ib++)
             {
                 float* bSrc = sbSrc + ib * 32;
-                float bMin = bSrc[0];
-                float bMax = bSrc[0];
-                for (int i = 1; i < 32; i++)
-                {
-                    float v = bSrc[i];
-                    if (v < bMin) bMin = v;
-                    if (v > bMax) bMax = v;
-                }
+                BlockMinMax32(bSrc, out float bMin, out float bMax);
 
                 if (bMin > 0f) bMin = 0f;
                 float range = bMax - bMin;
@@ -1002,20 +1240,7 @@ public static unsafe class GgufMerger
             using var fs = File.OpenRead(binPath);
             using var br = new BinaryReader(fs);
 
-            uint magic = br.ReadUInt32();
-            if (magic != 0x41524F4C)
-                throw new InvalidDataException($"Invalid LoRA magic header: 0x{magic:X8} (expected 0x41524F4C 'LORA')");
-
-            uint version = br.ReadUInt32();
-            if (version != 1)
-                throw new InvalidDataException($"Unsupported LoRA adapter version: {version}");
-
-            int layerCount = br.ReadInt32();
-            int rank = br.ReadInt32();
-            float alpha = br.ReadSingle();
-            int tensorCount = br.ReadInt32();
-            if (tensorCount < 0)
-                throw new InvalidDataException($"Invalid negative LoRA tensor count: {tensorCount}");
+            LoraBinaryFormat.ValidateAndReadHeader(fs, br, out int layerCount, out int rank, out float alpha, out int tensorCount);
 
             var parsed = new ParsedLoraAdapter
             {
@@ -1026,26 +1251,37 @@ public static unsafe class GgufMerger
 
             for (int t = 0; t < tensorCount; t++)
             {
-                string name = br.ReadString();
+                string name = LoraBinaryFormat.ReadBoundedString(fs);
+                if (fs.Length - fs.Position < sizeof(int) * 2)
+                    throw new InvalidDataException($"Truncated LoRA tensor dimensions for '{name}'.");
+
                 int dim0 = br.ReadInt32();
                 int dim1 = br.ReadInt32();
                 if (dim0 <= 0 || dim1 <= 0)
                     throw new InvalidDataException($"Invalid LoRA tensor dimensions [{dim0}, {dim1}] for '{name}'.");
 
-                long elemCount = (long)dim0 * dim1;
-                long byteCount = elemCount * sizeof(float);
+                long elemCountLong = checked((long)dim0 * dim1);
+                if (elemCountLong > int.MaxValue / sizeof(float))
+                    throw new InvalidDataException($"LoRA tensor '{name}' element count {elemCountLong} exceeds maximum supported buffer size.");
+
+                long byteCount = checked(elemCountLong * sizeof(float));
                 if (byteCount > fs.Length - fs.Position)
                     throw new InvalidDataException($"Truncated LoRA binary payload for '{name}': expected {byteCount} bytes, only {fs.Length - fs.Position} remaining.");
 
+                int elemCount = (int)elemCountLong;
                 var parts = name.Split('.');
                 if (parts.Length >= 5 && parts[0] == "blk" && int.TryParse(parts[1], out int layerIdx))
                 {
+                    if (layerIdx < 0 || layerIdx >= layerCount)
+                        throw new InvalidDataException($"LoRA tensor '{name}' references out-of-range layer index {layerIdx} (layerCount={layerCount}).");
+
                     string? canonicalProj = CanonicalizeProjection(parts[2]);
                     string matrix = parts[3];
                     if (canonicalProj != null && (matrix == "lora_a" || matrix == "lora_b"))
                     {
                         float[] data = new float[elemCount];
                         fs.ReadExactly(MemoryMarshal.AsBytes(data.AsSpan()));
+                        LoraBinaryFormat.ValidateFinite(data, $"Merged adapter tensor '{name}'");
 
                         if (!parsed._slots.TryGetValue((layerIdx, canonicalProj), out var slot))
                         {
@@ -1069,6 +1305,9 @@ public static unsafe class GgufMerger
 
                 fs.Seek(byteCount, SeekOrigin.Current);
             }
+
+            if (fs.Position != fs.Length)
+                throw new InvalidDataException($"Unexpected trailing bytes ({fs.Length - fs.Position}) in LoRA adapter '{binPath}'.");
 
             return parsed;
         }

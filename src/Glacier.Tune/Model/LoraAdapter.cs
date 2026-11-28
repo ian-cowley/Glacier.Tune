@@ -40,6 +40,8 @@ public sealed unsafe class LoraAdapter : IDisposable
     public Tensor<float> AdapterB => _adapterB;
     public IReadOnlyList<Tensor<float>> TrainableParameters => _trainableParameters;
     public GpuTarget Target => _target;
+    public IntPtr BaseWeightPtr => _dBaseWeight;
+    public IntPtr BaseBiasPtr => _dBaseBias;
 
     /// <summary>
     /// Returns true if this adapter is disabled or if AdapterB is currently all zeros (Delta W == 0).
@@ -92,12 +94,18 @@ public sealed unsafe class LoraAdapter : IDisposable
         GpuTarget target = GpuTarget.Auto,
         bool isEnabled = true)
     {
+        if (target is GpuTarget.Direct3D12 or GpuTarget.Vulkan or GpuTarget.Amd or GpuTarget.DualGpu)
+        {
+            throw new NotSupportedException(
+                $"GPU backend '{target}' is not supported by {nameof(LoraAdapter)}. Supported targets are Auto, Cpu, Nvidia, and NvidiaTensorCore.");
+        }
+
         _inFeatures = inFeatures;
         _outFeatures = outFeatures;
         _rank = rank;
         _scaling = rank > 0 ? alpha / rank : 0f;
         _isEnabled = isEnabled && rank > 0;
-        _target = GpuTarget.Cpu; // Fast SIMD cache-blocked microkernel for low-rank adapters
+        _target = target;
 
         if (_isEnabled)
         {
@@ -291,6 +299,44 @@ public sealed unsafe class LoraAdapter : IDisposable
             {
                 dXSpan[i] += loraSpan[i];
             }
+        }
+    }
+
+    public void ForwardResident(Glacier.Tune.Gpu.GpuLoraEngine engine, GgufType type, DeviceResidentTensor<float> x, DeviceResidentTensor<float> output, int seqLen)
+    {
+        engine.LaunchGemmBatch(
+            type,
+            output.DevicePointer,
+            x.DevicePointer,
+            _dBaseWeight,
+            _inFeatures,
+            _outFeatures,
+            seqLen,
+            _dBaseBias);
+
+        if (_isEnabled && !IsZeroDelta)
+        {
+            engine.LaunchLoraForward(this, x.DevicePointer, output.DevicePointer, seqLen);
+        }
+    }
+
+    public void BackwardResident(Glacier.Tune.Gpu.GpuLoraEngine engine, GgufType type, DeviceResidentTensor<float> dY, DeviceResidentTensor<float> x, DeviceResidentTensor<float>? dXInput, int seqLen)
+    {
+        if (dXInput != null && _dBaseWeight != IntPtr.Zero)
+        {
+            engine.LaunchGemmBwd(
+                type,
+                dXInput.DevicePointer,
+                dY.DevicePointer,
+                _dBaseWeight,
+                _inFeatures,
+                _outFeatures,
+                seqLen);
+        }
+
+        if (_isEnabled)
+        {
+            engine.LaunchLoraBackward(this, x.DevicePointer, dY.DevicePointer, dXInput?.DevicePointer ?? IntPtr.Zero, seqLen);
         }
     }
 

@@ -27,6 +27,7 @@ public sealed class BlockActivationState : IDisposable
     public Tensor<float>? QGate { get; set; }
     public Tensor<float>? AttnOutPreGate { get; set; }
     public Tensor<float>? AttnProbs { get; set; }
+    public Tensor<float>? AttnLse { get; set; }
     public Tensor<float>? AttnOut { get; set; }
     public Tensor<float>? X1 { get; set; }
     public Tensor<float>? Norm2X { get; set; }
@@ -45,6 +46,37 @@ public sealed class BlockActivationState : IDisposable
         QGate?.Dispose();
         AttnOutPreGate?.Dispose();
         AttnProbs?.Dispose();
+        AttnLse?.Dispose();
+        AttnOut?.Dispose();
+        X1?.Dispose();
+        Norm2X?.Dispose();
+        Gate?.Dispose();
+        Up?.Dispose();
+        Hidden?.Dispose();
+    }
+}
+
+public sealed class ResidentBlockActivationState : IDisposable
+{
+    public DeviceResidentTensor<float>? Norm1X { get; set; }
+    public DeviceResidentTensor<float>? Q { get; set; }
+    public DeviceResidentTensor<float>? K { get; set; }
+    public DeviceResidentTensor<float>? V { get; set; }
+    public DeviceResidentTensor<float>? AttnLse { get; set; }
+    public DeviceResidentTensor<float>? AttnOut { get; set; }
+    public DeviceResidentTensor<float>? X1 { get; set; }
+    public DeviceResidentTensor<float>? Norm2X { get; set; }
+    public DeviceResidentTensor<float>? Gate { get; set; }
+    public DeviceResidentTensor<float>? Up { get; set; }
+    public DeviceResidentTensor<float>? Hidden { get; set; }
+
+    public void Dispose()
+    {
+        Norm1X?.Dispose();
+        Q?.Dispose();
+        K?.Dispose();
+        V?.Dispose();
+        AttnLse?.Dispose();
         AttnOut?.Dispose();
         X1?.Dispose();
         Norm2X?.Dispose();
@@ -423,7 +455,8 @@ public sealed unsafe class TransformerBlock : ITuneBlock
 
         // 3 & 4. RoPE + Causal Multi-Head GQA Attention (+ optional Q-Gate)
         var attnOut = new Tensor<float>(seqLen, qDim);
-        var attnProbs = state != null ? new Tensor<float>(_nHeadsQ, seqLen, seqLen) : null;
+        Tensor<float>? attnProbs = null;
+        Tensor<float>? attnLse = null;
 
         bool canUseGpuAttn = gpu != null &&
                              !_weights.HasQGate &&
@@ -435,8 +468,9 @@ public sealed unsafe class TransformerBlock : ITuneBlock
 
         if (canUseGpuAttn)
         {
+            attnLse = state != null ? new Tensor<float>(_nHeadsQ, seqLen) : null;
             gpu!.ForwardAttention(
-                _layerIndex, q, k, v, attnOut, attnProbs,
+                _layerIndex, q, k, v, attnOut, attnLse,
                 seqLen, _nHeadsQ, _nHeadsKv, _headDim, _ropeFreqBase);
         }
         else
@@ -446,7 +480,7 @@ public sealed unsafe class TransformerBlock : ITuneBlock
                 seqLen, _nHeadsQ, _nHeadsKv, _headDim, _ropeFreqBase,
                 ropeDim: _ropeDim, ropeFreqs: _ropeFreqs);
 
-            attnProbs ??= new Tensor<float>(_nHeadsQ, seqLen, seqLen);
+            attnProbs = new Tensor<float>(_nHeadsQ, seqLen, seqLen);
 
             if (_weights.HasQGate)
             {
@@ -492,12 +526,14 @@ public sealed unsafe class TransformerBlock : ITuneBlock
             state.Q = q;
             state.K = k;
             state.V = v;
-            state.AttnProbs = attnProbs!;
+            state.AttnProbs = attnProbs;
+            state.AttnLse = attnLse;
             state.AttnOut = attnOut;
         }
         else
         {
             attnProbs?.Dispose();
+            attnLse?.Dispose();
         }
 
         // 5. Output projection + Residual: x1 = x + OProj(attnOut)
@@ -716,13 +752,14 @@ public sealed unsafe class TransformerBlock : ITuneBlock
                              _weights.AttnKNormWeight == null &&
                              _ropeDim == _headDim &&
                              _ropeFreqs == null &&
+                             state.AttnLse != null &&
                              _gpuEngine.SupportsAttention(seqLen, _headDim);
 
         if (canUseGpuAttn)
         {
             _gpuEngine!.BackwardAttention(
-                _layerIndex, dAttnOut,
-                state.Q!, state.K!, state.V!, state.AttnProbs!,
+                _layerIndex, dAttnOut, state.AttnOut!,
+                state.Q!, state.K!, state.V!, state.AttnLse!,
                 dQ, dK, dV,
                 seqLen, _nHeadsQ, _nHeadsKv, _headDim, _ropeFreqBase);
         }
@@ -836,6 +873,190 @@ public sealed unsafe class TransformerBlock : ITuneBlock
         var dXInput = TensorOps.Add(dX1, dX_norm);
         dX1.Dispose();
 
+        return dXInput;
+    }
+
+    public bool SupportsFullResidentGpu(int seqLen)
+    {
+        var gpu = _gpuEngine;
+        if (gpu == null) return false;
+        if (_hasFusedUnslicedQkv || _weights.HasQGate || _weights.AttnQNormWeight != null || _weights.AttnKNormWeight != null)
+            return false;
+        if (_ropeDim != _headDim || _ropeFreqs != null)
+            return false;
+        if (!gpu.SupportsAttention(seqLen, _headDim))
+            return false;
+        if (gpu.GetAttnNorm(_layerIndex) == IntPtr.Zero || gpu.GetFfnNorm(_layerIndex) == IntPtr.Zero)
+            return false;
+
+        return gpu.SupportsForwardGemm(_weights.QType) && gpu.SupportsBackwardGemm(_weights.QType) &&
+               gpu.SupportsForwardGemm(_weights.KType) && gpu.SupportsBackwardGemm(_weights.KType) &&
+               gpu.SupportsForwardGemm(_weights.VType) && gpu.SupportsBackwardGemm(_weights.VType) &&
+               gpu.SupportsForwardGemm(_weights.AttnOutType) && gpu.SupportsBackwardGemm(_weights.AttnOutType) &&
+               gpu.SupportsForwardGemm(_weights.FfnGateType) && gpu.SupportsBackwardGemm(_weights.FfnGateType) &&
+               gpu.SupportsForwardGemm(_weights.FfnUpType) && gpu.SupportsBackwardGemm(_weights.FfnUpType) &&
+               gpu.SupportsForwardGemm(_weights.FfnDownType) && gpu.SupportsBackwardGemm(_weights.FfnDownType);
+    }
+
+    public DeviceResidentTensor<float> ForwardResident(
+        Glacier.Tune.Gpu.GpuLoraEngine gpu,
+        DeviceResidentTensor<float> x,
+        int seqLen,
+        bool saveActivations,
+        out ResidentBlockActivationState? state)
+    {
+        state = saveActivations ? new ResidentBlockActivationState() : null;
+        int qDim = _nHeadsQ * _headDim;
+        int kvDim = _nHeadsKv * _headDim;
+        float attnScale = 1.0f / MathF.Sqrt(_headDim);
+
+        try
+        {
+            var norm1X = gpu.AllocateResident(seqLen, _hiddenDim);
+            gpu.LaunchRmsNormBatch(x.DevicePointer, gpu.GetAttnNorm(_layerIndex), norm1X.DevicePointer, seqLen, _hiddenDim, _rmsNormEps);
+            if (state != null) state.Norm1X = norm1X;
+
+            var q = gpu.AllocateResident(seqLen, qDim);
+            var k = gpu.AllocateResident(seqLen, kvDim);
+            var v = gpu.AllocateResident(seqLen, kvDim);
+            _qProj.ForwardResident(gpu, _weights.QType, norm1X, q, seqLen);
+            _kProj.ForwardResident(gpu, _weights.KType, norm1X, k, seqLen);
+            _vProj.ForwardResident(gpu, _weights.VType, norm1X, v, seqLen);
+
+            gpu.LaunchRopeBatch(q.DevicePointer, k.DevicePointer, _nHeadsQ, _nHeadsKv, _headDim, seqLen, _ropeFreqBase, 1.0f);
+
+            var attnOut = gpu.AllocateResident(seqLen, qDim);
+            var attnLse = gpu.AllocateResident(_nHeadsQ, seqLen);
+            gpu.LaunchAttnTrainFwd(q.DevicePointer, k.DevicePointer, v.DevicePointer, attnOut.DevicePointer, attnLse.DevicePointer, seqLen, _nHeadsQ, _nHeadsKv, _headDim, attnScale);
+
+            if (state != null)
+            {
+                state.Q = q;
+                state.K = k;
+                state.V = v;
+                state.AttnOut = attnOut;
+                state.AttnLse = attnLse;
+            }
+            else
+            {
+                norm1X.Dispose();
+                q.Dispose();
+                k.Dispose();
+                v.Dispose();
+                attnLse.Dispose();
+            }
+
+            var x1 = gpu.AllocateResident(seqLen, _hiddenDim);
+            _oProj.ForwardResident(gpu, _weights.AttnOutType, attnOut, x1, seqLen);
+            gpu.LaunchVecAdd(x1.DevicePointer, x.DevicePointer, seqLen * _hiddenDim);
+            if (state != null)
+            {
+                state.X1 = x1;
+            }
+            else
+            {
+                attnOut.Dispose();
+            }
+
+            var norm2X = gpu.AllocateResident(seqLen, _hiddenDim);
+            gpu.LaunchRmsNormBatch(x1.DevicePointer, gpu.GetFfnNorm(_layerIndex), norm2X.DevicePointer, seqLen, _hiddenDim, _rmsNormEps);
+            if (state != null) state.Norm2X = norm2X;
+
+            var gate = gpu.AllocateResident(seqLen, _ffnDim);
+            var up = gpu.AllocateResident(seqLen, _ffnDim);
+            var hidden = gpu.AllocateResident(seqLen, _ffnDim);
+            _gateProj.ForwardResident(gpu, _weights.FfnGateType, norm2X, gate, seqLen);
+            _upProj.ForwardResident(gpu, _weights.FfnUpType, norm2X, up, seqLen);
+            gpu.LaunchSwiglu(hidden.DevicePointer, gate.DevicePointer, up.DevicePointer, seqLen * _ffnDim);
+
+            if (state != null)
+            {
+                state.Gate = gate;
+                state.Up = up;
+                state.Hidden = hidden;
+            }
+            else
+            {
+                gate.Dispose();
+                up.Dispose();
+                norm2X.Dispose();
+            }
+
+            var output = gpu.AllocateResident(seqLen, _hiddenDim);
+            _downProj.ForwardResident(gpu, _weights.FfnDownType, hidden, output, seqLen);
+            gpu.LaunchVecAdd(output.DevicePointer, x1.DevicePointer, seqLen * _hiddenDim);
+
+            if (state == null)
+            {
+                hidden.Dispose();
+                x1.Dispose();
+            }
+
+            return output;
+        }
+        catch
+        {
+            state?.Dispose();
+            state = null;
+            throw;
+        }
+    }
+
+    public DeviceResidentTensor<float> BackwardResident(
+        Glacier.Tune.Gpu.GpuLoraEngine gpu,
+        DeviceResidentTensor<float> dOutput,
+        ResidentBlockActivationState state,
+        DeviceResidentTensor<float> xInput,
+        int seqLen)
+    {
+        int qDim = _nHeadsQ * _headDim;
+        int kvDim = _nHeadsKv * _headDim;
+        float attnScale = 1.0f / MathF.Sqrt(_headDim);
+
+        using var dHidden = gpu.AllocateResident(seqLen, _ffnDim);
+        gpu.ZeroResident(dHidden);
+        _downProj.BackwardResident(gpu, _weights.FfnDownType, dOutput, state.Hidden!, dHidden, seqLen);
+
+        using var dGate = gpu.AllocateResident(seqLen, _ffnDim);
+        using var dUp = gpu.AllocateResident(seqLen, _ffnDim);
+        gpu.LaunchSwigluBwd(dHidden.DevicePointer, state.Gate!.DevicePointer, state.Up!.DevicePointer, dGate.DevicePointer, dUp.DevicePointer, seqLen * _ffnDim);
+
+        using var dNorm2X = gpu.AllocateResident(seqLen, _hiddenDim);
+        gpu.ZeroResident(dNorm2X);
+        _gateProj.BackwardResident(gpu, _weights.FfnGateType, dGate, state.Norm2X!, dNorm2X, seqLen);
+        _upProj.BackwardResident(gpu, _weights.FfnUpType, dUp, state.Norm2X!, dNorm2X, seqLen);
+
+        using var dX1Norm = gpu.AllocateResident(seqLen, _hiddenDim);
+        gpu.LaunchRmsNormBwd(dNorm2X.DevicePointer, state.X1!.DevicePointer, gpu.GetFfnNorm(_layerIndex), dX1Norm.DevicePointer, seqLen, _hiddenDim, _rmsNormEps);
+
+        using var dX1 = gpu.AllocateResident(seqLen, _hiddenDim);
+        gpu.LaunchResAddOut(dX1.DevicePointer, dOutput.DevicePointer, dX1Norm.DevicePointer, seqLen * _hiddenDim);
+
+        using var dAttnOut = gpu.AllocateResident(seqLen, qDim);
+        gpu.ZeroResident(dAttnOut);
+        _oProj.BackwardResident(gpu, _weights.AttnOutType, dX1, state.AttnOut!, dAttnOut, seqLen);
+
+        using var dQ = gpu.AllocateResident(seqLen, qDim);
+        using var dK = gpu.AllocateResident(seqLen, kvDim);
+        using var dV = gpu.AllocateResident(seqLen, kvDim);
+        gpu.LaunchAttnTrainBwd(
+            dAttnOut.DevicePointer, state.AttnOut!.DevicePointer,
+            state.Q!.DevicePointer, state.K!.DevicePointer, state.V!.DevicePointer, state.AttnLse!.DevicePointer,
+            dQ.DevicePointer, dK.DevicePointer, dV.DevicePointer,
+            seqLen, _nHeadsQ, _nHeadsKv, _headDim, attnScale);
+        gpu.LaunchRopeBatch(dQ.DevicePointer, dK.DevicePointer, _nHeadsQ, _nHeadsKv, _headDim, seqLen, _ropeFreqBase, -1.0f);
+
+        using var dNorm1X = gpu.AllocateResident(seqLen, _hiddenDim);
+        gpu.ZeroResident(dNorm1X);
+        _qProj.BackwardResident(gpu, _weights.QType, dQ, state.Norm1X!, dNorm1X, seqLen);
+        _kProj.BackwardResident(gpu, _weights.KType, dK, state.Norm1X!, dNorm1X, seqLen);
+        _vProj.BackwardResident(gpu, _weights.VType, dV, state.Norm1X!, dNorm1X, seqLen);
+
+        using var dXNorm = gpu.AllocateResident(seqLen, _hiddenDim);
+        gpu.LaunchRmsNormBwd(dNorm1X.DevicePointer, xInput.DevicePointer, gpu.GetAttnNorm(_layerIndex), dXNorm.DevicePointer, seqLen, _hiddenDim, _rmsNormEps);
+
+        var dXInput = gpu.AllocateResident(seqLen, _hiddenDim);
+        gpu.LaunchResAddOut(dXInput.DevicePointer, dX1.DevicePointer, dXNorm.DevicePointer, seqLen * _hiddenDim);
         return dXInput;
     }
 

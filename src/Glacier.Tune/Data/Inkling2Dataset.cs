@@ -94,10 +94,27 @@ public sealed class Inkling2Dataset
                     }
                 }
 
-                if (inputIds.Count >= 4 && supervisedCount >= 4)
-                    dataset._examples.Add(new TrainingExample(inputIds.ToArray(), labels.ToArray()));
+                // Causal Language Modeling shift matching ChatMlDataset: token at position t predicts token at position t + 1
+                var shiftedLabels = new int[labels.Count];
+                int shiftedSupervisedCount = 0;
+                for (int i = 0; i < labels.Count - 1; i++)
+                {
+                    int nextLabel = labels[i + 1];
+                    shiftedLabels[i] = nextLabel;
+                    if (nextLabel != IgnoreIndex)
+                    {
+                        shiftedSupervisedCount++;
+                    }
+                }
+                if (labels.Count > 0)
+                {
+                    shiftedLabels[labels.Count - 1] = IgnoreIndex;
+                }
+
+                if (inputIds.Count >= 4 && shiftedSupervisedCount >= 4)
+                    dataset._examples.Add(new TrainingExample(inputIds.ToArray(), shiftedLabels));
             }
-            catch
+            catch (JsonException)
             {
                 continue;
             }

@@ -1,28 +1,26 @@
 using System;
+using System.Buffers;
 using System.Runtime.CompilerServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 
 namespace Glacier.Tune.Kernels;
 
 /// <summary>
-/// High-performance Rotary Position Embedding (RoPE) forward and backward kernels.
-/// Applies orthogonal 2D Givens rotations with exact transpose inversion on the reverse pass.
+/// High-performance 3-tier SIMD Rotary Position Embedding (RoPE) forward and backward kernels.
+/// Precomputes inverse frequencies once per sequence and vectorizes 2D Givens rotations.
 /// </summary>
 public static unsafe class RoPEKernel
 {
+    private const int StackThreshold = 256;
+
     public static void ForwardSequence(
         float* q, float* k,
         int seqLen,
         int nHeadsQ, int nHeadsKv, int headDim,
         float freqBase, float freqScale = 1.0f,
         int ropeDim = -1, float* ropeFreqs = null)
-    {
-        for (int pos = 0; pos < seqLen; pos++)
-        {
-            float* posQ = q + (long)pos * nHeadsQ * headDim;
-            float* posK = k + (long)pos * nHeadsKv * headDim;
-            ApplyRoPE(posQ, posK, nHeadsQ, nHeadsKv, headDim, pos, freqBase, freqScale, inverse: false, ropeDim, ropeFreqs);
-        }
-    }
+        => ProcessSequence(q, k, seqLen, nHeadsQ, nHeadsKv, headDim, freqBase, freqScale, inverse: false, ropeDim, ropeFreqs);
 
     public static void BackwardSequence(
         float* dq, float* dk,
@@ -30,77 +28,144 @@ public static unsafe class RoPEKernel
         int nHeadsQ, int nHeadsKv, int headDim,
         float freqBase, float freqScale = 1.0f,
         int ropeDim = -1, float* ropeFreqs = null)
-    {
-        for (int pos = 0; pos < seqLen; pos++)
-        {
-            float* posDq = dq + (long)pos * nHeadsQ * headDim;
-            float* posDk = dk + (long)pos * nHeadsKv * headDim;
-            // Reverse rotation has negated sine (-sin(theta))
-            ApplyRoPE(posDq, posDk, nHeadsQ, nHeadsKv, headDim, pos, freqBase, freqScale, inverse: true, ropeDim, ropeFreqs);
-        }
-    }
+        => ProcessSequence(dq, dk, seqLen, nHeadsQ, nHeadsKv, headDim, freqBase, freqScale, inverse: true, ropeDim, ropeFreqs);
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void ApplyRoPE(
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private static void ProcessSequence(
         float* q, float* k,
-        int nHeadsQ, int nHeadsKv,
-        int headDim, int pos,
+        int seqLen,
+        int nHeadsQ, int nHeadsKv, int headDim,
         float freqBase, float freqScale,
         bool inverse,
-        int ropeDim = -1,
-        float* ropeFreqs = null)
+        int ropeDim,
+        float* ropeFreqs)
     {
+        if (seqLen <= 0 || headDim <= 1) return;
+
         int effectiveRopeDim = (ropeDim > 0 && ropeDim <= headDim) ? ropeDim : headDim;
         int halfDim = effectiveRopeDim / 2;
         if (halfDim <= 0) return;
 
-        Span<float> cosTable = halfDim <= 128 ? stackalloc float[halfDim] : new float[halfDim];
-        Span<float> sinTable = halfDim <= 128 ? stackalloc float[halfDim] : new float[halfDim];
-
-        float sinSign = inverse ? -1.0f : 1.0f;
-
-        for (int i = 0; i < halfDim; i++)
+        float[]? rented = halfDim > StackThreshold ? ArrayPool<float>.Shared.Rent(halfDim * 3) : null;
+        try
         {
-            float baseFreq = 1.0f / MathF.Pow(freqBase, (float)(2 * i) / effectiveRopeDim);
-            float freq = ropeFreqs != null ? (baseFreq / ropeFreqs[i]) : baseFreq;
-            float theta = pos * freq * freqScale;
-            cosTable[i] = MathF.Cos(theta);
-            sinTable[i] = MathF.Sin(theta) * sinSign;
+            Span<float> invFreq = rented != null ? rented.AsSpan(0, halfDim) : stackalloc float[halfDim];
+            Span<float> cosTable = rented != null ? rented.AsSpan(halfDim, halfDim) : stackalloc float[halfDim];
+            Span<float> sinTable = rented != null ? rented.AsSpan(halfDim * 2, halfDim) : stackalloc float[halfDim];
+
+            for (int i = 0; i < halfDim; i++)
+            {
+                float baseFreq = 1.0f / MathF.Pow(freqBase, (float)(2 * i) / effectiveRopeDim);
+                float freq = ropeFreqs != null ? (baseFreq / ropeFreqs[i]) : baseFreq;
+                invFreq[i] = freq * freqScale;
+            }
+
+            float sinSign = inverse ? -1.0f : 1.0f;
+
+            fixed (float* pInv = invFreq, pCos = cosTable, pSin = sinTable)
+            {
+                for (int pos = 0; pos < seqLen; pos++)
+                {
+                    float fPos = pos;
+                    for (int i = 0; i < halfDim; i++)
+                    {
+                        (float s, float c) = MathF.SinCos(fPos * pInv[i]);
+                        pCos[i] = c;
+                        pSin[i] = s * sinSign;
+                    }
+
+                    float* posQ = q + (long)pos * nHeadsQ * headDim;
+                    for (int h = 0; h < nHeadsQ; h++)
+                    {
+                        RotateHeadSimd(posQ + (long)h * headDim, pCos, pSin, halfDim);
+                    }
+
+                    float* posK = k + (long)pos * nHeadsKv * headDim;
+                    for (int h = 0; h < nHeadsKv; h++)
+                    {
+                        RotateHeadSimd(posK + (long)h * headDim, pCos, pSin, halfDim);
+                    }
+                }
+            }
+        }
+        finally
+        {
+            if (rented != null)
+            {
+                ArrayPool<float>.Shared.Return(rented);
+            }
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void RotateHeadSimd(float* head, float* pCos, float* pSin, int halfDim)
+    {
+        float* second = head + halfDim;
+        int i = 0;
+
+        if (Vector512.IsHardwareAccelerated && halfDim >= 16)
+        {
+            for (; i <= halfDim - 16; i += 16)
+            {
+                var v0 = Vector512.Load(head + i);
+                var v1 = Vector512.Load(second + i);
+                var c = Vector512.Load(pCos + i);
+                var s = Vector512.Load(pSin + i);
+
+                var r0 = v0 * c - v1 * s;
+                var r1 = Avx512F.IsSupported
+                    ? Avx512F.FusedMultiplyAdd(v0, s, v1 * c)
+                    : (v0 * s + v1 * c);
+
+                Vector512.Store(r0, head + i);
+                Vector512.Store(r1, second + i);
+            }
+        }
+        if (Vector256.IsHardwareAccelerated && i <= halfDim - 8)
+        {
+            for (; i <= halfDim - 8; i += 8)
+            {
+                var v0 = Vector256.Load(head + i);
+                var v1 = Vector256.Load(second + i);
+                var c = Vector256.Load(pCos + i);
+                var s = Vector256.Load(pSin + i);
+
+                var r0 = v0 * c - v1 * s;
+                var r1 = Fma.IsSupported
+                    ? Fma.MultiplyAdd(v0, s, v1 * c)
+                    : (v0 * s + v1 * c);
+
+                Vector256.Store(r0, head + i);
+                Vector256.Store(r1, second + i);
+            }
+        }
+        if (Vector128.IsHardwareAccelerated && i <= halfDim - 4)
+        {
+            for (; i <= halfDim - 4; i += 4)
+            {
+                var v0 = Vector128.Load(head + i);
+                var v1 = Vector128.Load(second + i);
+                var c = Vector128.Load(pCos + i);
+                var s = Vector128.Load(pSin + i);
+
+                var r0 = v0 * c - v1 * s;
+                var r1 = Fma.IsSupported
+                    ? Fma.MultiplyAdd(v0, s, v1 * c)
+                    : (v0 * s + v1 * c);
+
+                Vector128.Store(r0, head + i);
+                Vector128.Store(r1, second + i);
+            }
         }
 
-        fixed (float* pCos = cosTable, pSin = sinTable)
+        for (; i < halfDim; i++)
         {
-            // Rotate Q heads
-            for (int h = 0; h < nHeadsQ; h++)
-            {
-                float* head = q + h * headDim;
-                for (int i = 0; i < halfDim; i++)
-                {
-                    float c = pCos[i];
-                    float s = pSin[i];
-                    float v0 = head[i];
-                    float v1 = head[i + halfDim];
-
-                    head[i] = v0 * c - v1 * s;
-                    head[i + halfDim] = v0 * s + v1 * c;
-                }
-            }
-
-            // Rotate K heads
-            for (int h = 0; h < nHeadsKv; h++)
-            {
-                float* head = k + h * headDim;
-                for (int i = 0; i < halfDim; i++)
-                {
-                    float c = pCos[i];
-                    float s = pSin[i];
-                    float v0 = head[i];
-                    float v1 = head[i + halfDim];
-
-                    head[i] = v0 * c - v1 * s;
-                    head[i + halfDim] = v0 * s + v1 * c;
-                }
-            }
+            float c = pCos[i];
+            float s = pSin[i];
+            float v0 = head[i];
+            float v1 = second[i];
+            head[i] = v0 * c - v1 * s;
+            second[i] = v0 * s + v1 * c;
         }
     }
 }

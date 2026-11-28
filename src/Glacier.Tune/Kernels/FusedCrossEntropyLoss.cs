@@ -12,10 +12,12 @@ namespace Glacier.Tune.Kernels;
 /// Online streaming Fused Cross-Entropy Loss over large vocabularies (e.g. 152,064 tokens).
 /// Computes online Log-Sum-Exp and directly backpropagates exact unbiased dLogits into hidden-state gradients (dX)
 /// via tiled GPU VRAM or SIMD CPU transpose-GEMMs without allocating full [T x Vocab] tensors.
+/// Delegates FP32 CPU and online-softmax primitives to <c>Glacier.Tensor.Losses.FusedCrossEntropyLoss</c>
+/// when compiled against local M3.1 <c>Glacier.Tensor</c>.
 /// </summary>
 public static unsafe class FusedCrossEntropyLoss
 {
-    private const int VocabTileSize = 4096;
+    internal const int VocabTileSize = 4096;
 
     /// <summary>
     /// Computes forward-only online streaming Cross-Entropy loss without allocating or mutating gradient buffers.
@@ -46,6 +48,32 @@ public static unsafe class FusedCrossEntropyLoss
         out int validTokenCount,
         Glacier.Tune.Gpu.GpuLoraEngine? gpuEngine = null)
     {
+        ArgumentNullException.ThrowIfNull(targetTokens);
+        if (seqLen <= 0 || hiddenDim <= 0 || vocabSize <= 0)
+        {
+            validTokenCount = 0;
+            return 0.0f;
+        }
+
+        var gpu = gpuEngine;
+        bool canUseGpu = gpu != null &&
+                         gpu.LmHeadWeight != IntPtr.Zero &&
+                         gpu.SupportsForwardGemm(lmHeadType);
+
+#if GLACIER_TENSOR_LOCAL
+        if (!canUseGpu && lmHeadType == GgufType.F32)
+        {
+            return Glacier.Tensor.Losses.FusedCrossEntropyLoss.ComputeLoss(
+                finalHidden,
+                targetTokens.AsSpan(),
+                (float*)lmHeadWeight,
+                seqLen,
+                hiddenDim,
+                vocabSize,
+                out validTokenCount);
+        }
+#endif
+
         int[] validSeqIndices = new int[seqLen];
         int validCount = 0;
         for (int t = 0; t < seqLen; t++)
@@ -60,46 +88,43 @@ public static unsafe class FusedCrossEntropyLoss
         if (validCount == 0) return 0.0f;
 
         float invValid = 1.0f / validCount;
-        float* pValidHidden = (float*)NativeMemory.AlignedAlloc((nuint)((long)validCount * hiddenDim * sizeof(float)), 64);
-        int* validTargetIds = (int*)NativeMemory.Alloc((nuint)validCount, sizeof(int));
+        nuint validHiddenBytes = checked((nuint)validCount * (nuint)hiddenDim * sizeof(float));
+        float* pValidHidden = (float*)NativeMemory.AlignedAlloc(validHiddenBytes, 64);
+        int* validTargetIds = (int*)NativeMemory.Alloc(checked((nuint)validCount), sizeof(int));
 
         try
         {
+            nuint rowCopyBytes = checked((nuint)hiddenDim * sizeof(float));
             for (int i = 0; i < validCount; i++)
             {
                 int t = validSeqIndices[i];
                 validTargetIds[i] = targetTokens[t];
                 float* src = finalHidden + (long)t * hiddenDim;
                 float* dst = pValidHidden + (long)i * hiddenDim;
-                Buffer.MemoryCopy(src, dst, (ulong)(hiddenDim * sizeof(float)), (ulong)(hiddenDim * sizeof(float)));
+                Buffer.MemoryCopy(src, dst, rowCopyBytes, rowCopyBytes);
             }
 
-            var gpu = gpuEngine;
-            if (gpu != null &&
-                gpu.LmHeadWeight != IntPtr.Zero &&
-                gpu.SupportsForwardGemm(lmHeadType))
+            if (canUseGpu)
             {
-                return gpu.ComputeTiledLmHeadLoss(
+                return gpu!.ComputeTiledLmHeadLoss(
                     lmHeadType,
                     pValidHidden,
                     validTargetIds,
                     hiddenDim,
                     vocabSize,
                     validCount,
-                    VocabTileSize,
-                    &VectorizedMax,
-                    &VectorizedSumExp);
+                    VocabTileSize);
             }
 
             int actualTileSize = Math.Min(VocabTileSize, vocabSize);
             int numTiles = (vocabSize + actualTileSize - 1) / actualTileSize;
             int rowBytes = (int)GgufTypes.GetRowBytes(lmHeadType, hiddenDim);
 
-            float* pTileLogits = (float*)NativeMemory.AlignedAlloc((nuint)((long)validCount * actualTileSize * sizeof(float)), 64);
-            float* runningMax = (float*)NativeMemory.Alloc((nuint)validCount, sizeof(float));
-            int* runningArgMax = (int*)NativeMemory.Alloc((nuint)validCount, sizeof(int));
-            double* runningSumOther = (double*)NativeMemory.Alloc((nuint)validCount, sizeof(double));
-            float* targetLogits = (float*)NativeMemory.Alloc((nuint)validCount, sizeof(float));
+            float* pTileLogits = (float*)NativeMemory.AlignedAlloc(checked((nuint)validCount * (nuint)actualTileSize * sizeof(float)), 64);
+            float* runningMax = (float*)NativeMemory.Alloc(checked((nuint)validCount), sizeof(float));
+            int* runningArgMax = (int*)NativeMemory.Alloc(checked((nuint)validCount), sizeof(int));
+            double* runningSumOther = (double*)NativeMemory.Alloc(checked((nuint)validCount), sizeof(double));
+            float* targetLogits = (float*)NativeMemory.Alloc(checked((nuint)validCount), sizeof(float));
 
             try
             {
@@ -168,8 +193,36 @@ public static unsafe class FusedCrossEntropyLoss
         int vocabSize,
         Glacier.Tune.Gpu.GpuLoraEngine? gpuEngine = null)
     {
+        ArgumentNullException.ThrowIfNull(targetTokens);
+        _ = inputTokens;
+        if (seqLen <= 0 || hiddenDim <= 0 || vocabSize <= 0)
+        {
+            return 0.0f;
+        }
+
+        var gpu = gpuEngine;
+        bool canUseGpu = gpu != null &&
+                         gpu.LmHeadWeight != IntPtr.Zero &&
+                         gpu.SupportsForwardGemm(lmHeadType) &&
+                         gpu.SupportsBackwardGemm(lmHeadType);
+
+#if GLACIER_TENSOR_LOCAL
+        if (!canUseGpu && lmHeadType == GgufType.F32)
+        {
+            return Glacier.Tensor.Losses.FusedCrossEntropyLoss.ComputeLossAndGradients(
+                finalHidden,
+                targetTokens.AsSpan(),
+                (float*)lmHeadWeight,
+                dFinalHidden,
+                seqLen,
+                hiddenDim,
+                vocabSize);
+        }
+#endif
+
         // Clear hidden state gradients
-        new Span<float>(dFinalHidden, seqLen * hiddenDim).Clear();
+        long totalHiddenElems = checked((long)seqLen * hiddenDim);
+        NativeMemory.Clear(dFinalHidden, checked((nuint)totalHiddenElems * sizeof(float)));
 
         // 1. Identify valid target tokens (where target >= 0 and target < vocabSize)
         int[] validSeqIndices = new int[seqLen];
@@ -187,31 +240,29 @@ public static unsafe class FusedCrossEntropyLoss
         float invValid = 1.0f / validCount;
 
         // 2. Pack valid hidden states [validCount, hiddenDim] and valid target IDs
-        float* pValidHidden = (float*)NativeMemory.AlignedAlloc((nuint)((long)validCount * hiddenDim * sizeof(float)), 64);
-        float* pValidGrad = (float*)NativeMemory.AlignedAlloc((nuint)((long)validCount * hiddenDim * sizeof(float)), 64);
-        int* validTargetIds = (int*)NativeMemory.Alloc((nuint)validCount, sizeof(int));
+        nuint validHiddenBytes = checked((nuint)validCount * (nuint)hiddenDim * sizeof(float));
+        float* pValidHidden = (float*)NativeMemory.AlignedAlloc(validHiddenBytes, 64);
+        float* pValidGrad = (float*)NativeMemory.AlignedAlloc(validHiddenBytes, 64);
+        int* validTargetIds = (int*)NativeMemory.Alloc(checked((nuint)validCount), sizeof(int));
 
         try
         {
-            new Span<float>(pValidGrad, validCount * hiddenDim).Clear();
+            NativeMemory.Clear(pValidGrad, validHiddenBytes);
 
+            nuint rowCopyBytes = checked((nuint)hiddenDim * sizeof(float));
             for (int i = 0; i < validCount; i++)
             {
                 int t = validSeqIndices[i];
                 validTargetIds[i] = targetTokens[t];
                 float* src = finalHidden + (long)t * hiddenDim;
                 float* dst = pValidHidden + (long)i * hiddenDim;
-                Buffer.MemoryCopy(src, dst, (ulong)(hiddenDim * sizeof(float)), (ulong)(hiddenDim * sizeof(float)));
+                Buffer.MemoryCopy(src, dst, rowCopyBytes, rowCopyBytes);
             }
 
-            // 3. Tiled GPU VRAM execution branch (bounded < 16 MB tile logit memory, zero CPU dequantization)
-            var gpu = gpuEngine;
-            if (gpu != null &&
-                gpu.LmHeadWeight != IntPtr.Zero &&
-                gpu.SupportsForwardGemm(lmHeadType) &&
-                gpu.SupportsBackwardGemm(lmHeadType))
+            // 3. Tiled GPU VRAM execution branch (bounded tile logit memory, zero CPU logit downloads)
+            if (canUseGpu)
             {
-                float gpuLoss = gpu.ComputeTiledLmHeadLossAndGradients(
+                float gpuLoss = gpu!.ComputeTiledLmHeadLossAndGradients(
                     lmHeadType,
                     pValidHidden,
                     pValidGrad,
@@ -219,9 +270,7 @@ public static unsafe class FusedCrossEntropyLoss
                     hiddenDim,
                     vocabSize,
                     validCount,
-                    VocabTileSize,
-                    &VectorizedMax,
-                    &VectorizedSumExp);
+                    VocabTileSize);
 
                 ScatterValidGradients(pValidGrad, dFinalHidden, validSeqIndices, validCount, hiddenDim);
                 return gpuLoss;
@@ -232,12 +281,12 @@ public static unsafe class FusedCrossEntropyLoss
             int numTiles = (vocabSize + actualTileSize - 1) / actualTileSize;
             int rowBytes = (int)GgufTypes.GetRowBytes(lmHeadType, hiddenDim);
 
-            float* pTileLogits = (float*)NativeMemory.AlignedAlloc((nuint)((long)validCount * actualTileSize * sizeof(float)), 64);
-            float* runningMax = (float*)NativeMemory.Alloc((nuint)validCount, sizeof(float));
-            int* runningArgMax = (int*)NativeMemory.Alloc((nuint)validCount, sizeof(int));
-            double* runningSumOther = (double*)NativeMemory.Alloc((nuint)validCount, sizeof(double));
-            float* targetLogits = (float*)NativeMemory.Alloc((nuint)validCount, sizeof(float));
-            double* invDenom = (double*)NativeMemory.Alloc((nuint)validCount, sizeof(double));
+            float* pTileLogits = (float*)NativeMemory.AlignedAlloc(checked((nuint)validCount * (nuint)actualTileSize * sizeof(float)), 64);
+            float* runningMax = (float*)NativeMemory.Alloc(checked((nuint)validCount), sizeof(float));
+            int* runningArgMax = (int*)NativeMemory.Alloc(checked((nuint)validCount), sizeof(int));
+            double* runningSumOther = (double*)NativeMemory.Alloc(checked((nuint)validCount), sizeof(double));
+            float* targetLogits = (float*)NativeMemory.Alloc(checked((nuint)validCount), sizeof(float));
+            double* invDenom = (double*)NativeMemory.Alloc(checked((nuint)validCount), sizeof(double));
 
             try
             {
@@ -352,8 +401,55 @@ public static unsafe class FusedCrossEntropyLoss
         }
     }
 
+#if GLACIER_TENSOR_LOCAL
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static double Log1p(double x) => Glacier.Tensor.Losses.FusedCrossEntropyLoss.Log1p(x);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static float VectorizedMax(float* data, int count) => Glacier.Tensor.Losses.FusedCrossEntropyLoss.VectorizedMax(data, count);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static double VectorizedSumExp(float* data, int count, float maxVal) => Glacier.Tensor.Losses.FusedCrossEntropyLoss.VectorizedSumExp(data, count, maxVal);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static void UpdateOnlineTileStats(
+        float* logits,
+        int vStart,
+        int vCount,
+        ref float runningMax,
+        ref int runningArgMax,
+        ref double runningSumOther)
+        => Glacier.Tensor.Losses.FusedCrossEntropyLoss.UpdateOnlineTileStats(logits, vStart, vCount, ref runningMax, ref runningArgMax, ref runningSumOther);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static double SumExpExcluding(float* data, int count, float maxVal, int excludeLocalIdx)
+        => Glacier.Tensor.Losses.FusedCrossEntropyLoss.SumExpExcluding(data, count, maxVal, excludeLocalIdx);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static void WriteTiledSoftmaxCrossEntropyGradients(
+        float* logits,
+        int vStart,
+        int vCount,
+        int targetId,
+        float maxLogit,
+        int globalArgMax,
+        double sumOther,
+        double invDenom,
+        float invValid)
+        => Glacier.Tensor.Losses.FusedCrossEntropyLoss.WriteTiledSoftmaxCrossEntropyGradients(
+            logits, vStart, vCount, targetId, maxLogit, globalArgMax, sumOther, invDenom, invValid);
+#else
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static double Log1p(double x)
+    {
+        if (x == 0.0) return 0.0;
+        double u = 1.0 + x;
+        if (u == 1.0) return x;
+        return Math.Log(u) * (x / (u - 1.0));
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
-    private static float VectorizedMax(float* data, int count)
+    internal static float VectorizedMax(float* data, int count)
     {
         int i = 0;
         float maxVal = float.NegativeInfinity;
@@ -371,7 +467,7 @@ public static unsafe class FusedCrossEntropyLoss
                 if (vMax[k] > maxVal) maxVal = vMax[k];
             }
         }
-        else if (Vector256.IsHardwareAccelerated && count >= Vector256<float>.Count)
+        if (Vector256.IsHardwareAccelerated && count - i >= Vector256<float>.Count)
         {
             var vMax = Vector256.Create(float.NegativeInfinity);
             int step = Vector256<float>.Count;
@@ -385,7 +481,7 @@ public static unsafe class FusedCrossEntropyLoss
                 if (vMax[k] > maxVal) maxVal = vMax[k];
             }
         }
-        else if (Vector128.IsHardwareAccelerated && count >= Vector128<float>.Count)
+        if (Vector128.IsHardwareAccelerated && count - i >= Vector128<float>.Count)
         {
             var vMax = Vector128.Create(float.NegativeInfinity);
             int step = Vector128<float>.Count;
@@ -404,15 +500,6 @@ public static unsafe class FusedCrossEntropyLoss
             if (data[i] > maxVal) maxVal = data[i];
         }
         return maxVal;
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal static double Log1p(double x)
-    {
-        if (x == 0.0) return 0.0;
-        double u = 1.0 + x;
-        if (u == 1.0) return x;
-        return Math.Log(u) * (x / (u - 1.0));
     }
 
     internal static void UpdateOnlineTileStats(
@@ -457,16 +544,16 @@ public static unsafe class FusedCrossEntropyLoss
 
     internal static double SumExpExcluding(float* data, int count, float maxVal, int excludeLocalIdx)
     {
-        if (float.IsNegativeInfinity(maxVal))
+        if (float.IsNegativeInfinity(maxVal) || count <= 0)
             return 0.0;
 
-        double sum = 0.0;
-        for (int i = 0; i < count; i++)
-        {
-            if (i != excludeLocalIdx)
-                sum += Math.Exp((double)data[i] - maxVal);
-        }
-        return sum;
+        if (excludeLocalIdx < 0 || excludeLocalIdx >= count)
+            return VectorizedSumExp(data, count, maxVal);
+
+        double left = excludeLocalIdx > 0 ? VectorizedSumExp(data, excludeLocalIdx, maxVal) : 0.0;
+        int rightCount = count - excludeLocalIdx - 1;
+        double right = rightCount > 0 ? VectorizedSumExp(data + excludeLocalIdx + 1, rightCount, maxVal) : 0.0;
+        return left + right;
     }
 
     internal static void WriteTiledSoftmaxCrossEntropyGradients(
@@ -480,28 +567,129 @@ public static unsafe class FusedCrossEntropyLoss
         double invDenom,
         float invValid)
     {
-        for (int v = 0; v < vCount; v++)
+        float scale = (float)(invDenom * invValid);
+        int v = 0;
+
+        if (Vector512.IsHardwareAccelerated && vCount >= Vector512<float>.Count)
         {
-            int vGlobal = vStart + v;
-            if (vGlobal == targetId && vGlobal == globalArgMax)
-                logits[v] = (float)(-sumOther * invDenom * invValid);
-            else if (vGlobal == targetId)
-                logits[v] = (float)((Math.Exp((double)logits[v] - maxLogit) * invDenom - 1.0) * invValid);
-            else if (vGlobal == globalArgMax)
-                logits[v] = (float)(invDenom * invValid);
-            else
-                logits[v] = (float)(Math.Exp((double)logits[v] - maxLogit) * invDenom * invValid);
+            var vMax = Vector512.Create(maxLogit);
+            var vScale = Vector512.Create(scale);
+            int step = Vector512<float>.Count;
+            int limit = vCount - step;
+            for (; v <= limit; v += step)
+            {
+                var exp = TuneSimdMath.FastExpNonPositiveAvx512(Vector512.Subtract(Vector512.Load(logits + v), vMax));
+                Vector512.Multiply(exp, vScale).Store(logits + v);
+            }
+        }
+        if (Vector256.IsHardwareAccelerated && vCount - v >= Vector256<float>.Count)
+        {
+            var vMax = Vector256.Create(maxLogit);
+            var vScale = Vector256.Create(scale);
+            int step = Vector256<float>.Count;
+            int limit = vCount - step;
+            for (; v <= limit; v += step)
+            {
+                var exp = TuneSimdMath.FastExpNonPositiveAvx2(Vector256.Subtract(Vector256.Load(logits + v), vMax));
+                Vector256.Multiply(exp, vScale).Store(logits + v);
+            }
+        }
+        if (Vector128.IsHardwareAccelerated && vCount - v >= Vector128<float>.Count)
+        {
+            var vMax = Vector128.Create(maxLogit);
+            var vScale = Vector128.Create(scale);
+            int step = Vector128<float>.Count;
+            int limit = vCount - step;
+            for (; v <= limit; v += step)
+            {
+                var exp = TuneSimdMath.FastExpNonPositiveAdvSimd(Vector128.Subtract(Vector128.Load(logits + v), vMax));
+                Vector128.Multiply(exp, vScale).Store(logits + v);
+            }
+        }
+
+        for (; v < vCount; v++)
+        {
+            logits[v] = (float)(Math.Exp((double)logits[v] - maxLogit) * invDenom * invValid);
+        }
+
+        int localArgMax = globalArgMax - vStart;
+        if ((uint)localArgMax < (uint)vCount)
+        {
+            logits[localArgMax] = (globalArgMax == targetId)
+                ? (float)(-sumOther * invDenom * invValid)
+                : (float)(invDenom * invValid);
+        }
+
+        int localTarget = targetId - vStart;
+        if ((uint)localTarget < (uint)vCount && localTarget != localArgMax)
+        {
+            logits[localTarget] -= invValid;
         }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
-    private static double VectorizedSumExp(float* data, int count, float maxVal)
+    internal static double VectorizedSumExp(float* data, int count, float maxVal)
     {
+        if (float.IsNegativeInfinity(maxVal) || count <= 0)
+            return 0.0;
+
+        int i = 0;
         double sum = 0.0;
-        for (int i = 0; i < count; i++)
+
+        if (Vector512.IsHardwareAccelerated && count >= Vector512<float>.Count)
         {
-            sum += MathF.Exp(data[i] - maxVal);
+            var vMax = Vector512.Create(maxVal);
+            var accLo = Vector512<double>.Zero;
+            var accHi = Vector512<double>.Zero;
+            int step = Vector512<float>.Count;
+            int limit = count - step;
+            for (; i <= limit; i += step)
+            {
+                var exp = TuneSimdMath.FastExpNonPositiveAvx512(Vector512.Subtract(Vector512.Load(data + i), vMax));
+                var (lo, hi) = Vector512.Widen(exp);
+                accLo += lo;
+                accHi += hi;
+            }
+            sum += Vector512.Sum(accLo + accHi);
+        }
+        if (Vector256.IsHardwareAccelerated && count - i >= Vector256<float>.Count)
+        {
+            var vMax = Vector256.Create(maxVal);
+            var accLo = Vector256<double>.Zero;
+            var accHi = Vector256<double>.Zero;
+            int step = Vector256<float>.Count;
+            int limit = count - step;
+            for (; i <= limit; i += step)
+            {
+                var exp = TuneSimdMath.FastExpNonPositiveAvx2(Vector256.Subtract(Vector256.Load(data + i), vMax));
+                var (lo, hi) = Vector256.Widen(exp);
+                accLo += lo;
+                accHi += hi;
+            }
+            sum += Vector256.Sum(accLo + accHi);
+        }
+        if (Vector128.IsHardwareAccelerated && count - i >= Vector128<float>.Count)
+        {
+            var vMax = Vector128.Create(maxVal);
+            var accLo = Vector128<double>.Zero;
+            var accHi = Vector128<double>.Zero;
+            int step = Vector128<float>.Count;
+            int limit = count - step;
+            for (; i <= limit; i += step)
+            {
+                var exp = TuneSimdMath.FastExpNonPositiveAdvSimd(Vector128.Subtract(Vector128.Load(data + i), vMax));
+                var (lo, hi) = Vector128.Widen(exp);
+                accLo += lo;
+                accHi += hi;
+            }
+            sum += Vector128.Sum(accLo + accHi);
+        }
+
+        for (; i < count; i++)
+        {
+            sum += Math.Exp((double)data[i] - maxVal);
         }
         return sum;
     }
+#endif
 }

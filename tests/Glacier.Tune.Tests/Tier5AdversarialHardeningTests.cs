@@ -40,7 +40,9 @@ public sealed class Tier5AdversarialHardeningTests
             float norm = trainer.ClipGradients(1.0f);
 
             Assert.True(float.IsFinite(norm) || norm > 1e19f);
-            Assert.True(model.TrainableParameters[0].Grad.AsSpan()[0] > 0f,
+            var grad = model.TrainableParameters[0].Grad;
+            Assert.NotNull(grad);
+            Assert.True(grad.AsSpan()[0] > 0f,
                 "Huge finite gradient was zeroed out due to (float)totalNormSq overflow.");
         }
         finally
@@ -126,6 +128,11 @@ public sealed class Tier5AdversarialHardeningTests
                 "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":\"zzzzzzzzzz\"}]}\n" +
                 "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":\"zzzzzzzzzz\"}]}\n");
             var ds2 = ChatMlDataset.FromFile(t2, model.Tokenizer, 64);
+
+            // Remove Phase 1 optimizer momentum so Phase 2 immediately steps toward the contradicting ds2 ("zzzzzzzzzz")
+            // distribution rather than riding Phase 1's residual "yes" momentum to a lower ev1 loss on step 5.
+            string optStatePath = Path.Combine(outDir, "optimizer_state.bin");
+            if (File.Exists(optStatePath)) File.Delete(optStatePath);
 
             using var trainer2 = new LoraTrainer(model, new TrainingArguments
             {

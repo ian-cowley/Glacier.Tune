@@ -26,14 +26,14 @@ public sealed class LoraTrainer : IDisposable
 {
     private readonly GgufLoraModel _model;
     private readonly TrainingArguments _args;
-    private readonly AdamW _optimizer;
+    private readonly StatefulAdamW _optimizer;
     private int _startingStep;
     private float? _resumedLearningRate;
     private bool _disposed;
 
     public GgufLoraModel Model => _model;
     public TrainingArguments Args => _args;
-    public AdamW Optimizer => _optimizer;
+    public StatefulAdamW Optimizer => _optimizer;
     public float? BestValidationLoss { get; private set; }
     public float? LastValidationLoss { get; private set; }
 
@@ -53,7 +53,7 @@ public sealed class LoraTrainer : IDisposable
     {
         _model = model;
         _args = args;
-        _optimizer = new AdamW(
+        _optimizer = new StatefulAdamW(
             _model.TrainableParameters,
             lr: _args.LearningRate,
             beta1: _args.Beta1,
@@ -62,16 +62,43 @@ public sealed class LoraTrainer : IDisposable
             weightDecay: _args.WeightDecay);
     }
 
+    internal static string GetOptimizerStatePath(string adapterPath)
+    {
+        if (adapterPath.EndsWith(".bin", StringComparison.OrdinalIgnoreCase))
+        {
+            return Path.ChangeExtension(adapterPath, ".opt");
+        }
+        return Path.Combine(adapterPath, "optimizer_state.bin");
+    }
+
     /// <summary>
     /// Resumes training from an existing saved LoRA adapter checkpoint, optionally
-    /// annealing the base learning rate and setting the initial step offset.
+    /// restoring optimizer moments, annealing the learning rate, and setting the initial step offset.
     /// </summary>
     public void ResumeFromCheckpoint(string adapterFilePath, float? annealedLearningRate = null, int startingStep = 0)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         GlacierDiagnostics.LogInformation($"[RESUME] Loading adapter checkpoint from {adapterFilePath}...");
         _model.LoadAdapter(adapterFilePath);
-        _startingStep = Math.Max(0, startingStep);
+
+        string optPath = GetOptimizerStatePath(adapterFilePath);
+        if (!File.Exists(optPath) && adapterFilePath.EndsWith(".bin", StringComparison.OrdinalIgnoreCase))
+        {
+            string? dir = Path.GetDirectoryName(adapterFilePath);
+            if (!string.IsNullOrEmpty(dir))
+            {
+                string dirOpt = Path.Combine(dir, "optimizer_state.bin");
+                if (File.Exists(dirOpt)) optPath = dirOpt;
+            }
+        }
+
+        if (File.Exists(optPath))
+        {
+            _optimizer.LoadState(optPath);
+            GlacierDiagnostics.LogInformation($"[RESUME] Restored AdamW optimizer state from {optPath} (step={_optimizer.StepCount}).");
+        }
+
+        _startingStep = Math.Max(0, startingStep > 0 ? startingStep : _optimizer.StepCount);
         if (annealedLearningRate.HasValue)
         {
             _resumedLearningRate = annealedLearningRate.Value;
@@ -158,7 +185,8 @@ public sealed class LoraTrainer : IDisposable
         GlacierDiagnostics.LogInformation("================================================================================");
 
         var (trainable, total, pct) = _model.GetParameterStats();
-        GlacierDiagnostics.LogInformation($"  Compute Device/Target: {_model.Target} (Hardware Accelerated)");
+        string accelDesc = _model.IsGpuAccelerated ? "GPU VRAM Accelerated" : "CPU SIMD Accelerated";
+        GlacierDiagnostics.LogInformation($"  Compute Device/Target: {_model.Target} ({accelDesc})");
         GlacierDiagnostics.LogInformation($"  Base Model Layers:    {_model.LayerCount} ({_model.HiddenDim} dim, {_model.FfnDim} ffn)");
         GlacierDiagnostics.LogInformation($"  Base Model Params:    {total:N0} parameters (FROZEN in unmanaged memory)");
         GlacierDiagnostics.LogInformation($"  Trainable Parameters: {trainable:N0} ({pct:F2}% trainable - {100.0 - pct:F2}% parameter reduction)");
@@ -263,7 +291,8 @@ public sealed class LoraTrainer : IDisposable
                     {
                         string checkpointDir = Path.Combine(_args.OutputDir, $"checkpoint-{globalStep}");
                         _model.SaveAdapter(checkpointDir);
-                        GlacierDiagnostics.LogInformation($"[CHECKPOINT] Saved intermediate LoRA checkpoint to {checkpointDir}");
+                        _optimizer.SaveState(GetOptimizerStatePath(checkpointDir));
+                        GlacierDiagnostics.LogInformation($"[CHECKPOINT] Saved intermediate LoRA checkpoint + optimizer state to {checkpointDir}");
                     }
 
                     if (evalDataset != null && evalDataset.Count > 0 && _args.EvalSteps > 0 && globalStep % _args.EvalSteps == 0)
@@ -277,6 +306,7 @@ public sealed class LoraTrainer : IDisposable
                                 bestValLoss = valLoss;
                                 BestValidationLoss = valLoss;
                                 _model.SaveAdapter(bestPath);
+                                _optimizer.SaveState(GetOptimizerStatePath(bestPath));
                                 File.WriteAllText(bestLossPath, valLoss.ToString("R", System.Globalization.CultureInfo.InvariantCulture));
                                 GlacierDiagnostics.LogInformation($"[EVAL] Step {globalStep}: ValLoss={valLoss:F4} (new best -> {bestPath})");
                             }
@@ -308,10 +338,11 @@ public sealed class LoraTrainer : IDisposable
 
         GlacierDiagnostics.LogInformation($"\n[SUCCESS] Fine-tuning completed in {swTotal.Elapsed.TotalMinutes:F2} minutes ({swTotal.Elapsed.TotalSeconds:F1} seconds)!");
 
-        // Save adapters to output directory
+        // Save adapters & optimizer state to output directory
         GlacierDiagnostics.LogInformation($"[*] Exporting LoRA adapter weights to {_args.OutputDir}...");
         _model.SaveAdapter(_args.OutputDir);
-        GlacierDiagnostics.LogInformation("[SUCCESS] Model adapter saved successfully.");
+        _optimizer.SaveState(GetOptimizerStatePath(_args.OutputDir));
+        GlacierDiagnostics.LogInformation("[SUCCESS] Model adapter and optimizer state saved successfully.");
     }
 
     /// <summary>
@@ -352,28 +383,7 @@ public sealed class LoraTrainer : IDisposable
     public void ScaleAccumulatedGradients(float scale)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        if (scale == 1.0f) return;
-
-        foreach (var p in _model.TrainableParameters)
-        {
-            if (p.Grad == null) continue;
-            var gradSpan = p.Grad.AsSpan();
-            int n = gradSpan.Length;
-            int i = 0;
-            if (Vector256.IsHardwareAccelerated && n >= 8)
-            {
-                var vScale = Vector256.Create(scale);
-                for (; i <= n - 8; i += 8)
-                {
-                    var vG = Vector256.LoadUnsafe(ref gradSpan[i]);
-                    Vector256.StoreUnsafe(Vector256.Multiply(vG, vScale), ref gradSpan[i]);
-                }
-            }
-            for (; i < n; i++)
-            {
-                gradSpan[i] *= scale;
-            }
-        }
+        StatefulAdamW.ScaleGradients(_model.TrainableParameters, scale);
     }
 
     public static float ComputeCosineLr(int currentStep, int totalSteps, float baseLr, float warmupRatio, float minLr = 0f)
@@ -395,41 +405,7 @@ public sealed class LoraTrainer : IDisposable
     public float ClipGradients(float maxNorm)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        if (maxNorm <= 0f) return 0f;
-
-        double totalNormSq = 0.0;
-        foreach (var p in _model.TrainableParameters)
-        {
-            if (p.Grad == null) continue;
-            var gradSpan = p.Grad.AsSpan();
-            int n = gradSpan.Length;
-
-            double sumSq = 0.0;
-            for (int i = 0; i < n; i++)
-            {
-                double g = gradSpan[i];
-                sumSq += g * g;
-            }
-            totalNormSq += sumSq;
-        }
-
-        double totalNormD = Math.Sqrt(totalNormSq);
-        if (!double.IsFinite(totalNormD))
-        {
-            foreach (var p in _model.TrainableParameters)
-            {
-                p.Grad?.AsSpan().Clear();
-            }
-            return 0f;
-        }
-
-        if (totalNormD > maxNorm)
-        {
-            float scale = (float)(maxNorm / (totalNormD + 1e-6));
-            ScaleAccumulatedGradients(scale);
-        }
-
-        return (float)Math.Min(totalNormD, float.MaxValue);
+        return StatefulAdamW.ClipGradients(_model.TrainableParameters, maxNorm);
     }
 
     public void Dispose()

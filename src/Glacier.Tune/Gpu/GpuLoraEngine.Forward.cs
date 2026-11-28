@@ -398,6 +398,134 @@ public sealed unsafe partial class GpuLoraEngine
         }
     }
 
+    private static int AttnTileBc(int headDim) =>
+        headDim <= 128 ? 32 : (headDim <= 256 ? 16 : (headDim <= 512 ? 8 : 4));
+
+    public void LaunchRmsNormBatch(IntPtr dX, IntPtr dWeight, IntPtr dDst, int batchSize, int size, float eps)
+    {
+        uint blockSize = 256;
+        uint gridX = (uint)batchSize;
+
+        void** pArgs = stackalloc void*[5];
+        pArgs[0] = &dX;
+        pArgs[1] = &dWeight;
+        pArgs[2] = &dDst;
+        pArgs[3] = &size;
+        pArgs[4] = &eps;
+
+        CuDriver.CtxSetCurrent(_gpu.Handle);
+        CuDriver.Check(CuDriver.LaunchKernel(
+            _fnRmsNormBatch,
+            gridX, 1, 1,
+            blockSize, 1, 1,
+            0, IntPtr.Zero,
+            (IntPtr)pArgs,
+            IntPtr.Zero), "LaunchKernel(rms_norm_batch)");
+    }
+
+    public void LaunchResAddOut(IntPtr dDst, IntPtr dA, IntPtr dB, int totalElements)
+    {
+        if (totalElements <= 0) return;
+        uint blockSize = 256;
+        uint gridX = (uint)((totalElements + 255) / 256);
+
+        void** pArgs = stackalloc void*[4];
+        pArgs[0] = &dDst;
+        pArgs[1] = &dA;
+        pArgs[2] = &dB;
+        pArgs[3] = &totalElements;
+
+        CuDriver.CtxSetCurrent(_gpu.Handle);
+        CuDriver.Check(CuDriver.LaunchKernel(
+            _fnResAddOut,
+            gridX, 1, 1,
+            blockSize, 1, 1,
+            0, IntPtr.Zero,
+            (IntPtr)pArgs,
+            IntPtr.Zero), "LaunchKernel(tune_res_add_out)");
+    }
+
+    public void LaunchScaleBuf(IntPtr dBuf, float scale, int totalElements)
+    {
+        if (totalElements <= 0) return;
+        uint blockSize = 256;
+        uint gridX = (uint)((totalElements + 255) / 256);
+
+        void** pArgs = stackalloc void*[3];
+        pArgs[0] = &dBuf;
+        pArgs[1] = &scale;
+        pArgs[2] = &totalElements;
+
+        CuDriver.CtxSetCurrent(_gpu.Handle);
+        CuDriver.Check(CuDriver.LaunchKernel(
+            _fnScaleBuf,
+            gridX, 1, 1,
+            blockSize, 1, 1,
+            0, IntPtr.Zero,
+            (IntPtr)pArgs,
+            IntPtr.Zero), "LaunchKernel(tune_scale_buf)");
+    }
+
+    public void LaunchLoraForward(LoraAdapter adapter, IntPtr dX, IntPtr dY, int seqLen)
+    {
+        if (!adapter.IsEnabled || adapter.IsZeroDelta) return;
+
+        int inFeatures = adapter.InFeatures;
+        int outFeatures = adapter.OutFeatures;
+        int rank = adapter.Rank;
+        float scaling = adapter.Scaling;
+
+        lock (_scratchLock)
+        {
+            if (!_loraBuffers.TryGetValue(adapter, out var state))
+            {
+                BeginResidentStep([adapter]);
+                state = _loraBuffers[adapter];
+            }
+
+            EnsureLoraTempCapacity(seqLen, rank);
+            IntPtr dA = state.DA;
+            IntPtr dB = state.DB;
+            IntPtr dLr = _dLoraTemp;
+
+            CuDriver.CtxSetCurrent(_gpu.Handle);
+
+            void** pProjArgs = stackalloc void*[6];
+            pProjArgs[0] = &dX;
+            pProjArgs[1] = &dA;
+            pProjArgs[2] = &dLr;
+            pProjArgs[3] = &seqLen;
+            pProjArgs[4] = &inFeatures;
+            pProjArgs[5] = &rank;
+
+            CuDriver.Check(CuDriver.LaunchKernel(
+                _fnLoraProjLr,
+                (uint)rank, (uint)seqLen, 1,
+                256, 1, 1,
+                0, IntPtr.Zero,
+                (IntPtr)pProjArgs,
+                IntPtr.Zero), "LaunchKernel(tune_lora_proj_lr)");
+
+            void** pAddArgs = stackalloc void*[7];
+            pAddArgs[0] = &dY;
+            pAddArgs[1] = &dLr;
+            pAddArgs[2] = &dB;
+            pAddArgs[3] = &seqLen;
+            pAddArgs[4] = &outFeatures;
+            pAddArgs[5] = &rank;
+            pAddArgs[6] = &scaling;
+
+            uint gridX = (uint)((outFeatures + 255) / 256);
+            CuDriver.Check(CuDriver.LaunchKernel(
+                _fnLoraAddB,
+                gridX, (uint)seqLen, 1,
+                256, 1, 1,
+                0, IntPtr.Zero,
+                (IntPtr)pAddArgs,
+                IntPtr.Zero), "LaunchKernel(tune_lora_add_b)");
+        }
+    }
+
     public void LaunchRopeBatch(IntPtr dQ, IntPtr dK, int nHeadsQ, int nHeadsKv, int headDim, int seqLen, float freqBase, float freqScale = 1.0f)
     {
         int halfDim = headDim / 2;
@@ -431,7 +559,7 @@ public sealed unsafe partial class GpuLoraEngine
     }
 
     public void LaunchAttnTrainFwd(
-        IntPtr dQ, IntPtr dK, IntPtr dV, IntPtr dAttnOut, IntPtr dProbs,
+        IntPtr dQ, IntPtr dK, IntPtr dV, IntPtr dAttnOut, IntPtr dLseOut,
         int seqLen, int nHeadsQ, int nHeadsKv, int headDim, float scale)
     {
         if (headDim <= 0 || headDim > 1024)
@@ -440,14 +568,15 @@ public sealed unsafe partial class GpuLoraEngine
         uint blockSize = (uint)(((headDim + 31) / 32) * 32);
         uint gridX = (uint)nHeadsQ;
         uint gridY = (uint)seqLen;
-        uint sharedMemBytes = dProbs != IntPtr.Zero ? (uint)(seqLen * sizeof(float)) : 0u;
+        int bc = AttnTileBc(headDim);
+        uint sharedMemBytes = (uint)(2 * bc * headDim * sizeof(float));
 
         void** pArgs = stackalloc void*[10];
         pArgs[0] = &dQ;
         pArgs[1] = &dK;
         pArgs[2] = &dV;
         pArgs[3] = &dAttnOut;
-        pArgs[4] = &dProbs;
+        pArgs[4] = &dLseOut;
         pArgs[5] = &seqLen;
         pArgs[6] = &nHeadsQ;
         pArgs[7] = &nHeadsKv;
@@ -470,7 +599,7 @@ public sealed unsafe partial class GpuLoraEngine
         Tensor<float> k,
         Tensor<float> v,
         Tensor<float> attnOut,
-        Tensor<float>? attnProbs,
+        Tensor<float>? attnLse,
         int seqLen,
         int nHeadsQ,
         int nHeadsKv,
@@ -493,20 +622,20 @@ public sealed unsafe partial class GpuLoraEngine
 
             LaunchRopeBatch(_dQBuf, _dKBuf, nHeadsQ, nHeadsKv, headDim, seqLen, ropeFreqBase, 1.0f);
 
-            if (attnProbs != null)
+            if (attnLse != null)
             {
                 _gpu.CopyToHost((IntPtr)q.DataPointer, _dQBuf, qBytes);
                 _gpu.CopyToHost((IntPtr)k.DataPointer, _dKBuf, kvBytes);
             }
 
-            IntPtr dProbs = attnProbs != null ? _dAttnProbs : IntPtr.Zero;
-            LaunchAttnTrainFwd(_dQBuf, _dKBuf, _dVBuf, _dAttnOut, dProbs, seqLen, nHeadsQ, nHeadsKv, headDim, scale);
+            IntPtr dLse = attnLse != null ? _dAttnLse : IntPtr.Zero;
+            LaunchAttnTrainFwd(_dQBuf, _dKBuf, _dVBuf, _dAttnOut, dLse, seqLen, nHeadsQ, nHeadsKv, headDim, scale);
 
             _gpu.CopyToHost((IntPtr)attnOut.DataPointer, _dAttnOut, qBytes);
-            if (attnProbs != null)
+            if (attnLse != null)
             {
-                nuint probsBytes = (nuint)((long)nHeadsQ * seqLen * seqLen * sizeof(float));
-                _gpu.CopyToHost((IntPtr)attnProbs.DataPointer, _dAttnProbs, probsBytes);
+                nuint lseBytes = (nuint)((long)nHeadsQ * seqLen * sizeof(float));
+                _gpu.CopyToHost((IntPtr)attnLse.DataPointer, _dAttnLse, lseBytes);
             }
         }
     }

@@ -449,63 +449,56 @@ public sealed unsafe class GdnBlock : ITuneBlock
         float* pSsmA = _weights.SsmAWeight;
         float* pDtBias = _weights.SsmDtBias;
 
+        var gdnWs = GdnScratchWorkspace.GetOrCreateForForward(_ssmHeads, _stateDim);
+
         Parallel.For(0, _ssmHeads, h =>
         {
             int g = h % _groupCount;
             float aLog = pSsmA != null ? pSsmA[h] : 0f;
             float dtBias = pDtBias != null ? pDtBias[h] : 0f;
-            nuint stateBytes = (nuint)((long)_stateDim * _stateDim * sizeof(float));
-            float* sMat = (float*)NativeMemory.AllocZeroed((nuint)(_stateDim * _stateDim), sizeof(float));
-            float* delta = (float*)NativeMemory.Alloc((nuint)_stateDim, sizeof(float));
-            try
+            gdnWs.GetForwardHeadScratch(h, _stateDim, out float* sMat, out float* delta);
+
+            for (int t = 0; t < seqLen; t++)
             {
-                for (int t = 0; t < seqLen; t++)
+                float aVal = pAlpha[(long)t * _ssmHeads + h] + dtBias;
+                float dt = aVal > 20.0f ? aVal : MathF.Log(1.0f + MathF.Exp(aVal));
+                float decay = MathF.Exp(aLog * dt);
+                float beta = 1.0f / (1.0f + MathF.Exp(-pBetaRaw[(long)t * _ssmHeads + h]));
+
+                if (pDecay != null) pDecay[(long)t * _ssmHeads + h] = decay;
+                if (pBeta != null) pBeta[(long)t * _ssmHeads + h] = beta;
+
+                float* qHead = pQNorm + ((long)t * _groupCount + g) * _stateDim;
+                float* kHead = pKNorm + ((long)t * _groupCount + g) * _stateDim;
+                float* vHead = pV + ((long)t * _ssmHeads + h) * _stateDim;
+                float* yHead = pYRec + ((long)t * _ssmHeads + h) * _stateDim;
+
+                for (int i = 0; i < _stateDim; i++)
                 {
-                    float aVal = pAlpha[(long)t * _ssmHeads + h] + dtBias;
-                    float dt = aVal > 20.0f ? aVal : MathF.Log(1.0f + MathF.Exp(aVal));
-                    float decay = MathF.Exp(aLog * dt);
-                    float beta = 1.0f / (1.0f + MathF.Exp(-pBetaRaw[(long)t * _ssmHeads + h]));
-
-                    if (pDecay != null) pDecay[(long)t * _ssmHeads + h] = decay;
-                    if (pBeta != null) pBeta[(long)t * _ssmHeads + h] = beta;
-
-                    float* qHead = pQNorm + ((long)t * _groupCount + g) * _stateDim;
-                    float* kHead = pKNorm + ((long)t * _groupCount + g) * _stateDim;
-                    float* vHead = pV + ((long)t * _ssmHeads + h) * _stateDim;
-                    float* yHead = pYRec + ((long)t * _ssmHeads + h) * _stateDim;
-
-                    for (int i = 0; i < _stateDim; i++)
+                    float* sRow = sMat + (long)i * _stateDim;
+                    float kvMem = 0f;
+                    for (int j = 0; j < _stateDim; j++)
                     {
-                        float* sRow = sMat + (long)i * _stateDim;
-                        float kvMem = 0f;
-                        for (int j = 0; j < _stateDim; j++)
-                        {
-                            float decayed = sRow[j] * decay;
-                            sRow[j] = decayed;
-                            kvMem += decayed * kHead[j];
-                        }
-                        delta[i] = (vHead[i] - kvMem) * beta;
+                        float decayed = sRow[j] * decay;
+                        sRow[j] = decayed;
+                        kvMem += decayed * kHead[j];
                     }
-
-                    for (int i = 0; i < _stateDim; i++)
-                    {
-                        float* sRow = sMat + (long)i * _stateDim;
-                        float dVal = delta[i];
-                        float dot = 0f;
-                        for (int j = 0; j < _stateDim; j++)
-                        {
-                            float updated = sRow[j] + dVal * kHead[j];
-                            sRow[j] = updated;
-                            dot += updated * qHead[j];
-                        }
-                        yHead[i] = dot;
-                    }
+                    delta[i] = (vHead[i] - kvMem) * beta;
                 }
-            }
-            finally
-            {
-                NativeMemory.Free(sMat);
-                NativeMemory.Free(delta);
+
+                for (int i = 0; i < _stateDim; i++)
+                {
+                    float* sRow = sMat + (long)i * _stateDim;
+                    float dVal = delta[i];
+                    float dot = 0f;
+                    for (int j = 0; j < _stateDim; j++)
+                    {
+                        float updated = sRow[j] + dVal * kHead[j];
+                        sRow[j] = updated;
+                        dot += updated * qHead[j];
+                    }
+                    yHead[i] = dot;
+                }
             }
         });
 
@@ -688,15 +681,34 @@ public sealed unsafe class GdnBlock : ITuneBlock
         using var dX1 = TensorOps.Add(dOutput, dX1_norm);
 
         // -------------------------------------------------------------
-        // B. GDN Backward Pass (BPTT)
+        // B. GDN Backward Pass (BPTT via pre-allocated GdnScratchWorkspace)
         // -------------------------------------------------------------
+        int qkGroupFloats = _groupCount * _stateDim;
+        var gdnWs = GdnScratchWorkspace.GetOrCreateForBackward(
+            _ssmHeads, _stateDim, seqLen, _ssmInnerSize, qkGroupFloats, _gdnConvChannels);
+        gdnWs.GetBackwardActivationBuffers(
+            out float* pDYGatedBuf,
+            out float* pDYNormBuf,
+            out float* pDZBuf,
+            out float* pDYRecBuf,
+            out float* pDVBuf,
+            out float* pDQPerHeadBuf,
+            out float* pDKPerHeadBuf,
+            out float* pDQNormBuf,
+            out float* pDKNormBuf,
+            out float* pDAlphaBuf,
+            out float* pDBetaRawBuf,
+            out float* pDConvOutBuf,
+            out float* pDConvPreBuf,
+            out float* pDQkvBuf);
+
         // 1. ssm_out backward
-        using var dYGated = new Tensor<float>(seqLen, _ssmInnerSize);
+        using var dYGated = AutogradScratchWorkspace.Wrap(pDYGatedBuf, seqLen, _ssmInnerSize);
         _ssmOutProj.Backward(_weights.SsmOutType, _weights.SsmOutWeight, dX1, state.YGated!, dYGated);
 
         // 2. Output gate backward -> dYNorm, dZ
-        using var dYNorm = new Tensor<float>(seqLen, _ssmInnerSize);
-        using var dZ = new Tensor<float>(seqLen, _ssmInnerSize);
+        using var dYNorm = AutogradScratchWorkspace.Wrap(pDYNormBuf, seqLen, _ssmInnerSize);
+        using var dZ = AutogradScratchWorkspace.Wrap(pDZBuf, seqLen, _ssmInnerSize);
         float* pDYGated = (float*)dYGated.DataPointer;
         float* pYNorm = (float*)state.YNorm!.DataPointer;
         float* pZ = (float*)state.Z!.DataPointer;
@@ -727,7 +739,7 @@ public sealed unsafe class GdnBlock : ITuneBlock
         }
 
         // 3. Per-head ssm_norm RMSNorm backward -> dYRec
-        using var dYRec = new Tensor<float>(seqLen, _ssmInnerSize);
+        using var dYRec = AutogradScratchWorkspace.Wrap(pDYRecBuf, seqLen, _ssmInnerSize);
         if (_weights.SsmNormWeight != null)
         {
             using var dYNormView = dYNorm.Reshape(seqLen * _ssmHeads, _stateDim);
@@ -744,12 +756,11 @@ public sealed unsafe class GdnBlock : ITuneBlock
         }
 
         // 4. Parallel per-head BPTT across DeltaNet recurrence
-        int qkGroupFloats = _groupCount * _stateDim;
-        using var dQPerHead = new Tensor<float>(_ssmHeads, seqLen, _stateDim);
-        using var dKPerHead = new Tensor<float>(_ssmHeads, seqLen, _stateDim);
-        using var dV = new Tensor<float>(seqLen, _ssmInnerSize);
-        using var dAlpha = new Tensor<float>(seqLen, _ssmHeads);
-        using var dBetaRaw = new Tensor<float>(seqLen, _ssmHeads);
+        using var dQPerHead = AutogradScratchWorkspace.Wrap(pDQPerHeadBuf, _ssmHeads, seqLen, _stateDim);
+        using var dKPerHead = AutogradScratchWorkspace.Wrap(pDKPerHeadBuf, _ssmHeads, seqLen, _stateDim);
+        using var dV = AutogradScratchWorkspace.Wrap(pDVBuf, seqLen, _ssmInnerSize);
+        using var dAlpha = AutogradScratchWorkspace.Wrap(pDAlphaBuf, seqLen, _ssmHeads);
+        using var dBetaRaw = AutogradScratchWorkspace.Wrap(pDBetaRawBuf, seqLen, _ssmHeads);
 
         float* pQNorm = (float*)state.QNorm!.DataPointer;
         float* pKNorm = (float*)state.KNorm!.DataPointer;
@@ -773,162 +784,148 @@ public sealed unsafe class GdnBlock : ITuneBlock
             float aLog = pSsmA != null ? pSsmA[h] : 0f;
             float dtBias = pDtBias != null ? pDtBias[h] : 0f;
 
-            float* sPrevHist = (float*)NativeMemory.Alloc((nuint)((long)seqLen * matElems), sizeof(float));
-            float* mHist = (float*)NativeMemory.Alloc((nuint)((long)seqLen * _stateDim), sizeof(float));
-            float* deltaHist = (float*)NativeMemory.Alloc((nuint)((long)seqLen * _stateDim), sizeof(float));
-            float* sCur = (float*)NativeMemory.AllocZeroed((nuint)matElems, sizeof(float));
-            float* sPrime = (float*)NativeMemory.Alloc((nuint)matElems, sizeof(float));
-            float* sMat = (float*)NativeMemory.Alloc((nuint)matElems, sizeof(float));
-            float* dS = (float*)NativeMemory.AllocZeroed((nuint)matElems, sizeof(float));
-            float* dSTot = (float*)NativeMemory.Alloc((nuint)matElems, sizeof(float));
-            float* dDelta = (float*)NativeMemory.Alloc((nuint)_stateDim, sizeof(float));
+            gdnWs.GetBackwardHeadScratch(
+                h,
+                _stateDim,
+                out float* sPrevHist,
+                out float* mHist,
+                out float* deltaHist,
+                out float* sCur,
+                out float* sPrime,
+                out float* sMat,
+                out float* dS,
+                out float* dSTot,
+                out float* dDelta);
 
-            try
+            // Replay forward state trajectory S_{t-1}, m_t, delta_t for head h
+            for (int t = 0; t < seqLen; t++)
             {
-                // Replay forward state trajectory S_{t-1}, m_t, delta_t for head h
-                for (int t = 0; t < seqLen; t++)
+                Buffer.MemoryCopy(sCur, sPrevHist + (long)t * matElems, (ulong)(matElems * sizeof(float)), (ulong)(matElems * sizeof(float)));
+
+                float decay = pDecay[(long)t * _ssmHeads + h];
+                float beta = pBeta[(long)t * _ssmHeads + h];
+                float* kHead = pKNorm + ((long)t * _groupCount + g) * _stateDim;
+                float* vHead = pV + ((long)t * _ssmHeads + h) * _stateDim;
+                float* mT = mHist + (long)t * _stateDim;
+                float* deltaT = deltaHist + (long)t * _stateDim;
+
+                for (int i = 0; i < _stateDim; i++)
                 {
-                    Buffer.MemoryCopy(sCur, sPrevHist + (long)t * matElems, (ulong)(matElems * sizeof(float)), (ulong)(matElems * sizeof(float)));
-
-                    float decay = pDecay[(long)t * _ssmHeads + h];
-                    float beta = pBeta[(long)t * _ssmHeads + h];
-                    float* kHead = pKNorm + ((long)t * _groupCount + g) * _stateDim;
-                    float* vHead = pV + ((long)t * _ssmHeads + h) * _stateDim;
-                    float* mT = mHist + (long)t * _stateDim;
-                    float* deltaT = deltaHist + (long)t * _stateDim;
-
-                    for (int i = 0; i < _stateDim; i++)
+                    float* sRow = sCur + (long)i * _stateDim;
+                    float kvMem = 0f;
+                    for (int j = 0; j < _stateDim; j++)
                     {
-                        float* sRow = sCur + (long)i * _stateDim;
-                        float kvMem = 0f;
-                        for (int j = 0; j < _stateDim; j++)
-                        {
-                            float decayed = sRow[j] * decay;
-                            sRow[j] = decayed;
-                            kvMem += decayed * kHead[j];
-                        }
-                        mT[i] = kvMem;
-                        float dVal = (vHead[i] - kvMem) * beta;
-                        deltaT[i] = dVal;
-                        for (int j = 0; j < _stateDim; j++)
-                        {
-                            sRow[j] += dVal * kHead[j];
-                        }
+                        float decayed = sRow[j] * decay;
+                        sRow[j] = decayed;
+                        kvMem += decayed * kHead[j];
                     }
-                }
-
-                // Reverse-time BPTT
-                for (int t = seqLen - 1; t >= 0; t--)
-                {
-                    float decay = pDecay[(long)t * _ssmHeads + h];
-                    float beta = pBeta[(long)t * _ssmHeads + h];
-                    float* sPrevT = sPrevHist + (long)t * matElems;
-                    float* mT = mHist + (long)t * _stateDim;
-                    float* deltaT = deltaHist + (long)t * _stateDim;
-
-                    float* qHead = pQNorm + ((long)t * _groupCount + g) * _stateDim;
-                    float* kHead = pKNorm + ((long)t * _groupCount + g) * _stateDim;
-                    float* vHead = pV + ((long)t * _ssmHeads + h) * _stateDim;
-                    float* dy = pDYRec + ((long)t * _ssmHeads + h) * _stateDim;
-
-                    float* dqOut = pDQPerHead + ((long)h * seqLen + t) * _stateDim;
-                    float* dkOut = pDKPerHead + ((long)h * seqLen + t) * _stateDim;
-                    float* dvOut = pDV + ((long)t * _ssmHeads + h) * _stateDim;
-
-                    // Reconstruct S' = decay * S_{t-1} and S_t = S' + delta * k^T
-                    for (int i = 0; i < _stateDim; i++)
+                    mT[i] = kvMem;
+                    float dVal = (vHead[i] - kvMem) * beta;
+                    deltaT[i] = dVal;
+                    for (int j = 0; j < _stateDim; j++)
                     {
-                        float dVal = deltaT[i];
-                        int rowOff = i * _stateDim;
-                        for (int j = 0; j < _stateDim; j++)
-                        {
-                            float sp = decay * sPrevT[rowOff + j];
-                            sPrime[rowOff + j] = sp;
-                            sMat[rowOff + j] = sp + dVal * kHead[j];
-                        }
+                        sRow[j] += dVal * kHead[j];
                     }
-
-                    // Readout y = S_t * q -> dQ and dSTot = dS + dy * q^T
-                    for (int j = 0; j < _stateDim; j++) dqOut[j] = 0f;
-                    for (int i = 0; i < _stateDim; i++)
-                    {
-                        float dyi = dy[i];
-                        int rowOff = i * _stateDim;
-                        for (int j = 0; j < _stateDim; j++)
-                        {
-                            dqOut[j] += sMat[rowOff + j] * dyi;
-                            dSTot[rowOff + j] = dS[rowOff + j] + dyi * qHead[j];
-                        }
-                    }
-
-                    // State update S_t = S' + delta * k^T -> dDelta, dK part 1
-                    for (int j = 0; j < _stateDim; j++) dkOut[j] = 0f;
-                    for (int i = 0; i < _stateDim; i++)
-                    {
-                        int rowOff = i * _stateDim;
-                        float dd = 0f;
-                        float dVal = deltaT[i];
-                        for (int j = 0; j < _stateDim; j++)
-                        {
-                            float dst = dSTot[rowOff + j];
-                            dd += dst * kHead[j];
-                            dkOut[j] += dst * dVal;
-                        }
-                        dDelta[i] = dd;
-                    }
-
-                    // Delta = beta * (v - m) -> dV, dM = -dV, dBetaRaw
-                    float dBeta = 0f;
-                    for (int i = 0; i < _stateDim; i++)
-                    {
-                        float dd = dDelta[i];
-                        dvOut[i] = beta * dd;
-                        dBeta += dd * (vHead[i] - mT[i]);
-                    }
-                    pDBetaRaw[(long)t * _ssmHeads + h] = dBeta * beta * (1.0f - beta);
-
-                    // Retrieval m = S' * k, dSPrime = dSTot - dV * k^T, dK += S'^T * (-dV)
-                    float dDecay = 0f;
-                    for (int i = 0; i < _stateDim; i++)
-                    {
-                        int rowOff = i * _stateDim;
-                        float dm = -dvOut[i];
-                        for (int j = 0; j < _stateDim; j++)
-                        {
-                            dkOut[j] += sPrime[rowOff + j] * dm;
-                            float dsp = dSTot[rowOff + j] + dm * kHead[j];
-                            dDecay += dsp * sPrevT[rowOff + j];
-                            dS[rowOff + j] = decay * dsp;
-                        }
-                    }
-
-                    float aRaw = pAlpha[(long)t * _ssmHeads + h] + dtBias;
-                    float dtGrad = dDecay * decay * aLog;
-                    float sigA = aRaw > 20.0f ? 1.0f : 1.0f / (1.0f + MathF.Exp(-aRaw));
-                    pDAlpha[(long)t * _ssmHeads + h] = dtGrad * sigA;
                 }
             }
-            finally
+
+            // Reverse-time BPTT
+            for (int t = seqLen - 1; t >= 0; t--)
             {
-                NativeMemory.Free(sPrevHist);
-                NativeMemory.Free(mHist);
-                NativeMemory.Free(deltaHist);
-                NativeMemory.Free(sCur);
-                NativeMemory.Free(sPrime);
-                NativeMemory.Free(sMat);
-                NativeMemory.Free(dS);
-                NativeMemory.Free(dSTot);
-                NativeMemory.Free(dDelta);
+                float decay = pDecay[(long)t * _ssmHeads + h];
+                float beta = pBeta[(long)t * _ssmHeads + h];
+                float* sPrevT = sPrevHist + (long)t * matElems;
+                float* mT = mHist + (long)t * _stateDim;
+                float* deltaT = deltaHist + (long)t * _stateDim;
+
+                float* qHead = pQNorm + ((long)t * _groupCount + g) * _stateDim;
+                float* kHead = pKNorm + ((long)t * _groupCount + g) * _stateDim;
+                float* vHead = pV + ((long)t * _ssmHeads + h) * _stateDim;
+                float* dy = pDYRec + ((long)t * _ssmHeads + h) * _stateDim;
+
+                float* dqOut = pDQPerHead + ((long)h * seqLen + t) * _stateDim;
+                float* dkOut = pDKPerHead + ((long)h * seqLen + t) * _stateDim;
+                float* dvOut = pDV + ((long)t * _ssmHeads + h) * _stateDim;
+
+                // Reconstruct S' = decay * S_{t-1} and S_t = S' + delta * k^T
+                for (int i = 0; i < _stateDim; i++)
+                {
+                    float dVal = deltaT[i];
+                    int rowOff = i * _stateDim;
+                    for (int j = 0; j < _stateDim; j++)
+                    {
+                        float sp = decay * sPrevT[rowOff + j];
+                        sPrime[rowOff + j] = sp;
+                        sMat[rowOff + j] = sp + dVal * kHead[j];
+                    }
+                }
+
+                // Readout y = S_t * q -> dQ and dSTot = dS + dy * q^T
+                for (int j = 0; j < _stateDim; j++) dqOut[j] = 0f;
+                for (int i = 0; i < _stateDim; i++)
+                {
+                    float dyi = dy[i];
+                    int rowOff = i * _stateDim;
+                    for (int j = 0; j < _stateDim; j++)
+                    {
+                        dqOut[j] += sMat[rowOff + j] * dyi;
+                        dSTot[rowOff + j] = dS[rowOff + j] + dyi * qHead[j];
+                    }
+                }
+
+                // State update S_t = S' + delta * k^T -> dDelta, dK part 1
+                for (int j = 0; j < _stateDim; j++) dkOut[j] = 0f;
+                for (int i = 0; i < _stateDim; i++)
+                {
+                    int rowOff = i * _stateDim;
+                    float dd = 0f;
+                    float dVal = deltaT[i];
+                    for (int j = 0; j < _stateDim; j++)
+                    {
+                        float dst = dSTot[rowOff + j];
+                        dd += dst * kHead[j];
+                        dkOut[j] += dst * dVal;
+                    }
+                    dDelta[i] = dd;
+                }
+
+                // Delta = beta * (v - m) -> dV, dM = -dV, dBetaRaw
+                float dBeta = 0f;
+                for (int i = 0; i < _stateDim; i++)
+                {
+                    float dd = dDelta[i];
+                    dvOut[i] = beta * dd;
+                    dBeta += dd * (vHead[i] - mT[i]);
+                }
+                pDBetaRaw[(long)t * _ssmHeads + h] = dBeta * beta * (1.0f - beta);
+
+                // Retrieval m = S' * k, dSPrime = dSTot - dV * k^T, dK += S'^T * (-dV)
+                float dDecay = 0f;
+                for (int i = 0; i < _stateDim; i++)
+                {
+                    int rowOff = i * _stateDim;
+                    float dm = -dvOut[i];
+                    for (int j = 0; j < _stateDim; j++)
+                    {
+                        dkOut[j] += sPrime[rowOff + j] * dm;
+                        float dsp = dSTot[rowOff + j] + dm * kHead[j];
+                        dDecay += dsp * sPrevT[rowOff + j];
+                        dS[rowOff + j] = decay * dsp;
+                    }
+                }
+
+                float aRaw = pAlpha[(long)t * _ssmHeads + h] + dtBias;
+                float dtGrad = dDecay * decay * aLog;
+                float sigA = aRaw > 20.0f ? 1.0f : 1.0f / (1.0f + MathF.Exp(-aRaw));
+                pDAlpha[(long)t * _ssmHeads + h] = dtGrad * sigA;
             }
         });
 
         // Reduce per-head dQ, dK into [seqLen, G * d]
-        using var dQNorm = new Tensor<float>(seqLen, qkGroupFloats);
-        using var dKNorm = new Tensor<float>(seqLen, qkGroupFloats);
+        using var dQNorm = AutogradScratchWorkspace.Wrap(pDQNormBuf, seqLen, qkGroupFloats);
+        using var dKNorm = AutogradScratchWorkspace.Wrap(pDKNormBuf, seqLen, qkGroupFloats);
         float* pDQNorm = (float*)dQNorm.DataPointer;
         float* pDKNorm = (float*)dKNorm.DataPointer;
-        dQNorm.AsSpan().Clear();
-        dKNorm.AsSpan().Clear();
 
         for (int h = 0; h < _ssmHeads; h++)
         {
@@ -948,7 +945,7 @@ public sealed unsafe class GdnBlock : ITuneBlock
         }
 
         // 5. Group L2 norm backward -> dConvOut [seqLen, C]
-        using var dConvOut = new Tensor<float>(seqLen, _gdnConvChannels);
+        using var dConvOut = AutogradScratchWorkspace.Wrap(pDConvOutBuf, seqLen, _gdnConvChannels);
         float* pDConvOut = (float*)dConvOut.DataPointer;
         float* pInvQ = (float*)state.InvNormQ!.DataPointer;
         float* pInvK = (float*)state.InvNormK!.DataPointer;
@@ -998,8 +995,8 @@ public sealed unsafe class GdnBlock : ITuneBlock
         }
 
         // 6. SiLU + Causal Conv1d backward -> dQkv [seqLen, C]
-        using var dConvPre = new Tensor<float>(seqLen, _gdnConvChannels);
-        using var dQkv = new Tensor<float>(seqLen, _gdnConvChannels);
+        using var dConvPre = AutogradScratchWorkspace.Wrap(pDConvPreBuf, seqLen, _gdnConvChannels);
+        using var dQkv = AutogradScratchWorkspace.Wrap(pDQkvBuf, seqLen, _gdnConvChannels);
         float* pConvPre = (float*)state.ConvPre!.DataPointer;
         float* pDConvPre = (float*)dConvPre.DataPointer;
         float* pDQkv = (float*)dQkv.DataPointer;

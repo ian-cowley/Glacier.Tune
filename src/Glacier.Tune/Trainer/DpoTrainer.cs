@@ -3,8 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Text.Json;
 using System.Text.Json.Serialization;
-using Glacier.Tensor.Optimizers;
-using Glacier.Tune.Config;
+using Glacier.Inference.Tokenizer;
 using Glacier.Tune.Data;
 using Glacier.Tune.Diagnostics;
 using Glacier.Tune.Model;
@@ -14,11 +13,14 @@ namespace Glacier.Tune.Trainer;
 public sealed record DpoPreferencePair(
     [property: JsonPropertyName("prompt")] string Prompt,
     [property: JsonPropertyName("chosen")] string Chosen,
-    [property: JsonPropertyName("rejected")] string Rejected);
+    [property: JsonPropertyName("rejected")] string Rejected,
+    [property: JsonPropertyName("prompt_messages")] List<ChatMessage>? PromptMessages = null);
 
 [JsonSourceGenerationOptions(PropertyNameCaseInsensitive = true)]
 [JsonSerializable(typeof(DpoPreferencePair))]
 [JsonSerializable(typeof(List<DpoPreferencePair>))]
+[JsonSerializable(typeof(ChatMessage))]
+[JsonSerializable(typeof(List<ChatMessage>))]
 public partial class DpoJsonContext : JsonSerializerContext
 {
 }
@@ -58,6 +60,13 @@ public sealed class DpoTrainingArguments
     public float MaxGradNorm { get; set; } = 1.0f;
     public float WarmupRatio { get; set; } = 0.05f;
     public int Epochs { get; set; } = 1;
+    public int GradientAccumulationSteps { get; set; } = 1;
+    public double SftAnchorWeight { get; set; } = 0.0;
+    public bool CheckpointActivations { get; set; } = false;
+    public int SaveSteps { get; set; } = 0;
+    public int? MaxSteps { get; set; } = null;
+    public int LoggingSteps { get; set; } = 1;
+    public string? ReferenceLogProbsCachePath { get; set; } = null;
     public string OutputDir { get; set; } = "dpo_adapter";
 }
 
@@ -149,29 +158,89 @@ public static class DpoDataset
         }
         return pairs;
     }
+
+    public static List<TokenizedPreferencePair> Tokenize(
+        IReadOnlyList<DpoPreferencePair> pairs,
+        BpeTokenizer tokenizer,
+        int maxSeqLength = 2048)
+    {
+        ArgumentNullException.ThrowIfNull(pairs);
+        ArgumentNullException.ThrowIfNull(tokenizer);
+        ArgumentOutOfRangeException.ThrowIfLessThan(maxSeqLength, 2);
+
+        var tokenized = new List<TokenizedPreferencePair>(pairs.Count);
+        for (int i = 0; i < pairs.Count; i++)
+        {
+            var pair = pairs[i];
+            if (string.IsNullOrEmpty(pair.Chosen) || string.IsNullOrEmpty(pair.Rejected))
+                continue;
+
+            var chosenConv = BuildConversation(pair, pair.Chosen);
+            var rejectedConv = BuildConversation(pair, pair.Rejected);
+
+            var chosenEx = ChatMlDataset.FormatAndTokenize(chosenConv, tokenizer, maxSeqLength);
+            var rejectedEx = ChatMlDataset.FormatAndTokenize(rejectedConv, tokenizer, maxSeqLength);
+
+            if (chosenEx.InputIds.Length >= 2 && rejectedEx.InputIds.Length >= 2)
+            {
+                tokenized.Add(new TokenizedPreferencePair(
+                    chosenEx.InputIds,
+                    chosenEx.Labels,
+                    rejectedEx.InputIds,
+                    rejectedEx.Labels));
+            }
+        }
+
+        return tokenized;
+    }
+
+    private static ChatConversation BuildConversation(DpoPreferencePair pair, string responseContent)
+    {
+        var conv = new ChatConversation();
+        if (pair.PromptMessages is { Count: > 0 })
+        {
+            foreach (var msg in pair.PromptMessages)
+            {
+                conv.Messages.Add(new ChatMessage { Role = msg.Role, Content = msg.Content });
+            }
+        }
+        else if (!string.IsNullOrEmpty(pair.Prompt))
+        {
+            conv.Messages.Add(new ChatMessage { Role = "user", Content = pair.Prompt });
+        }
+
+        conv.Messages.Add(new ChatMessage { Role = "assistant", Content = responseContent });
+        return conv;
+    }
 }
 
 /// <summary>
-/// Pure C# Direct Preference Optimization (DPO) LoRA alignment trainer for <see cref="GgufLoraModel"/>.
-/// Supports either an explicit frozen reference <see cref="GgufLoraModel"/> or automatic precomputed reference log-probs.
+/// Pure C# Direct Preference Optimization (DPO / cDPO / RPO-anchor) LoRA alignment trainer for <see cref="GgufLoraModel"/>.
+/// Uses memoryless 2-pass scalar chain-rule scaling, disk reference log-prob caching (<c>DPRF</c>),
+/// and <see cref="StatefulAdamW"/> persistence.
 /// </summary>
 public sealed class DpoTrainer : IDisposable
 {
+    public const uint RefCacheMagic = 0x46525044u; // 'DPRF'
+    public const int RefCacheVersion = 1;
+
     private readonly GgufLoraModel _policyModel;
     private readonly GgufLoraModel? _referenceModel;
     private readonly DpoTrainingArguments _args;
-    private readonly AdamW _optimizer;
+    private readonly StatefulAdamW _optimizer;
+    private int _startingStep;
     private bool _disposed;
 
     public GgufLoraModel PolicyModel => _policyModel;
     public DpoTrainingArguments Args => _args;
+    public StatefulAdamW Optimizer => _optimizer;
 
     public DpoTrainer(GgufLoraModel policyModel, DpoTrainingArguments args, GgufLoraModel? referenceModel = null)
     {
         _policyModel = policyModel ?? throw new ArgumentNullException(nameof(policyModel));
         _args = args ?? throw new ArgumentNullException(nameof(args));
         _referenceModel = referenceModel;
-        _optimizer = new AdamW(
+        _optimizer = new StatefulAdamW(
             _policyModel.TrainableParameters,
             lr: _args.LearningRate,
             beta1: _args.Beta1,
@@ -180,40 +249,74 @@ public sealed class DpoTrainer : IDisposable
             weightDecay: _args.WeightDecay);
     }
 
+    public void ResumeFromCheckpoint(string adapterFilePath, float? annealedLearningRate = null, int startingStep = 0)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        _policyModel.LoadAdapter(adapterFilePath);
+
+        string optPath = LoraTrainer.GetOptimizerStatePath(adapterFilePath);
+        if (!File.Exists(optPath) && adapterFilePath.EndsWith(".bin", StringComparison.OrdinalIgnoreCase))
+        {
+            string? dir = Path.GetDirectoryName(adapterFilePath);
+            if (!string.IsNullOrEmpty(dir))
+            {
+                string dirOpt = Path.Combine(dir, "optimizer_state.bin");
+                if (File.Exists(dirOpt)) optPath = dirOpt;
+            }
+        }
+
+        if (File.Exists(optPath))
+        {
+            _optimizer.LoadState(optPath);
+        }
+
+        _startingStep = Math.Max(0, startingStep > 0 ? startingStep : _optimizer.StepCount);
+        if (annealedLearningRate.HasValue)
+        {
+            _optimizer.LearningRate = annealedLearningRate.Value;
+        }
+    }
+
     public List<DpoStepResult> Train(IReadOnlyList<TokenizedPreferencePair> dataset, Action<DpoStepResult>? onStep = null)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         ArgumentNullException.ThrowIfNull(dataset);
         if (dataset.Count == 0) return [];
+        if (!double.IsFinite(_args.SftAnchorWeight) || _args.SftAnchorWeight < 0.0)
+            throw new ArgumentOutOfRangeException(nameof(_args.SftAnchorWeight), "SftAnchorWeight must be finite and non-negative.");
 
-        // Cache initial reference log-probabilities once when no dedicated reference model instance is supplied.
-        var cachedRefLogProbs = new (double RefChosenLogP, double RefRejectedLogP)[dataset.Count];
-        var refEvalModel = _referenceModel ?? _policyModel;
-        for (int i = 0; i < dataset.Count; i++)
-        {
-            var pair = dataset[i];
-            double refChosen = ComputeSequenceLogProb(refEvalModel, pair.ChosenInputIds, pair.ChosenLabels, _args.LengthNormalizedLogProbs, out _);
-            double refRejected = ComputeSequenceLogProb(refEvalModel, pair.RejectedInputIds, pair.RejectedLabels, _args.LengthNormalizedLogProbs, out _);
-            cachedRefLogProbs[i] = (refChosen, refRejected);
-        }
+        int gradAccumSteps = Math.Max(1, _args.GradientAccumulationSteps);
+        var cachedRefLogProbs = LoadOrComputeRefLogProbs(dataset);
 
-        int totalSteps = Math.Max(1, _args.Epochs * dataset.Count);
-        var trainable = _policyModel.TrainableParameters;
-        var chosenGradBuffers = new float[trainable.Count][];
+        int stepsPerEpoch = (dataset.Count + gradAccumSteps - 1) / gradAccumSteps;
+        int plannedTotalSteps = _args.MaxSteps.HasValue && _args.MaxSteps.Value > 0
+            ? _args.MaxSteps.Value
+            : Math.Max(1, _args.Epochs * stepsPerEpoch);
 
-        var results = new List<DpoStepResult>(totalSteps);
-        int globalStep = 0;
+        var results = new List<DpoStepResult>(plannedTotalSteps);
+        int globalStep = _startingStep;
+        int totalSteps = Math.Max(globalStep + 1, plannedTotalSteps);
 
         for (int epoch = 0; epoch < _args.Epochs; epoch++)
         {
+            if (_args.MaxSteps.HasValue && globalStep >= _args.MaxSteps.Value) break;
+
+            int accumCounter = 0;
+            double accumLoss = 0.0;
+            double accumChosenReward = 0.0;
+            double accumRejectedReward = 0.0;
+            double accumMargin = 0.0;
+            double accumAccuracy = 0.0;
+            _optimizer.ZeroGrad();
+
             for (int idx = 0; idx < dataset.Count; idx++)
             {
                 var pair = dataset[idx];
                 var (refChosen, refRejected) = cachedRefLogProbs[idx];
 
-                // 1. Evaluate policy sequence log-probs cleanly
-                double policyChosenLogP = ComputeSequenceLogProb(_policyModel, pair.ChosenInputIds, pair.ChosenLabels, _args.LengthNormalizedLogProbs, out int chosenTokens);
-                double policyRejectedLogP = ComputeSequenceLogProb(_policyModel, pair.RejectedInputIds, pair.RejectedLabels, _args.LengthNormalizedLogProbs, out int rejectedTokens);
+                // Pass 1: Evaluate policy log-probs without gradient allocation
+                double policyChosenLogP = ComputeSequenceLogProb(_policyModel, pair.ChosenInputIds, pair.ChosenLabels, _args.LengthNormalizedLogProbs, out int chosenTokens, out double chosenAvgNll);
+                double policyRejectedLogP = ComputeSequenceLogProb(_policyModel, pair.RejectedInputIds, pair.RejectedLabels, _args.LengthNormalizedLogProbs, out int rejectedTokens, out _);
 
                 var dpo = DpoLoss.Compute(
                     policyChosenLogP,
@@ -223,77 +326,197 @@ public sealed class DpoTrainer : IDisposable
                     _args.Beta,
                     _args.LabelSmoothing);
 
-                if (chosenTokens > 0 && rejectedTokens > 0 && double.IsFinite(dpo.Loss))
+                double totalPairLoss = dpo.Loss + (_args.SftAnchorWeight > 0.0 && chosenTokens > 0 ? _args.SftAnchorWeight * chosenAvgNll : 0.0);
+
+                if (chosenTokens > 0 && rejectedTokens > 0 && double.IsFinite(totalPairLoss))
                 {
-                    // 2. Backprop chosen sequence (ForwardLossAndBackward accumulates d(-avgLogP)/dTheta)
-                    _optimizer.ZeroGrad();
-                    _policyModel.ForwardLossAndBackward(pair.ChosenInputIds, pair.ChosenLabels);
-                    for (int p = 0; p < trainable.Count; p++)
-                    {
-                        var gradTensor = trainable[p].Grad;
-                        if (gradTensor != null)
-                        {
-                            var gradSpan = gradTensor.AsSpan();
-                            if (chosenGradBuffers[p] == null || chosenGradBuffers[p].Length != gradSpan.Length)
-                                chosenGradBuffers[p] = new float[gradSpan.Length];
-                            gradSpan.CopyTo(chosenGradBuffers[p]);
-                        }
-                        else if (chosenGradBuffers[p] != null)
-                        {
-                            Array.Clear(chosenGradBuffers[p]);
-                        }
-                    }
-
-                    // 3. Backprop rejected sequence
-                    _optimizer.ZeroGrad();
-                    _policyModel.ForwardLossAndBackward(pair.RejectedInputIds, pair.RejectedLabels);
-
-                    // Combine: d(loss)/dTheta = (-gradLogP_w * scaleW) * gCE_w + (-gradLogP_l * scaleL) * gCE_l
+                    // Pass 2: Accumulate exact scaled gradients directly via lossScale (zero chosenGradBuffers clone)
                     double scaleW = _args.LengthNormalizedLogProbs ? 1.0 : chosenTokens;
                     double scaleL = _args.LengthNormalizedLogProbs ? 1.0 : rejectedTokens;
-                    float coefW = (float)(-dpo.GradPolicyChosen * scaleW);
-                    float coefL = (float)(-dpo.GradPolicyRejected * scaleL);
+                    float lossScaleChosen = (float)((-dpo.GradPolicyChosen * scaleW) + _args.SftAnchorWeight);
+                    float lossScaleRejected = (float)(-dpo.GradPolicyRejected * scaleL);
 
-                    for (int p = 0; p < trainable.Count; p++)
-                    {
-                        var gradTensor = trainable[p].Grad;
-                        if (gradTensor == null) continue;
-                        Span<float> gSpan = gradTensor.AsSpan();
-                        float[]? gChosen = chosenGradBuffers[p];
-                        if (gChosen != null && gChosen.Length == gSpan.Length)
-                        {
-                            for (int j = 0; j < gSpan.Length; j++)
-                            {
-                                gSpan[j] = coefW * gChosen[j] + coefL * gSpan[j];
-                            }
-                        }
-                    }
+                    _policyModel.ForwardLossAndBackward(pair.ChosenInputIds, pair.ChosenLabels, _args.CheckpointActivations, lossScaleChosen);
+                    _policyModel.ForwardLossAndBackward(pair.RejectedInputIds, pair.RejectedLabels, _args.CheckpointActivations, lossScaleRejected);
 
-                    globalStep++;
-                    _optimizer.LearningRate = LoraTrainer.ComputeCosineLr(globalStep, totalSteps, _args.LearningRate, _args.WarmupRatio, minLr: _args.LearningRate * 0.1f);
-                    ClipGradients(_args.MaxGradNorm);
-                    _optimizer.Step();
-                    _optimizer.ZeroGrad();
+                    accumCounter++;
+                    accumLoss += totalPairLoss;
+                    accumChosenReward += dpo.ChosenReward;
+                    accumRejectedReward += dpo.RejectedReward;
+                    accumMargin += dpo.Margin;
+                    accumAccuracy += dpo.Margin > 0.0 ? 1.0 : 0.0;
                 }
-                else
+
+                bool stepBoundary = accumCounter >= gradAccumSteps || idx == dataset.Count - 1;
+                if (stepBoundary)
                 {
                     globalStep++;
-                }
+                    if (accumCounter > 0)
+                    {
+                        if (accumCounter > 1)
+                        {
+                            StatefulAdamW.ScaleGradients(_policyModel.TrainableParameters, 1.0f / accumCounter);
+                        }
 
-                var stepResult = new DpoStepResult(
-                    globalStep,
-                    dpo.Loss,
-                    dpo.ChosenReward,
-                    dpo.RejectedReward,
-                    dpo.Margin,
-                    dpo.Margin > 0.0 ? 1.0 : 0.0);
-                results.Add(stepResult);
-                onStep?.Invoke(stepResult);
+                        _optimizer.LearningRate = LoraTrainer.ComputeCosineLr(
+                            globalStep,
+                            totalSteps,
+                            _args.LearningRate,
+                            _args.WarmupRatio,
+                            minLr: _args.LearningRate * 0.1f);
+                        StatefulAdamW.ClipGradients(_policyModel.TrainableParameters, _args.MaxGradNorm);
+                        _optimizer.Step();
+                        _optimizer.ZeroGrad();
+                    }
+
+                    double denom = Math.Max(1, accumCounter);
+                    var stepResult = new DpoStepResult(
+                        globalStep,
+                        accumCounter > 0 ? accumLoss / denom : totalPairLoss,
+                        accumCounter > 0 ? accumChosenReward / denom : dpo.ChosenReward,
+                        accumCounter > 0 ? accumRejectedReward / denom : dpo.RejectedReward,
+                        accumCounter > 0 ? accumMargin / denom : dpo.Margin,
+                        accumCounter > 0 ? accumAccuracy / denom : (dpo.Margin > 0.0 ? 1.0 : 0.0));
+                    results.Add(stepResult);
+                    onStep?.Invoke(stepResult);
+
+                    if (_args.LoggingSteps <= 1 || globalStep % _args.LoggingSteps == 0 || globalStep == totalSteps)
+                    {
+                        GlacierDiagnostics.LogInformation(
+                            $"[DPO] Step {globalStep}/{totalSteps} | Loss={stepResult.Loss:F4} | Margin={stepResult.RewardMargin:F4} | Acc={stepResult.RewardAccuracy:P0} | LR={_optimizer.LearningRate:E2}");
+                    }
+
+                    if (_args.SaveSteps > 0 && globalStep % _args.SaveSteps == 0 && !string.IsNullOrWhiteSpace(_args.OutputDir))
+                    {
+                        string ckptDir = Path.Combine(_args.OutputDir, $"checkpoint-{globalStep}");
+                        _policyModel.SaveAdapter(ckptDir);
+                        _optimizer.SaveState(LoraTrainer.GetOptimizerStatePath(ckptDir));
+                    }
+
+                    accumCounter = 0;
+                    accumLoss = 0.0;
+                    accumChosenReward = 0.0;
+                    accumRejectedReward = 0.0;
+                    accumMargin = 0.0;
+                    accumAccuracy = 0.0;
+
+                    if (_args.MaxSteps.HasValue && globalStep >= _args.MaxSteps.Value)
+                    {
+                        break;
+                    }
+                }
             }
+        }
+
+        if (!string.IsNullOrWhiteSpace(_args.OutputDir))
+        {
+            _policyModel.SaveAdapter(_args.OutputDir);
+            _optimizer.SaveState(LoraTrainer.GetOptimizerStatePath(_args.OutputDir));
         }
 
         GlacierDiagnostics.LogInformation($"[DPO] Completed {globalStep} DPO optimization steps.");
         return results;
+    }
+
+    private (double RefChosenLogP, double RefRejectedLogP)[] LoadOrComputeRefLogProbs(IReadOnlyList<TokenizedPreferencePair> dataset)
+    {
+        string? cachePath = _args.ReferenceLogProbsCachePath;
+        if (!string.IsNullOrWhiteSpace(cachePath) && File.Exists(cachePath))
+        {
+            if (TryLoadRefCache(cachePath, dataset.Count, _args.LengthNormalizedLogProbs, out var cached))
+            {
+                GlacierDiagnostics.LogInformation($"[DPO] Loaded {dataset.Count} cached reference log-probabilities from {cachePath}.");
+                return cached;
+            }
+        }
+
+        var computed = new (double RefChosenLogP, double RefRejectedLogP)[dataset.Count];
+        var refEvalModel = _referenceModel ?? _policyModel;
+        for (int i = 0; i < dataset.Count; i++)
+        {
+            var pair = dataset[i];
+            double refChosen = ComputeSequenceLogProb(refEvalModel, pair.ChosenInputIds, pair.ChosenLabels, _args.LengthNormalizedLogProbs, out _, out _);
+            double refRejected = ComputeSequenceLogProb(refEvalModel, pair.RejectedInputIds, pair.RejectedLabels, _args.LengthNormalizedLogProbs, out _, out _);
+            computed[i] = (refChosen, refRejected);
+        }
+
+        if (!string.IsNullOrWhiteSpace(cachePath))
+        {
+            SaveRefCache(cachePath, _args.LengthNormalizedLogProbs, computed);
+        }
+
+        return computed;
+    }
+
+    private static bool TryLoadRefCache(
+        string path,
+        int expectedCount,
+        bool expectedLengthNorm,
+        out (double RefChosenLogP, double RefRejectedLogP)[] entries)
+    {
+        entries = [];
+        try
+        {
+            using var fs = File.OpenRead(path);
+            using var br = new BinaryReader(fs);
+            if (fs.Length < 16) return false;
+            if (br.ReadUInt32() != RefCacheMagic) return false;
+            if (br.ReadInt32() != RefCacheVersion) return false;
+            if (br.ReadBoolean() != expectedLengthNorm) return false;
+            int count = br.ReadInt32();
+            if (count != expectedCount) return false;
+            if (fs.Length - fs.Position != (long)count * 2 * sizeof(double)) return false;
+
+            var loaded = new (double, double)[count];
+            for (int i = 0; i < count; i++)
+            {
+                double c = br.ReadDouble();
+                double r = br.ReadDouble();
+                if (!double.IsFinite(c) || !double.IsFinite(r)) return false;
+                loaded[i] = (c, r);
+            }
+            entries = loaded;
+            return true;
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+    }
+
+    private static void SaveRefCache(string path, bool lengthNorm, (double RefChosenLogP, double RefRejectedLogP)[] entries)
+    {
+        string? dir = Path.GetDirectoryName(path);
+        if (!string.IsNullOrEmpty(dir))
+        {
+            Directory.CreateDirectory(dir);
+        }
+
+        string tmpPath = LoraBinaryFormat.CreateTempSiblingPath(path);
+        try
+        {
+            using (var fs = File.Create(tmpPath))
+            using (var bw = new BinaryWriter(fs))
+            {
+                bw.Write(RefCacheMagic);
+                bw.Write(RefCacheVersion);
+                bw.Write(lengthNorm);
+                bw.Write(entries.Length);
+                for (int i = 0; i < entries.Length; i++)
+                {
+                    bw.Write(entries[i].RefChosenLogP);
+                    bw.Write(entries[i].RefRejectedLogP);
+                }
+                bw.Flush();
+                fs.Flush(true);
+            }
+            File.Move(tmpPath, path, overwrite: true);
+        }
+        catch
+        {
+            try { if (File.Exists(tmpPath)) File.Delete(tmpPath); } catch { }
+            throw;
+        }
     }
 
     private static double ComputeSequenceLogProb(
@@ -301,34 +524,17 @@ public sealed class DpoTrainer : IDisposable
         int[] inputIds,
         int[] labels,
         bool lengthNormalized,
-        out int validTokens)
+        out int validTokens,
+        out double avgNll)
     {
         float ceLoss = model.EvaluateLoss(inputIds, labels, out validTokens);
-        if (validTokens <= 0 || !float.IsFinite(ceLoss)) return 0.0;
+        if (validTokens <= 0 || !float.IsFinite(ceLoss))
+        {
+            avgNll = 0.0;
+            return 0.0;
+        }
+        avgNll = ceLoss;
         return lengthNormalized ? -ceLoss : -(double)ceLoss * validTokens;
-    }
-
-    private void ClipGradients(float maxNorm)
-    {
-        if (maxNorm <= 0f) return;
-        double normSq = 0.0;
-        foreach (var p in _policyModel.TrainableParameters)
-        {
-            if (p.Grad == null) continue;
-            foreach (float g in p.Grad.AsSpan())
-                normSq += (double)g * g;
-        }
-        double norm = Math.Sqrt(normSq);
-        if (norm > maxNorm && norm > 0.0)
-        {
-            float scale = (float)(maxNorm / norm);
-            foreach (var p in _policyModel.TrainableParameters)
-            {
-                if (p.Grad == null) continue;
-                Span<float> span = p.Grad.AsSpan();
-                for (int i = 0; i < span.Length; i++) span[i] *= scale;
-            }
-        }
     }
 
     public void Dispose()

@@ -21,7 +21,7 @@ public sealed class SecurityComplianceE2ETests
         var dir = new DirectoryInfo(AppContext.BaseDirectory);
         while (dir != null)
         {
-            if (File.Exists(Path.Combine(dir.FullName, "Glacier.sln")) &&
+            if ((File.Exists(Path.Combine(dir.FullName, "Glacier.sln")) || File.Exists(Path.Combine(dir.FullName, "Glacier.slnx"))) &&
                 File.Exists(Path.Combine(dir.FullName, "scripts", "security_check.py")))
             {
                 return dir.FullName;
@@ -67,6 +67,26 @@ public sealed class SecurityComplianceE2ETests
         return RunProcess(pythonExe, $"\"{scriptPath}\" \"{targetPath}\"", repoRoot);
     }
 
+    private static (int ExitCode, string StdOut, string StdErr)? TryRunGlacierCliSecurityCheck(string repoRoot, string targetPath)
+    {
+        string preferredCfg = AppContext.BaseDirectory.Contains($"{Path.DirectorySeparatorChar}Release{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase)
+            ? "Release"
+            : "Debug";
+        string? cliDll = null;
+        foreach (string cfg in new[] { preferredCfg, preferredCfg == "Release" ? "Debug" : "Release" })
+        {
+            string candidate = Path.Combine(repoRoot, "Glacier.Cli", "src", "Glacier.Cli", "bin", cfg, "net10.0", "glacier.dll");
+            if (File.Exists(candidate) && File.Exists(Path.ChangeExtension(candidate, ".runtimeconfig.json")))
+            {
+                cliDll = candidate;
+                break;
+            }
+        }
+        if (cliDll is null) return null;
+
+        return RunProcess("dotnet", $"\"{cliDll}\" security-check \"{targetPath}\"", repoRoot);
+    }
+
     [Fact]
     [Trait("Tier", "Tier1")]
     [Trait("Feature", "F15")]
@@ -77,6 +97,12 @@ public sealed class SecurityComplianceE2ETests
 
         Assert.True(exitCode == 0, $"security_check.py failed on repo root (exit {exitCode}):\n{stdout}\n{stderr}");
         Assert.Contains("[PASSED]", stdout);
+
+        if (TryRunGlacierCliSecurityCheck(repoRoot, "Glacier.Tune") is { } cli)
+        {
+            Assert.True(cli.ExitCode == 0, $"glacier security-check failed on Glacier.Tune (exit {cli.ExitCode}):\n{cli.StdOut}\n{cli.StdErr}");
+            Assert.Contains("[PASSED]", cli.StdOut);
+        }
     }
 
     [Fact]
@@ -95,6 +121,12 @@ public sealed class SecurityComplianceE2ETests
             var (exitCode, stdout, stderr) = RunSecurityCheck(repoRoot, pillar);
             Assert.True(exitCode == 0, $"security_check.py failed on {pillar} (exit {exitCode}):\n{stdout}\n{stderr}");
             Assert.Contains("[PASSED]", stdout);
+
+            if (TryRunGlacierCliSecurityCheck(repoRoot, pillar) is { } cli)
+            {
+                Assert.True(cli.ExitCode == 0, $"glacier security-check failed on {pillar} (exit {cli.ExitCode}):\n{cli.StdOut}\n{cli.StdErr}");
+                Assert.Contains("[PASSED]", cli.StdOut);
+            }
         }
     }
 
@@ -117,6 +149,12 @@ public sealed class SecurityComplianceE2ETests
         var (exitCode, stdout, stderr) = RunSecurityCheck(repoRoot, tempScope.Path);
         Assert.True(exitCode == 0, $"Expected clean env-var sample to pass (exit {exitCode}):\n{stdout}\n{stderr}");
         Assert.Contains("[PASSED]", stdout);
+
+        if (TryRunGlacierCliSecurityCheck(repoRoot, tempScope.Path) is { } cli)
+        {
+            Assert.True(cli.ExitCode == 0, $"Expected glacier security-check clean sample to pass (exit {cli.ExitCode}):\n{cli.StdOut}\n{cli.StdErr}");
+            Assert.Contains("[PASSED]", cli.StdOut);
+        }
     }
 
     [Fact]
@@ -179,6 +217,11 @@ public sealed class SecurityComplianceE2ETests
 
             var (exitCode, stdout, stderr) = RunSecurityCheck(repoRoot, rel);
             Assert.True(exitCode == 0, $"security_check.py failed on {rel} (exit {exitCode}):\n{stdout}\n{stderr}");
+
+            if (TryRunGlacierCliSecurityCheck(repoRoot, rel) is { } cli)
+            {
+                Assert.True(cli.ExitCode == 0, $"glacier security-check failed on {rel} (exit {cli.ExitCode}):\n{cli.StdOut}\n{cli.StdErr}");
+            }
         }
     }
 
@@ -199,6 +242,13 @@ public sealed class SecurityComplianceE2ETests
         Assert.NotEqual(0, exitCode);
         Assert.Contains("leaky.json", stdout);
         Assert.Contains("CRITICAL ALERT", stdout);
+
+        if (TryRunGlacierCliSecurityCheck(repoRoot, tempScope.Path) is { } cli)
+        {
+            Assert.NotEqual(0, cli.ExitCode);
+            Assert.Contains("leaky.json", cli.StdOut);
+            Assert.Contains("CRITICAL ALERT", cli.StdOut);
+        }
     }
 
     [Fact]
@@ -212,6 +262,12 @@ public sealed class SecurityComplianceE2ETests
         var (exitCode, stdout, stderr) = RunSecurityCheck(repoRoot, tempScope.Path);
         Assert.True(exitCode == 0, $"Expected 0 on empty dir (got {exitCode}):\n{stdout}\n{stderr}");
         Assert.Contains("Scanned 0 files", stdout);
+
+        if (TryRunGlacierCliSecurityCheck(repoRoot, tempScope.Path) is { } cli)
+        {
+            Assert.True(cli.ExitCode == 0, $"Expected glacier security-check 0 on empty dir (got {cli.ExitCode}):\n{cli.StdOut}\n{cli.StdErr}");
+            Assert.Contains("Scanned 0 files", cli.StdOut);
+        }
     }
 
     [Fact]
@@ -225,6 +281,12 @@ public sealed class SecurityComplianceE2ETests
         var (exitCode, stdout, stderr) = RunSecurityCheck(repoRoot, missingDir);
         Assert.DoesNotContain("Traceback", stderr, StringComparison.OrdinalIgnoreCase);
         Assert.NotEqual(0, exitCode);
+
+        if (TryRunGlacierCliSecurityCheck(repoRoot, missingDir) is { } cli)
+        {
+            Assert.Equal(2, cli.ExitCode);
+            Assert.Contains("[ERROR]", cli.StdErr);
+        }
     }
 
     [Fact]
@@ -243,6 +305,11 @@ public sealed class SecurityComplianceE2ETests
         var (exitCode, stdout, stderr) = RunSecurityCheck(repoRoot, tempScope.Path);
         Assert.True(exitCode == 0, $"Expected binary scan exit 0 (got {exitCode}):\n{stdout}\n{stderr}");
         Assert.DoesNotContain("UnicodeDecodeError", stderr);
+
+        if (TryRunGlacierCliSecurityCheck(repoRoot, tempScope.Path) is { } cli)
+        {
+            Assert.True(cli.ExitCode == 0, $"Expected glacier binary scan exit 0 (got {cli.ExitCode}):\n{cli.StdOut}\n{cli.StdErr}");
+        }
     }
 
     [Fact]
@@ -265,6 +332,12 @@ public sealed class SecurityComplianceE2ETests
         var (exitCode, stdout, stderr) = RunSecurityCheck(repoRoot, tempScope.Path);
         Assert.True(exitCode == 0, $"Expected sanitized empty template exit 0 (got {exitCode}):\n{stdout}\n{stderr}");
         Assert.Contains("[PASSED]", stdout);
+
+        if (TryRunGlacierCliSecurityCheck(repoRoot, tempScope.Path) is { } cli)
+        {
+            Assert.True(cli.ExitCode == 0, $"Expected glacier sanitized empty template exit 0 (got {cli.ExitCode}):\n{cli.StdOut}\n{cli.StdErr}");
+            Assert.Contains("[PASSED]", cli.StdOut);
+        }
     }
 
     [Fact]
@@ -292,9 +365,12 @@ public sealed class SecurityComplianceE2ETests
             Assert.True(File.Exists(Path.Combine(repoRoot, rel)), $"Missing pillar project: {rel}");
         }
 
-        // 2. Verify Glacier.Tune is bound to local Glacier.Inference (UseLocalProjectReferences=true) and new R4/R5 APIs exist
-        string infAssemblyPath = typeof(KlDivergenceVerifier).Assembly.Location;
-        Assert.Contains(Path.GetFullPath(repoRoot), Path.GetFullPath(infAssemblyPath), StringComparison.OrdinalIgnoreCase);
+        // 2. Verify Glacier.Tune local binding when compiled in monorepo mode and R4/R5 APIs exist
+        string infAssemblyPath = Path.GetFullPath(typeof(KlDivergenceVerifier).Assembly.Location);
+        if (!infAssemblyPath.Contains($"{Path.DirectorySeparatorChar}.nuget{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase))
+        {
+            Assert.Contains(Path.GetFullPath(repoRoot), infAssemblyPath, StringComparison.OrdinalIgnoreCase);
+        }
 
         Assert.Equal(0, new TrainingArguments().EvalSteps);
         Assert.True(typeof(PostTuneEvaluator).GetMethod(nameof(PostTuneEvaluator.Evaluate),
@@ -304,5 +380,11 @@ public sealed class SecurityComplianceE2ETests
         var (exitCode, stdout, stderr) = RunSecurityCheck(repoRoot, "Glacier.Tune");
         Assert.True(exitCode == 0, $"Full repo security_check.py failed (exit {exitCode}):\n{stdout}\n{stderr}");
         Assert.Contains("[PASSED]", stdout);
+
+        if (TryRunGlacierCliSecurityCheck(repoRoot, "Glacier.Tune") is { } cli)
+        {
+            Assert.True(cli.ExitCode == 0, $"glacier security-check failed on Glacier.Tune (exit {cli.ExitCode}):\n{cli.StdOut}\n{cli.StdErr}");
+            Assert.Contains("[PASSED]", cli.StdOut);
+        }
     }
 }

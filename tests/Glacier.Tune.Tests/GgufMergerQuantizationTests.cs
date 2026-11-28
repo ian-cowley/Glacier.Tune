@@ -195,7 +195,10 @@ public unsafe class GgufMergerQuantizationTests
     {
         // Dimension 5120 (multiple of 256)
         Assert.Equal(GgufType.Q4_K, GgufMerger.ResolveTargetType(TargetQuantization.Auto, GgufType.Q4_K, 5120));
-        Assert.Equal(GgufType.Q4_K, GgufMerger.ResolveTargetType(TargetQuantization.Auto, GgufType.Q6_K, 5120));
+        Assert.Equal(GgufType.Q6_K, GgufMerger.ResolveTargetType(TargetQuantization.Auto, GgufType.Q6_K, 5120));
+        Assert.Equal(GgufType.F16, GgufMerger.ResolveTargetType(TargetQuantization.Auto, GgufType.F16, 5120));
+        Assert.Equal(GgufType.BF16, GgufMerger.ResolveTargetType(TargetQuantization.Auto, GgufType.BF16, 5120));
+        Assert.Equal(GgufType.F32, GgufMerger.ResolveTargetType(TargetQuantization.Auto, GgufType.F32, 5120));
         Assert.Equal(GgufType.Q4_0, GgufMerger.ResolveTargetType(TargetQuantization.Auto, GgufType.Q4_0, 5120));
         Assert.Equal(GgufType.Q8_0, GgufMerger.ResolveTargetType(TargetQuantization.Auto, GgufType.Q8_0, 5120));
 

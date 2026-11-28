@@ -2,6 +2,7 @@
 namespace Glacier.Tune.Trainer;
 
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -10,7 +11,9 @@ using System.Threading.Tasks;
 using Glacier.Inference.Gpu.D3D12;
 using Glacier.Inference.Model;
 using Glacier.Tune.Data;
+using Glacier.Tune.Diagnostics;
 using Glacier.Tune.Kernels;
+using Glacier.Tune.Model;
 
 /// <summary>
 /// Pure-C# .NET 10 post-Epilogue Head-LoRA trainer for Thinking Machines Lab's Inkling-2-Mini.
@@ -58,31 +61,69 @@ public sealed unsafe class Inkling2HeadLoraTrainer
 
         public void Save(string path)
         {
-            string? dir = Path.GetDirectoryName(path);
-            if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
-            using var fs = File.Create(path);
-            using var bw = new BinaryWriter(fs);
-            bw.Write(CacheMagic);
-            bw.Write(EmbdDim);
-            bw.Write(Targets.Length);
-            bw.Flush();
-            fs.Write(MemoryMarshal.AsBytes(Targets.AsSpan()));
-            fs.Write(MemoryMarshal.AsBytes(HiddenFp16.AsSpan()));
+            string tmp = LoraBinaryFormat.CreateTempSiblingPath(path);
+            try
+            {
+                using (var fs = File.Create(tmp))
+                using (var bw = new BinaryWriter(fs))
+                {
+                    bw.Write(CacheMagic);
+                    bw.Write(EmbdDim);
+                    bw.Write(Targets.Length);
+                    bw.Flush();
+                    fs.Write(MemoryMarshal.AsBytes(Targets.AsSpan()));
+                    fs.Write(MemoryMarshal.AsBytes(HiddenFp16.AsSpan()));
+                    fs.Flush(true);
+                }
+                File.Move(tmp, path, overwrite: true);
+            }
+            catch
+            {
+                try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }
+                throw;
+            }
         }
 
         public static CachedHiddenDataset Load(string path)
         {
             using var fs = File.OpenRead(path);
+            if (fs.Length < 12)
+                throw new InvalidDataException($"Truncated hidden cache header in '{path}' ({fs.Length} bytes).");
+
             using var br = new BinaryReader(fs);
             uint magic = br.ReadUInt32();
             if (magic != CacheMagic)
                 throw new InvalidDataException($"Invalid hidden cache magic: 0x{magic:X8}");
+
             int embdDim = br.ReadInt32();
             int count = br.ReadInt32();
+            if (embdDim <= 0 || embdDim > 65536)
+                throw new InvalidDataException($"Invalid hidden cache embedding dimension: {embdDim}.");
+            if (count < 0 || count > int.MaxValue / sizeof(int))
+                throw new InvalidDataException($"Invalid hidden cache count: {count}.");
+
+            long totalHiddenElems = (long)count * embdDim;
+            if (totalHiddenElems > int.MaxValue / sizeof(ushort))
+                throw new InvalidDataException($"Hidden cache element count {totalHiddenElems} exceeds maximum buffer size.");
+
+            long expectedPayloadBytes = checked((long)count * sizeof(int) + totalHiddenElems * sizeof(ushort));
+            long remaining = fs.Length - fs.Position;
+            if (expectedPayloadBytes != remaining)
+                throw new InvalidDataException($"Hidden cache payload size mismatch in '{path}': expected {expectedPayloadBytes} bytes, found {remaining}.");
+
             var targets = new int[count];
-            var hidden = new Half[checked(count * embdDim)];
+            var hidden = new Half[checked((int)totalHiddenElems)];
             fs.ReadExactly(MemoryMarshal.AsBytes(targets.AsSpan()));
             fs.ReadExactly(MemoryMarshal.AsBytes(hidden.AsSpan()));
+
+            for (int i = 0; i < hidden.Length; i++)
+            {
+                if (!Half.IsFinite(hidden[i]))
+                {
+                    throw new InvalidDataException($"Non-finite FP16 hidden value ({hidden[i]}) in cache '{path}' at index {i}.");
+                }
+            }
+
             return new CachedHiddenDataset(embdDim, hidden, targets);
         }
     }
@@ -100,7 +141,20 @@ public sealed unsafe class Inkling2HeadLoraTrainer
         if (File.Exists(cachePath))
         {
             var cached = CachedHiddenDataset.Load(cachePath);
-            Console.WriteLine($"  [Cache Hit:{splitLabel}] Loaded {cached.Count:N0} supervised tokens ({cached.EmbdDim}d FP16) from {cachePath}");
+            if (cached.EmbdDim != model.EmbeddingDim)
+            {
+                throw new InvalidDataException(
+                    $"Cached hidden embedding dimension ({cached.EmbdDim}) does not match model embedding dimension ({model.EmbeddingDim}).");
+            }
+            for (int i = 0; i < cached.Targets.Length; i++)
+            {
+                if ((uint)cached.Targets[i] >= (uint)model.VocabSize)
+                {
+                    throw new InvalidDataException(
+                        $"Cached target token {cached.Targets[i]} at index {i} is outside model vocabulary bounds [0, {model.VocabSize}).");
+                }
+            }
+            GlacierDiagnostics.LogInformation($"  [Cache Hit:{splitLabel}] Loaded {cached.Count:N0} supervised tokens ({cached.EmbdDim}d FP16) from {cachePath}");
             return cached;
         }
 
@@ -129,18 +183,20 @@ public sealed unsafe class Inkling2HeadLoraTrainer
                 model.ExtractHiddenStatesBatch(ex.InputIds.AsSpan(0, n - 1), 0, seqHidden.AsSpan(0, (n - 1) * embd));
                 totalInputTokens += n - 1;
 
-                // Collect supervised positions where labels[t + 1] != IgnoreIndex
+                // Collect supervised positions where pre-shifted labels[t] != IgnoreIndex
                 int supInEx = 0;
                 for (int t = 0; t < n - 1; t++)
-                    if (ex.Labels[t + 1] != Inkling2Dataset.IgnoreIndex) supInEx++;
+                    if (ex.Labels[t] != Inkling2Dataset.IgnoreIndex) supInEx++;
                 if (supInEx == 0) continue;
 
                 var chunk = new Half[supInEx * embd];
                 int dstRow = 0;
                 for (int t = 0; t < n - 1; t++)
                 {
-                    int target = ex.Labels[t + 1];
+                    int target = ex.Labels[t];
                     if (target == Inkling2Dataset.IgnoreIndex) continue;
+                    if ((uint)target >= (uint)model.VocabSize)
+                        throw new InvalidDataException($"Target token {target} at example {exIdx} pos {t} is outside vocabulary [0, {model.VocabSize}).");
                     targetsList.Add(target);
                     int srcOff = t * embd;
                     int dstOff = dstRow * embd;
@@ -153,7 +209,7 @@ public sealed unsafe class Inkling2HeadLoraTrainer
                 if ((exIdx + 1) % 10 == 0 || exIdx == dataset.Count - 1)
                 {
                     double tps = totalInputTokens / Math.Max(0.001, sw.Elapsed.TotalSeconds);
-                    Console.WriteLine($"  [Extract:{splitLabel}] {exIdx + 1}/{dataset.Count} examples | {targetsList.Count:N0} supervised tokens | {tps:F1} tok/s | {sw.Elapsed.TotalSeconds:F1}s");
+                    GlacierDiagnostics.LogInformation($"  [Extract:{splitLabel}] {exIdx + 1}/{dataset.Count} examples | {targetsList.Count:N0} supervised tokens | {tps:F1} tok/s | {sw.Elapsed.TotalSeconds:F1}s");
                 }
             }
         }
@@ -173,7 +229,7 @@ public sealed unsafe class Inkling2HeadLoraTrainer
 
         var result = new CachedHiddenDataset(embd, allHidden, targetsList.ToArray());
         result.Save(cachePath);
-        Console.WriteLine($"  [Cache Saved:{splitLabel}] {result.Count:N0} supervised tokens -> {cachePath}");
+        GlacierDiagnostics.LogInformation($"  [Cache Saved:{splitLabel}] {result.Count:N0} supervised tokens -> {cachePath}");
         return result;
     }
 
@@ -202,6 +258,9 @@ public sealed unsafe class Inkling2HeadLoraTrainer
         float scale = adapter.Scaling;
         bool useSiLU = adapter.UseSiLU;
         bool useKl = klBeta > 0.0f;
+
+        if ((uint)targetToken >= (uint)vocab)
+            throw new ArgumentOutOfRangeException(nameof(targetToken), $"targetToken {targetToken} is outside vocabulary [0, {vocab}).");
 
         // If KL regularization is enabled, compute frozen base distribution p_base = softmax(softcap(baseRawLogits))
         int argMaxBase = 0;
@@ -241,171 +300,184 @@ public sealed unsafe class Inkling2HeadLoraTrainer
             }
         }
 
-        Span<float> u = rank <= 256 ? stackalloc float[rank] : new float[rank];
-        Span<float> a = rank <= 256 ? stackalloc float[rank] : new float[rank];
-
-        baseRawLogits.Slice(0, vocab).CopyTo(workLogits.Slice(0, vocab));
-
-        fixed (float* pH = hidden)
-        fixed (float* pA = adapter.A)
-        fixed (float* pB = adapter.B)
-        fixed (float* pZ = workLogits)
+        float[] uArr = ArrayPool<float>.Shared.Rent(rank);
+        float[] aArr = ArrayPool<float>.Shared.Rent(rank);
+        float[] hArr = ArrayPool<float>.Shared.Rent(embd);
+        try
         {
-            for (int r = 0; r < rank; r++)
+            Span<float> u = uArr.AsSpan(0, rank);
+            Span<float> a = aArr.AsSpan(0, rank);
+            hidden.Slice(0, embd).CopyTo(hArr.AsSpan(0, embd));
+
+            baseRawLogits.Slice(0, vocab).CopyTo(workLogits.Slice(0, vocab));
+
+            fixed (float* pH = hArr)
+            fixed (float* pA = adapter.A)
+            fixed (float* pB = adapter.B)
+            fixed (float* pZ = workLogits)
             {
-                float ur = Inkling2HeadLoraAdapter.DotSimd(pA + r * embd, pH, embd);
-                u[r] = ur;
-                if (useSiLU)
+                for (int r = 0; r < rank; r++)
                 {
-                    float sig = 1.0f / (1.0f + MathF.Exp(-ur));
-                    a[r] = ur * sig;
+                    float ur = Inkling2HeadLoraAdapter.DotSimd(pA + r * embd, pH, embd);
+                    u[r] = ur;
+                    if (useSiLU)
+                    {
+                        float sig = 1.0f / (1.0f + MathF.Exp(-ur));
+                        a[r] = ur * sig;
+                    }
+                    else
+                    {
+                        a[r] = ur;
+                    }
+                }
+
+                for (int r = 0; r < rank; r++)
+                {
+                    float w = a[r] * scale;
+                    if (w != 0f)
+                        Inkling2HeadLoraAdapter.AxpySimd(pZ, pB + r * vocab, w, vocab);
+                }
+            }
+
+            // Apply FinalLogitSoftcapping and compute Barron-stabilized split-sum softmax + NLL (+ KL) loss
+            float maxLogit = float.NegativeInfinity;
+            int argMax = 0;
+            float invCap = softcap > 0f ? 1.0f / softcap : 0f;
+            for (int v = 0; v < vocab; v++)
+            {
+                float zRaw = workLogits[v];
+                float z = zRaw;
+                if (softcap > 0f)
+                {
+                    float t = MathF.Tanh(zRaw * invCap);
+                    z = softcap * t;
+                    workDzRaw[v] = 1.0f - t * t; // store softcap derivative temporarily
                 }
                 else
                 {
-                    a[r] = ur;
+                    workDzRaw[v] = 1.0f;
+                }
+                workLogits[v] = z;
+                if (v == 0 || z > maxLogit)
+                {
+                    maxLogit = z;
+                    argMax = v;
                 }
             }
 
-            for (int r = 0; r < rank; r++)
-            {
-                float w = a[r] * scale;
-                if (w != 0f)
-                    Inkling2HeadLoraAdapter.AxpySimd(pZ, pB + r * vocab, w, vocab);
-            }
-        }
-
-        // Apply FinalLogitSoftcapping and compute Barron-stabilized split-sum softmax + NLL (+ KL) loss
-        float maxLogit = float.NegativeInfinity;
-        int argMax = 0;
-        float invCap = softcap > 0f ? 1.0f / softcap : 0f;
-        for (int v = 0; v < vocab; v++)
-        {
-            float zRaw = workLogits[v];
-            float z = zRaw;
-            if (softcap > 0f)
-            {
-                float t = MathF.Tanh(zRaw * invCap);
-                z = softcap * t;
-                workDzRaw[v] = 1.0f - t * t; // store softcap derivative temporarily
-            }
-            else
-            {
-                workDzRaw[v] = 1.0f;
-            }
-            workLogits[v] = z;
-            if (v == 0 || z > maxLogit)
-            {
-                maxLogit = z;
-                argMax = v;
-            }
-        }
-
-        double sumOther = 0.0;
-        for (int v = 0; v < vocab; v++)
-        {
-            if (v != argMax)
-                sumOther += Math.Exp((double)workLogits[v] - maxLogit);
-        }
-
-        double logZOffset = FusedCrossEntropyLoss.Log1p(sumOther);
-        double invSum = 1.0 / (1.0 + sumOther);
-        double nll = (targetToken == argMax)
-            ? logZOffset
-            : (logZOffset + ((double)maxLogit - (double)workLogits[targetToken]));
-        double totalLoss = nll;
-
-        if (useKl)
-        {
-            double klSum = 0.0;
+            double sumOther = 0.0;
             for (int v = 0; v < vocab; v++)
             {
-                double pb = (v == argMaxBase) ? invSumBase : workBaseProbs[v];
-                if (pb > 0.0)
-                {
-                    double logBase = (v == argMaxBase) ? -baseLogZOffset : Math.Log(pb);
-                    double logP = (v == argMax)
-                        ? -logZOffset
-                        : (((double)workLogits[v] - maxLogit) - logZOffset);
-                    klSum += pb * (logBase - logP);
-                }
+                if (v != argMax)
+                    sumOther += Math.Exp((double)workLogits[v] - maxLogit);
             }
-            totalLoss += klBeta * Math.Max(0.0, klSum);
-        }
 
-        float loss = (float)totalLoss;
-        if (!accumulateGrad)
-            return loss;
+            double logZOffset = FusedCrossEntropyLoss.Log1p(sumOther);
+            double invSum = 1.0 / (1.0 + sumOther);
+            double nll = (targetToken == argMax)
+                ? logZOffset
+                : (logZOffset + ((double)maxLogit - (double)workLogits[targetToken]));
+            double totalLoss = nll;
 
-        // dz_raw = [(prob - one_hot(target)) + klBeta * (prob - p_base)] * dSoftcap
-        for (int v = 0; v < vocab; v++)
-        {
-            double prob = (v == argMax)
-                ? invSum
-                : Math.Exp((double)workLogits[v] - maxLogit) * invSum;
-
-            double ceGrad = (v == targetToken && v == argMax)
-                ? (-sumOther * invSum)
-                : (prob - (v == targetToken ? 1.0 : 0.0));
-
-            double dz = ceGrad;
             if (useKl)
             {
-                double klGrad = (v == argMax && v == argMaxBase)
-                    ? ((baseSumOther - sumOther) * invSum * invSumBase)
-                    : (prob - workBaseProbs[v]);
-                dz += klBeta * klGrad;
+                double klSum = 0.0;
+                for (int v = 0; v < vocab; v++)
+                {
+                    double pb = (v == argMaxBase) ? invSumBase : workBaseProbs[v];
+                    if (pb > 0.0)
+                    {
+                        double logBase = (v == argMaxBase) ? -baseLogZOffset : Math.Log(pb);
+                        double logP = (v == argMax)
+                            ? -logZOffset
+                            : (((double)workLogits[v] - maxLogit) - logZOffset);
+                        klSum += pb * (logBase - logP);
+                    }
+                }
+                totalLoss += klBeta * Math.Max(0.0, klSum);
             }
 
-            workDzRaw[v] = (float)(dz * workDzRaw[v]);
-        }
+            float loss = (float)totalLoss;
+            if (!accumulateGrad)
+                return loss;
 
-        // Parallelize across rank rows for fast AVX-512 gradB += (scale * a[r]) * dz_raw and da[r] = scale * Dot(B[r], dz_raw)
-        float[] uArr = u.ToArray();
-        float[] aArr = a.ToArray();
-        float[] hArr = hidden.Slice(0, embd).ToArray();
-
-        fixed (float* pDzRaw = workDzRaw)
-        fixed (float* pB = adapter.B)
-        fixed (float* pGradB = gradB)
-        fixed (float* pGradA = gradA)
-        fixed (float* pH = hArr)
-        {
-            nint dzPtr = (nint)pDzRaw;
-            nint bPtr = (nint)pB;
-            nint gbPtr = (nint)pGradB;
-            nint gaPtr = (nint)pGradA;
-            nint hPtr = (nint)pH;
-
-            Parallel.For(0, rank, r =>
+            // dz_raw = [(prob - one_hot(target)) + klBeta * (prob - p_base)] * dSoftcap
+            for (int v = 0; v < vocab; v++)
             {
-                float* dz = (float*)dzPtr;
-                float* bRow = (float*)bPtr + r * vocab;
-                float* gbRow = (float*)gbPtr + r * vocab;
-                float* gaRow = (float*)gaPtr + r * embd;
-                float* hVec = (float*)hPtr;
+                double prob = (v == argMax)
+                    ? invSum
+                    : Math.Exp((double)workLogits[v] - maxLogit) * invSum;
 
-                // gradB[r, :] += (scale * a[r]) * dz_raw
-                float wB = scale * aArr[r];
-                if (wB != 0f)
-                    Inkling2HeadLoraAdapter.AxpySimd(gbRow, dz, wB, vocab);
+                double ceGrad = (v == targetToken && v == argMax)
+                    ? (-sumOther * invSum)
+                    : (prob - (v == targetToken ? 1.0 : 0.0));
 
-                // da[r] = scale * dot(B[r, :], dz_raw)
-                float da = scale * Inkling2HeadLoraAdapter.DotSimd(bRow, dz, vocab);
-                float du = da;
-                if (useSiLU)
+                double dz = ceGrad;
+                if (useKl)
                 {
-                    float ur = uArr[r];
-                    float sig = 1.0f / (1.0f + MathF.Exp(-ur));
-                    du = da * (sig * (1.0f + ur * (1.0f - sig)));
+                    double klGrad = (v == argMax && v == argMaxBase)
+                        ? ((baseSumOther - sumOther) * invSum * invSumBase)
+                        : (prob - workBaseProbs[v]);
+                    dz += klBeta * klGrad;
                 }
 
-                // gradA[r, :] += du * hidden
-                if (du != 0f)
-                    Inkling2HeadLoraAdapter.AxpySimd(gaRow, hVec, du, embd);
-            });
-        }
+                workDzRaw[v] = (float)(dz * workDzRaw[v]);
+            }
 
-        return loss;
+            // Parallelize across rank rows for fast AVX-512 gradB += (scale * a[r]) * dz_raw and da[r] = scale * Dot(B[r], dz_raw)
+            fixed (float* pDzRaw = workDzRaw)
+            fixed (float* pB = adapter.B)
+            fixed (float* pGradB = gradB)
+            fixed (float* pGradA = gradA)
+            fixed (float* pU = uArr)
+            fixed (float* pAct = aArr)
+            fixed (float* pH = hArr)
+            {
+                nint dzPtr = (nint)pDzRaw;
+                nint bPtr = (nint)pB;
+                nint gbPtr = (nint)pGradB;
+                nint gaPtr = (nint)pGradA;
+                nint uPtr = (nint)pU;
+                nint aPtr = (nint)pAct;
+                nint hPtr = (nint)pH;
+
+                Parallel.For(0, rank, r =>
+                {
+                    float* dz = (float*)dzPtr;
+                    float* bRow = (float*)bPtr + r * vocab;
+                    float* gbRow = (float*)gbPtr + r * vocab;
+                    float* gaRow = (float*)gaPtr + r * embd;
+                    float* hVec = (float*)hPtr;
+
+                    // gradB[r, :] += (scale * a[r]) * dz_raw
+                    float wB = scale * ((float*)aPtr)[r];
+                    if (wB != 0f)
+                        Inkling2HeadLoraAdapter.AxpySimd(gbRow, dz, wB, vocab);
+
+                    // da[r] = scale * dot(B[r, :], dz_raw)
+                    float da = scale * Inkling2HeadLoraAdapter.DotSimd(bRow, dz, vocab);
+                    float du = da;
+                    if (useSiLU)
+                    {
+                        float ur = ((float*)uPtr)[r];
+                        float sig = 1.0f / (1.0f + MathF.Exp(-ur));
+                        du = da * (sig * (1.0f + ur * (1.0f - sig)));
+                    }
+
+                    // gradA[r, :] += du * hidden
+                    if (du != 0f)
+                        Inkling2HeadLoraAdapter.AxpySimd(gaRow, hVec, du, embd);
+                });
+            }
+
+            return loss;
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(uArr);
+            ArrayPool<float>.Shared.Return(aArr);
+            ArrayPool<float>.Shared.Return(hArr);
+        }
     }
 
     /// <summary>
@@ -439,18 +511,18 @@ public sealed unsafe class Inkling2HeadLoraTrainer
         float[] workBaseProbs = config.KlBeta > 0f ? new float[vocab] : Array.Empty<float>();
 
         long totalParams = adapter.A.Length + adapter.B.Length;
-        Console.WriteLine($"================================================================================");
-        Console.WriteLine($"  GLACIER.TUNE PURE-C# INKLING-2 HEAD-LoRA TRAINER");
-        Console.WriteLine($"  Rank={config.Rank}, Alpha={config.Alpha}, SiLU={config.UseSiLU}, KlBeta={config.KlBeta} | Trainable={totalParams:N0} FP32 params");
-        Console.WriteLine($"  Train Tokens={trainData.Count:N0} | Val Tokens={valData?.Count ?? 0:N0} | Epochs={config.Epochs} | Batch={config.BatchTokens}");
-        Console.WriteLine($"================================================================================");
+        GlacierDiagnostics.LogInformation($"================================================================================");
+        GlacierDiagnostics.LogInformation($"  GLACIER.TUNE PURE-C# INKLING-2 HEAD-LoRA TRAINER");
+        GlacierDiagnostics.LogInformation($"  Rank={config.Rank}, Alpha={config.Alpha}, SiLU={config.UseSiLU}, KlBeta={config.KlBeta} | Trainable={totalParams:N0} FP32 params");
+        GlacierDiagnostics.LogInformation($"  Train Tokens={trainData.Count:N0} | Val Tokens={valData?.Count ?? 0:N0} | Epochs={config.Epochs} | Batch={config.BatchTokens}");
+        GlacierDiagnostics.LogInformation($"================================================================================");
 
         float bestValLoss = float.PositiveInfinity;
         if (valData != null && valData.Count > 0)
         {
             float baseValLoss = EvaluateLoss(model, adapter, valData, hBuf, baseLogits, workLogits, workDzRaw, softcap);
             bestValLoss = baseValLoss;
-            Console.WriteLine($"  [Epoch 0 / Base] val_loss={baseValLoss:F4} (ppl={MathF.Exp(Math.Min(20f, baseValLoss)):F2})");
+            GlacierDiagnostics.LogInformation($"  [Epoch 0 / Base] val_loss={baseValLoss:F4} (ppl={MathF.Exp(Math.Min(20f, baseValLoss)):F2})");
         }
 
         int stepsPerEpoch = (trainData.Count + config.BatchTokens - 1) / config.BatchTokens;
@@ -506,7 +578,7 @@ public sealed unsafe class Inkling2HeadLoraTrainer
                 if (globalStep % 25 == 0 || start + count >= order.Length)
                 {
                     double tokPerSec = epochTokens / Math.Max(0.001, swEpoch.Elapsed.TotalSeconds);
-                    Console.WriteLine($"  [Epoch {epoch}/{config.Epochs} Step {globalStep,4}/{totalSteps}] batch_loss={batchLoss / count:F4} | lr={lr:E2} | {tokPerSec:F1} tok/s");
+                    GlacierDiagnostics.LogInformation($"  [Epoch {epoch}/{config.Epochs} Step {globalStep,4}/{totalSteps}] batch_loss={batchLoss / count:F4} | lr={lr:E2} | {tokPerSec:F1} tok/s");
                 }
             }
 
@@ -520,16 +592,16 @@ public sealed unsafe class Inkling2HeadLoraTrainer
                     bestValLoss = valLoss;
                     adapter.Save(outputPath);
                 }
-                Console.WriteLine($"  >>> [Epoch {epoch} Done in {swEpoch.Elapsed.TotalSeconds:F1}s] train_loss={avgTrainLoss:F4} | val_loss={valLoss:F4} (ppl={MathF.Exp(Math.Min(20f, valLoss)):F2}) {(improved ? "*SAVED BEST*" : "")}");
+                GlacierDiagnostics.LogInformation($"  >>> [Epoch {epoch} Done in {swEpoch.Elapsed.TotalSeconds:F1}s] train_loss={avgTrainLoss:F4} | val_loss={valLoss:F4} (ppl={MathF.Exp(Math.Min(20f, valLoss)):F2}) {(improved ? "*SAVED BEST*" : "")}");
             }
             else
             {
                 adapter.Save(outputPath);
-                Console.WriteLine($"  >>> [Epoch {epoch} Done in {swEpoch.Elapsed.TotalSeconds:F1}s] train_loss={avgTrainLoss:F4} *SAVED*");
+                GlacierDiagnostics.LogInformation($"  >>> [Epoch {epoch} Done in {swEpoch.Elapsed.TotalSeconds:F1}s] train_loss={avgTrainLoss:F4} *SAVED*");
             }
         }
 
-        Console.WriteLine($"  [Training Complete] Total elapsed: {swTotal.Elapsed.TotalSeconds:F1}s | Best adapter: {outputPath}");
+        GlacierDiagnostics.LogInformation($"  [Training Complete] Total elapsed: {swTotal.Elapsed.TotalSeconds:F1}s | Best adapter: {outputPath}");
         return File.Exists(outputPath) ? Inkling2HeadLoraAdapter.Load(outputPath) : adapter;
     }
 

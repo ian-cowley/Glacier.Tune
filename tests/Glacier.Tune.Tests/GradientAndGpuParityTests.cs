@@ -172,6 +172,7 @@ public unsafe class GradientAndGpuParityTests
     }
 
     [Theory]
+    [Trait("Hardware", "Gpu")]
     [InlineData(GgufType.F32, 64, 128, 64, false)]
     [InlineData(GgufType.Q8_0, 64, 128, 64, true)]
     [InlineData(GgufType.Q4_0, 64, 128, 4608, false)]  // Multi-tile vocabulary (> 4096) in VRAM!

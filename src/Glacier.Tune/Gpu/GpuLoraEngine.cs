@@ -1,12 +1,14 @@
 namespace Glacier.Tune.Gpu;
 
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using Glacier.Inference.Gguf;
 using Glacier.Inference.Gpu;
 using Glacier.Inference.Model;
 using Glacier.Tune.Diagnostics;
+using Glacier.Tune.Model;
 
 /// <summary>
 /// High-performance GPU VRAM accelerator for Glacier.Tune.
@@ -34,10 +36,11 @@ public sealed unsafe partial class GpuLoraEngine : IDisposable
     private readonly IntPtr _fnVecAdd;
     private readonly IntPtr _fnRopeBatch;
     private readonly IntPtr _fnAttnTrainFwd;
-    private readonly IntPtr _fnAttnTrainBwdDqDs;
+    private readonly IntPtr _fnAttnBwdPreprocessD;
+    private readonly IntPtr _fnAttnTrainBwdDq;
     private readonly IntPtr _fnAttnTrainBwdDkDv;
 
-    // Extended forward & transpose-backward kernel handles (from Glacier.Tune tune_bwd.cubin)
+    // Extended forward, norm, LoRA, CE & transpose-backward kernel handles (from Glacier.Tune tune_bwd.cubin)
     private readonly IntPtr _fnGemmF32Batch;
     private readonly IntPtr _fnGemmQ4_0Batch;
     private readonly IntPtr _fnGemmQ4KBwd;
@@ -45,6 +48,18 @@ public sealed unsafe partial class GpuLoraEngine : IDisposable
     private readonly IntPtr _fnGemmQ8_0Bwd;
     private readonly IntPtr _fnGemmQ4_0Bwd;
     private readonly IntPtr _fnGemmF32Bwd;
+    private readonly IntPtr _fnRmsNormBwd;
+    private readonly IntPtr _fnResAddOut;
+    private readonly IntPtr _fnScaleBuf;
+    private readonly IntPtr _fnLoraProjLr;
+    private readonly IntPtr _fnLoraAddB;
+    private readonly IntPtr _fnLoraBwdDb;
+    private readonly IntPtr _fnLoraBwdDlr;
+    private readonly IntPtr _fnLoraBwdDa;
+    private readonly IntPtr _fnLoraBwdDx;
+    private readonly IntPtr _fnCeTileStats;
+    private readonly IntPtr _fnCeFinalizeLoss;
+    private readonly IntPtr _fnCeWriteGrad;
 
     // Scratch buffers in VRAM
     private IntPtr _dScratchX;
@@ -73,19 +88,44 @@ public sealed unsafe partial class GpuLoraEngine : IDisposable
     private IntPtr _dVBuf;
     private nuint _vBufCap;
 
-    // Dedicated Attention VRAM buffers
+    // Dedicated Attention VRAM buffers (O(H * S) FlashAttention-2 LSE + D)
     private IntPtr _dAttnOut;
     private nuint _attnOutCap;
-    private IntPtr _dAttnProbs;
-    private nuint _attnProbsCap;
-    private IntPtr _dAttnDs;
-    private nuint _attnDsCap;
+    private IntPtr _dAttnLse;
+    private nuint _attnLseCap;
+    private IntPtr _dAttnD;
+    private nuint _attnDCap;
     private IntPtr _dDq;
     private nuint _dqCap;
     private IntPtr _dDk;
     private nuint _dkCap;
     private IntPtr _dDv;
     private nuint _dvCap;
+
+    // Dedicated Cross-Entropy & LoRA VRAM scratch buffers
+    private IntPtr _dCeMax;
+    private IntPtr _dCeArgMax;
+    private IntPtr _dCeSumOther;
+    private IntPtr _dCeTargetLogits;
+    private IntPtr _dCeInvDenom;
+    private IntPtr _dCeLosses;
+    private IntPtr _dCeTargetIds;
+    private int _ceTokenCap;
+
+    private IntPtr _dLoraTemp;
+    private nuint _loraTempCap;
+
+    private sealed class LoraGpuBuffers
+    {
+        public IntPtr DA;
+        public IntPtr DB;
+        public IntPtr DGradA;
+        public IntPtr DGradB;
+        public nuint ABytes;
+        public nuint BBytes;
+    }
+
+    private readonly Dictionary<LoraAdapter, LoraGpuBuffers> _loraBuffers = new();
 
     // VRAM Weight pointers for transformer layers
     private readonly IntPtr[] _dQLayers;
@@ -99,17 +139,21 @@ public sealed unsafe partial class GpuLoraEngine : IDisposable
     private readonly IntPtr[] _dGateLayers;
     private readonly IntPtr[] _dUpLayers;
     private readonly IntPtr[] _dDownLayers;
+    private readonly IntPtr[] _dAttnNormLayers;
+    private readonly IntPtr[] _dFfnNormLayers;
 
-    // LM Head in VRAM
+    // LM Head & Final RMSNorm weight in VRAM
     private IntPtr _dLmHeadWeight;
+    private IntPtr _dOutNormWeight;
 
     private bool _disposed;
 
     public GpuContext Gpu => _gpu;
     public IntPtr LmHeadWeight => _dLmHeadWeight;
+    public IntPtr OutNormWeight => _dOutNormWeight;
 
     public bool SupportsAttention(int seqLen, int headDim) =>
-        headDim is > 0 and <= 1024 && (long)seqLen * sizeof(float) <= 48 * 1024;
+        seqLen > 0 && headDim is > 0 and <= 1024;
 
     public GpuLoraEngine(ModelWeights weights, int deviceOrdinal = 0)
     {
@@ -126,6 +170,8 @@ public sealed unsafe partial class GpuLoraEngine : IDisposable
         _dGateLayers = new IntPtr[blockCount];
         _dUpLayers = new IntPtr[blockCount];
         _dDownLayers = new IntPtr[blockCount];
+        _dAttnNormLayers = new IntPtr[blockCount];
+        _dFfnNormLayers = new IntPtr[blockCount];
 
         _gpu = new GpuContext(deviceOrdinal);
 
@@ -151,7 +197,8 @@ public sealed unsafe partial class GpuLoraEngine : IDisposable
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRopeBatch, _module, "rope_batch"), "ModuleGetFunction(rope_batch)");
 
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttnTrainFwd, _bwdModule, "tune_attn_causal_gqa_fwd"), "ModuleGetFunction(tune_attn_causal_gqa_fwd)");
-            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttnTrainBwdDqDs, _bwdModule, "tune_attn_causal_gqa_bwd_dq_ds"), "ModuleGetFunction(tune_attn_causal_gqa_bwd_dq_ds)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttnBwdPreprocessD, _bwdModule, "tune_attn_bwd_preprocess_d"), "ModuleGetFunction(tune_attn_bwd_preprocess_d)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttnTrainBwdDq, _bwdModule, "tune_attn_causal_gqa_bwd_dq"), "ModuleGetFunction(tune_attn_causal_gqa_bwd_dq)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttnTrainBwdDkDv, _bwdModule, "tune_attn_causal_gqa_bwd_dk_dv"), "ModuleGetFunction(tune_attn_causal_gqa_bwd_dk_dv)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmF32Batch, _bwdModule, "gemm_f32_batch"), "ModuleGetFunction(gemm_f32_batch)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmQ4_0Batch, _bwdModule, "gemm_q4_0_batch"), "ModuleGetFunction(gemm_q4_0_batch)");
@@ -160,6 +207,18 @@ public sealed unsafe partial class GpuLoraEngine : IDisposable
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmQ8_0Bwd, _bwdModule, "gemm_q8_0_bwd"), "ModuleGetFunction(gemm_q8_0_bwd)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmQ4_0Bwd, _bwdModule, "gemm_q4_0_bwd"), "ModuleGetFunction(gemm_q4_0_bwd)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmF32Bwd, _bwdModule, "gemm_f32_bwd"), "ModuleGetFunction(gemm_f32_bwd)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRmsNormBwd, _bwdModule, "tune_rmsnorm_bwd"), "ModuleGetFunction(tune_rmsnorm_bwd)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnResAddOut, _bwdModule, "tune_res_add_out"), "ModuleGetFunction(tune_res_add_out)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnScaleBuf, _bwdModule, "tune_scale_buf"), "ModuleGetFunction(tune_scale_buf)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnLoraProjLr, _bwdModule, "tune_lora_proj_lr"), "ModuleGetFunction(tune_lora_proj_lr)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnLoraAddB, _bwdModule, "tune_lora_add_b"), "ModuleGetFunction(tune_lora_add_b)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnLoraBwdDb, _bwdModule, "tune_lora_bwd_db"), "ModuleGetFunction(tune_lora_bwd_db)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnLoraBwdDlr, _bwdModule, "tune_lora_bwd_dlr"), "ModuleGetFunction(tune_lora_bwd_dlr)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnLoraBwdDa, _bwdModule, "tune_lora_bwd_da"), "ModuleGetFunction(tune_lora_bwd_da)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnLoraBwdDx, _bwdModule, "tune_lora_bwd_dx"), "ModuleGetFunction(tune_lora_bwd_dx)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnCeTileStats, _bwdModule, "tune_ce_tile_stats"), "ModuleGetFunction(tune_ce_tile_stats)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnCeFinalizeLoss, _bwdModule, "tune_ce_finalize_loss"), "ModuleGetFunction(tune_ce_finalize_loss)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnCeWriteGrad, _bwdModule, "tune_ce_write_grad"), "ModuleGetFunction(tune_ce_write_grad)");
 
             int initSeq = Math.Min(512, Math.Max(16, weights.ContextLength));
             _scratchXCap = (nuint)((long)initSeq * Math.Max(weights.EmbeddingLength, weights.FeedForwardLength) * sizeof(float));
@@ -202,10 +261,15 @@ public sealed unsafe partial class GpuLoraEngine : IDisposable
             _dvCap = _kBufCap;
             _dDv = _gpu.AllocateDevice(_dvCap);
 
-            _attnProbsCap = (nuint)((long)weights.HeadCount * initSeq * initSeq * sizeof(float));
-            _attnDsCap = _attnProbsCap;
-            _dAttnProbs = _gpu.AllocateDevice(_attnProbsCap);
-            _dAttnDs = _gpu.AllocateDevice(_attnDsCap);
+            _attnLseCap = (nuint)((long)weights.HeadCount * initSeq * sizeof(float));
+            _attnDCap = _attnLseCap;
+            _dAttnLse = _gpu.AllocateDevice(_attnLseCap);
+            _dAttnD = _gpu.AllocateDevice(_attnDCap);
+
+            _loraTempCap = (nuint)((long)initSeq * 128 * sizeof(float));
+            _dLoraTemp = _gpu.AllocateDevice(_loraTempCap);
+
+            EnsureCeCapacity(initSeq);
 
             UploadBaseWeights();
             s_current = this;
@@ -310,6 +374,27 @@ public sealed unsafe partial class GpuLoraEngine : IDisposable
             nuint downBytes = (nuint)GgufTypes.GetRowBytes(lw.FfnDownType, ffnDim) * (nuint)dim;
             _dDownLayers[l] = _gpu.AllocateDevice(downBytes);
             _gpu.CopyToDevice(_dDownLayers[l], (IntPtr)lw.FfnDownWeight, downBytes);
+
+            if (lw.AttnNormWeight != null)
+            {
+                nuint normBytes = (nuint)(dim * sizeof(float));
+                _dAttnNormLayers[l] = _gpu.AllocateDevice(normBytes);
+                _gpu.CopyToDevice(_dAttnNormLayers[l], (IntPtr)lw.AttnNormWeight, normBytes);
+            }
+
+            if (lw.FfnNormWeight != null)
+            {
+                nuint normBytes = (nuint)(dim * sizeof(float));
+                _dFfnNormLayers[l] = _gpu.AllocateDevice(normBytes);
+                _gpu.CopyToDevice(_dFfnNormLayers[l], (IntPtr)lw.FfnNormWeight, normBytes);
+            }
+        }
+
+        if (_weights.OutNormWeight != null)
+        {
+            nuint outNormBytes = (nuint)(dim * sizeof(float));
+            _dOutNormWeight = _gpu.AllocateDevice(outNormBytes);
+            _gpu.CopyToDevice(_dOutNormWeight, (IntPtr)_weights.OutNormWeight, outNormBytes);
         }
 
         nuint outBytes = (nuint)GgufTypes.GetRowBytes(_weights.OutType, dim) * (nuint)_weights.VocabSize;
@@ -331,6 +416,8 @@ public sealed unsafe partial class GpuLoraEngine : IDisposable
     public IntPtr GetGate(int layer) => _dGateLayers[layer];
     public IntPtr GetUp(int layer) => _dUpLayers[layer];
     public IntPtr GetDown(int layer) => _dDownLayers[layer];
+    public IntPtr GetAttnNorm(int layer) => _dAttnNormLayers[layer];
+    public IntPtr GetFfnNorm(int layer) => _dFfnNormLayers[layer];
 
     public void Dispose()
     {
@@ -338,6 +425,20 @@ public sealed unsafe partial class GpuLoraEngine : IDisposable
         _disposed = true;
 
         if (s_current == this) s_current = null;
+
+        if (_gpu.Handle != IntPtr.Zero)
+        {
+            CuDriver.CtxSetCurrent(_gpu.Handle);
+        }
+
+        foreach (var kv in _loraBuffers)
+        {
+            _gpu.FreeDevice(kv.Value.DA);
+            _gpu.FreeDevice(kv.Value.DB);
+            _gpu.FreeDevice(kv.Value.DGradA);
+            _gpu.FreeDevice(kv.Value.DGradB);
+        }
+        _loraBuffers.Clear();
 
         for (int l = 0; l < _dQLayers.Length; l++)
         {
@@ -352,8 +453,11 @@ public sealed unsafe partial class GpuLoraEngine : IDisposable
             _gpu.FreeDevice(_dGateLayers[l]);
             _gpu.FreeDevice(_dUpLayers[l]);
             _gpu.FreeDevice(_dDownLayers[l]);
+            _gpu.FreeDevice(_dAttnNormLayers[l]);
+            _gpu.FreeDevice(_dFfnNormLayers[l]);
         }
 
+        _gpu.FreeDevice(_dOutNormWeight);
         _gpu.FreeDevice(_dLmHeadWeight);
         _gpu.FreeDevice(_dScratchX);
         _gpu.FreeDevice(_dScratchY);
@@ -366,11 +470,19 @@ public sealed unsafe partial class GpuLoraEngine : IDisposable
         _gpu.FreeDevice(_dKBuf);
         _gpu.FreeDevice(_dVBuf);
         _gpu.FreeDevice(_dAttnOut);
-        _gpu.FreeDevice(_dAttnProbs);
-        _gpu.FreeDevice(_dAttnDs);
+        _gpu.FreeDevice(_dAttnLse);
+        _gpu.FreeDevice(_dAttnD);
         _gpu.FreeDevice(_dDq);
         _gpu.FreeDevice(_dDk);
         _gpu.FreeDevice(_dDv);
+        _gpu.FreeDevice(_dLoraTemp);
+        _gpu.FreeDevice(_dCeMax);
+        _gpu.FreeDevice(_dCeArgMax);
+        _gpu.FreeDevice(_dCeSumOther);
+        _gpu.FreeDevice(_dCeTargetLogits);
+        _gpu.FreeDevice(_dCeInvDenom);
+        _gpu.FreeDevice(_dCeLosses);
+        _gpu.FreeDevice(_dCeTargetIds);
 
         if (_gpu.Handle != IntPtr.Zero)
         {

@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -57,79 +58,149 @@ public sealed unsafe class GgufLoraModel : IDisposable
         _weights = weights;
         _tokenizer = tokenizer;
         _config = config;
-        _target = target;
 
-        InitializeBlocks();
-
-        if ((target is GpuTarget.Nvidia or GpuTarget.NvidiaTensorCore or GpuTarget.Auto) && Glacier.Inference.Gpu.GpuContext.IsSupported)
+        if (target is GpuTarget.Direct3D12 or GpuTarget.Vulkan or GpuTarget.Amd or GpuTarget.DualGpu)
         {
-            if (SupportsGpuEngine(weights))
+            throw new NotSupportedException(
+                $"GPU backend '{target}' is not supported by Glacier.Tune. GpuLoraEngine supports NVIDIA CUDA or CPU execution only.");
+        }
+
+        if (target is GpuTarget.Nvidia or GpuTarget.NvidiaTensorCore)
+        {
+            if (!Glacier.Inference.Gpu.GpuContext.IsSupported)
             {
-                try
+                throw new PlatformNotSupportedException(
+                    $"Explicit GPU target '{target}' was requested, but no CUDA-capable NVIDIA GPU or driver is available.");
+            }
+
+            if (!SupportsGpuEngine(weights, out string unsupportedReason))
+            {
+                throw new NotSupportedException(
+                    $"Explicit GPU target '{target}' does not support this model architecture ({unsupportedReason}). Use device=\"auto\" or \"cpu\" for CPU execution.");
+            }
+
+            _target = target;
+            _gpuEngine = new Glacier.Tune.Gpu.GpuLoraEngine(weights);
+        }
+        else if (target == GpuTarget.Auto)
+        {
+            if (Glacier.Inference.Gpu.GpuContext.IsSupported)
+            {
+                if (SupportsGpuEngine(weights, out string autoUnsupportedReason))
                 {
-                    _gpuEngine = new Glacier.Tune.Gpu.GpuLoraEngine(weights);
-                    for (int l = 0; l < _layerBlocks.Count; l++)
+                    try
                     {
-                        _layerBlocks[l].ConnectGpuWeights(_gpuEngine);
+                        _gpuEngine = new Glacier.Tune.Gpu.GpuLoraEngine(weights);
+                        _target = GpuTarget.Nvidia;
+                    }
+                    catch (Exception ex)
+                    {
+                        GlacierDiagnostics.LogWarning($"[GPU WARNING] Failed to initialize GPU VRAM base engine ({ex.Message}). Falling back to CPU memory-mapped base execution.", ex);
+                        _gpuEngine = null;
+                        _target = GpuTarget.Cpu;
                     }
                 }
-                catch (Exception ex)
+                else
                 {
-                    GlacierDiagnostics.LogWarning($"[GPU WARNING] Failed to initialize GPU VRAM base engine ({ex.Message}). Falling back to CPU memory-mapped base execution.", ex);
-                    _gpuEngine = null;
+                    GlacierDiagnostics.LogInformation($"[INFO] Architecture uses unsupported GPU features ({autoUnsupportedReason}); executing in pure-C# CPU mode.");
+                    _target = GpuTarget.Cpu;
                 }
             }
             else
             {
-                GlacierDiagnostics.LogInformation("[INFO] Architecture uses hybrid GDN / Q-Gate / QK-Norm / partial-RoPE / fused-QKV features; executing in pure-C# CPU mode.");
+                _target = GpuTarget.Cpu;
             }
+        }
+        else
+        {
+            _target = GpuTarget.Cpu;
+        }
+
+        try
+        {
+            InitializeBlocks();
+            if (_gpuEngine != null)
+            {
+                for (int l = 0; l < _layerBlocks.Count; l++)
+                {
+                    _layerBlocks[l].ConnectGpuWeights(_gpuEngine);
+                }
+            }
+        }
+        catch
+        {
+            _gpuEngine?.Dispose();
+            _gpuEngine = null;
+            foreach (var b in _layerBlocks) b.Dispose();
+            _layerBlocks.Clear();
+            _blocks.Clear();
+            _gdnBlocks.Clear();
+            _trainableParameters.Clear();
+            throw;
         }
     }
 
-    private static bool SupportsGpuEngine(ModelWeights weights)
+    private static bool SupportsGpuEngine(ModelWeights weights, out string unsupportedReason)
     {
-        if (weights.IsHybridSsm || weights.IsMoe || weights.IsMla || weights.IsDsa || weights.HasRopeFreqs)
-        {
-            return false;
-        }
-
+        var reasons = new List<string>();
+        if (weights.IsHybridSsm) reasons.Add("hybrid-SSM");
+        if (weights.IsMoe) reasons.Add("MoE");
+        if (weights.IsMla) reasons.Add("MLA");
+        if (weights.IsDsa) reasons.Add("DSA");
+        if (weights.HasRopeFreqs) reasons.Add("custom-rope-freqs");
         if (weights.RopeDimensionCount > 0 && weights.HeadDim > 0 && weights.RopeDimensionCount < weights.HeadDim)
         {
-            return false;
+            reasons.Add("partial-RoPE");
         }
 
         for (int l = 0; l < weights.BlockCount; l++)
         {
             var lw = weights.Layers[l];
-            if (lw == null ||
-                lw.IsGdn ||
-                lw.HasQGate ||
-                lw.QWeight == null ||
-                lw.KWeight == null ||
-                lw.VWeight == null ||
-                lw.AttnQNormWeight != null ||
-                lw.AttnKNormWeight != null ||
-                lw.AttnSinksWeight != null ||
-                lw.HasFusedGateUp ||
-                lw.FfnGateWeight == null ||
-                lw.FfnUpWeight == null ||
-                lw.FfnDownWeight == null ||
-                (lw.HeadDim > 0 && weights.HeadDim > 0 && lw.HeadDim != weights.HeadDim) ||
-                (lw.HeadsKv > 0 && lw.HeadsKv != weights.HeadCountKv) ||
-                lw.HasHyperConnections ||
-                lw.IsQsa ||
-                lw.HasPle)
+            if (lw == null)
             {
-                return false;
+                reasons.Add($"missing-layer-{l}");
+                break;
+            }
+            if (lw.IsGdn) reasons.Add("GDN");
+            if (lw.HasQGate) reasons.Add("Q-Gate");
+            if (lw.QWeight == null || lw.KWeight == null || lw.VWeight == null) reasons.Add("fused-QKV");
+            if (lw.AttnQNormWeight != null || lw.AttnKNormWeight != null) reasons.Add("QK-Norm");
+            if (lw.AttnSinksWeight != null) reasons.Add("Attn-Sinks");
+            if (lw.HasFusedGateUp || lw.FfnGateWeight == null || lw.FfnUpWeight == null || lw.FfnDownWeight == null) reasons.Add("fused-or-missing-FFN");
+            if ((lw.HeadDim > 0 && weights.HeadDim > 0 && lw.HeadDim != weights.HeadDim) ||
+                (lw.HeadsKv > 0 && lw.HeadsKv != weights.HeadCountKv))
+            {
+                reasons.Add("heterogeneous-heads");
+            }
+            if (lw.HasHyperConnections) reasons.Add("hyper-connections");
+            if (lw.IsQsa) reasons.Add("QSA");
+            if (lw.HasPle) reasons.Add("PLE");
+
+            if (reasons.Count > 0)
+            {
+                break;
             }
         }
 
-        return true;
+        if (reasons.Count == 0)
+        {
+            unsupportedReason = string.Empty;
+            return true;
+        }
+
+        unsupportedReason = string.Join(", ", reasons);
+        return false;
     }
 
     public static GgufLoraModel Load(string ggufPath, LoraConfig? config = null, string? device = "auto")
     {
         var target = ResolveTarget(device);
+        if (target is GpuTarget.Direct3D12 or GpuTarget.Vulkan or GpuTarget.Amd or GpuTarget.DualGpu)
+        {
+            throw new NotSupportedException(
+                $"GPU backend '{target}' is not supported by Glacier.Tune. GpuLoraEngine supports NVIDIA CUDA or CPU execution only.");
+        }
+
         var gguf = new GgufFile(ggufPath);
         try
         {
@@ -146,19 +217,23 @@ public sealed unsafe class GgufLoraModel : IDisposable
 
     public static GpuTarget ResolveTarget(string? device)
     {
-        if (string.IsNullOrEmpty(device) || device.Equals("auto", StringComparison.OrdinalIgnoreCase))
+        if (string.IsNullOrWhiteSpace(device) || device.Equals("auto", StringComparison.OrdinalIgnoreCase))
         {
-            return GpuAccelerator.HasNvidiaGpu ? GpuTarget.Nvidia : GpuTarget.Auto;
+            return GpuTarget.Auto;
         }
 
-        return device.ToLowerInvariant() switch
+        return device.Trim().ToLowerInvariant() switch
         {
+            "cpu" => GpuTarget.Cpu,
             "cuda" or "gpu" or "nvidia" => GpuTarget.Nvidia,
             "tensorcore" => GpuTarget.NvidiaTensorCore,
             "d3d12" or "directml" => GpuTarget.Direct3D12,
             "vulkan" => GpuTarget.Vulkan,
-            "cpu" => GpuTarget.Cpu,
-            _ => GpuTarget.Auto
+            "amd" or "rocm" or "hip" => GpuTarget.Amd,
+            "dualgpu" => GpuTarget.DualGpu,
+            _ => throw new ArgumentException(
+                $"Unknown compute device '{device}'. Supported values: auto, cpu, cuda, gpu, nvidia, tensorcore.",
+                nameof(device))
         };
     }
 
@@ -395,6 +470,11 @@ public sealed unsafe class GgufLoraModel : IDisposable
             }
         }
 
+        if (_gpuEngine != null && CanUseResidentGpuPipeline(seqLen))
+        {
+            return EvaluateLossResident(_gpuEngine, inputTokens, targetTokens, seqLen, out validTokenCount);
+        }
+
         var currentX = new Tensor<float>(seqLen, HiddenDim);
         float* pX0 = (float*)currentX.DataPointer;
         for (int t = 0; t < seqLen; t++)
@@ -428,12 +508,105 @@ public sealed unsafe class GgufLoraModel : IDisposable
             _gpuEngine);
     }
 
+    private float EvaluateLossResident(
+        Glacier.Tune.Gpu.GpuLoraEngine gpu,
+        int[] inputTokens,
+        int[] targetTokens,
+        int seqLen,
+        out int validTokenCount)
+    {
+        gpu.BeginResidentStep(EnumerateAdapters());
+
+        int x0Count = checked(seqLen * HiddenDim);
+        float[] x0Host = ArrayPool<float>.Shared.Rent(x0Count);
+        DeviceResidentTensor<float>? currentX = null;
+        try
+        {
+            fixed (float* pX0 = x0Host)
+            {
+                for (int t = 0; t < seqLen; t++)
+                {
+                    QuantKernels.ExtractEmbedding(_weights.EmbdType, _weights.EmbdWeight, inputTokens[t], pX0 + (long)t * HiddenDim, HiddenDim);
+                }
+                currentX = gpu.AllocateResident(seqLen, HiddenDim);
+                gpu.CopyHostToResident(pX0, currentX);
+            }
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(x0Host);
+        }
+
+        try
+        {
+            for (int l = 0; l < _blocks.Count; l++)
+            {
+                var nextX = _blocks[l].ForwardResident(gpu, currentX, seqLen, saveActivations: false, out _);
+                currentX.Dispose();
+                currentX = nextX;
+            }
+
+            using var finalNormOut = gpu.AllocateResident(seqLen, HiddenDim);
+            gpu.LaunchRmsNormBatch(currentX.DevicePointer, gpu.OutNormWeight, finalNormOut.DevicePointer, seqLen, HiddenDim, _weights.RmsNormEps);
+
+            return gpu.ComputeTiledLmHeadLossResident(
+                _weights.OutType,
+                finalNormOut,
+                targetTokens,
+                HiddenDim,
+                VocabSize,
+                seqLen,
+                FusedCrossEntropyLoss.VocabTileSize,
+                out validTokenCount);
+        }
+        finally
+        {
+            currentX?.Dispose();
+        }
+    }
+
+    private bool CanUseResidentGpuPipeline(int seqLen)
+    {
+        if (_gpuEngine == null || _layerBlocks.Count == 0 || _gdnBlocks.Count > 0) return false;
+        if (_gpuEngine.LmHeadWeight == IntPtr.Zero || _gpuEngine.OutNormWeight == IntPtr.Zero) return false;
+        if (!_gpuEngine.SupportsForwardGemm(_weights.OutType) || !_gpuEngine.SupportsBackwardGemm(_weights.OutType))
+            return false;
+
+        for (int l = 0; l < _layerBlocks.Count; l++)
+        {
+            if (_layerBlocks[l] is not TransformerBlock tb || !tb.SupportsFullResidentGpu(seqLen))
+                return false;
+        }
+        return true;
+    }
+
+    private IEnumerable<LoraAdapter> EnumerateAdapters()
+    {
+        for (int l = 0; l < _blocks.Count; l++)
+        {
+            var tb = _blocks[l];
+            yield return tb.QProj;
+            yield return tb.KProj;
+            yield return tb.VProj;
+            yield return tb.OProj;
+            yield return tb.GateProj;
+            yield return tb.UpProj;
+            yield return tb.DownProj;
+        }
+    }
+
     /// <summary>
     /// Executes the full-sequence forward pass through all layers (optionally with activation checkpointing),
     /// computes online fused cross-entropy loss against target labels, and backpropagates through
     /// all layers to accumulate exact gradients into all enabled LoRA adapters.
     /// </summary>
     public unsafe float ForwardLossAndBackward(int[] inputTokens, int[] targetTokens, bool checkpointActivations = false)
+        => ForwardLossAndBackward(inputTokens, targetTokens, checkpointActivations, lossScale: 1.0f);
+
+    /// <summary>
+    /// Executes the full-sequence forward and backward pass with scalar gradient multiplier <paramref name="lossScale"/>.
+    /// </summary>
+    public unsafe float ForwardLossAndBackward(int[] inputTokens, int[] targetTokens, bool checkpointActivations, float lossScale)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         ArgumentNullException.ThrowIfNull(inputTokens);
@@ -451,6 +624,11 @@ public sealed unsafe class GgufLoraModel : IDisposable
                     nameof(inputTokens),
                     $"Input token ID {token} at index {t} is outside vocabulary bounds [0, {VocabSize}).");
             }
+        }
+
+        if (_gpuEngine != null && CanUseResidentGpuPipeline(seqLen))
+        {
+            return ForwardLossAndBackwardResident(_gpuEngine, inputTokens, targetTokens, seqLen, checkpointActivations, lossScale);
         }
 
         // 1. Embedding lookup -> X0 [seqLen, hiddenDim]
@@ -500,6 +678,15 @@ public sealed unsafe class GgufLoraModel : IDisposable
             VocabSize,
             _gpuEngine);
         swLoss.Stop();
+
+        if (lossScale != 1.0f)
+        {
+            var gradSpan = dFinalNormOut.AsSpan();
+            for (int i = 0; i < gradSpan.Length; i++)
+            {
+                gradSpan[i] *= lossScale;
+            }
+        }
 
         // 5. Final Output RMSNorm Backward -> dXFinalLayer
         using var dXFinalLayer = new Tensor<float>(seqLen, HiddenDim);
@@ -554,6 +741,132 @@ public sealed unsafe class GgufLoraModel : IDisposable
         currentDX.Dispose();
 
         return loss;
+    }
+
+    private float ForwardLossAndBackwardResident(
+        Glacier.Tune.Gpu.GpuLoraEngine gpu,
+        int[] inputTokens,
+        int[] targetTokens,
+        int seqLen,
+        bool checkpointActivations,
+        float lossScale)
+    {
+        gpu.BeginResidentStep(EnumerateAdapters());
+
+        int x0Count = checked(seqLen * HiddenDim);
+        DeviceResidentTensor<float> x0;
+        float[] x0Host = ArrayPool<float>.Shared.Rent(x0Count);
+        try
+        {
+            fixed (float* pX0 = x0Host)
+            {
+                for (int t = 0; t < seqLen; t++)
+                {
+                    QuantKernels.ExtractEmbedding(_weights.EmbdType, _weights.EmbdWeight, inputTokens[t], pX0 + (long)t * HiddenDim, HiddenDim);
+                }
+                x0 = gpu.AllocateResident(seqLen, HiddenDim);
+                gpu.CopyHostToResident(pX0, x0);
+            }
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(x0Host);
+        }
+
+        var layerInputs = new DeviceResidentTensor<float>?[_blocks.Count];
+        var layerStates = new ResidentBlockActivationState?[_blocks.Count];
+        DeviceResidentTensor<float>? xFinalLayer = null;
+        DeviceResidentTensor<float>? currentDX = null;
+
+        try
+        {
+            var swFwd = Stopwatch.StartNew();
+            DeviceResidentTensor<float> currentX = x0;
+            for (int l = 0; l < _blocks.Count; l++)
+            {
+                layerInputs[l] = currentX;
+                currentX = _blocks[l].ForwardResident(gpu, currentX, seqLen, saveActivations: !checkpointActivations, out layerStates[l]);
+            }
+            swFwd.Stop();
+            xFinalLayer = currentX;
+
+            using var finalNormOut = gpu.AllocateResident(seqLen, HiddenDim);
+            gpu.LaunchRmsNormBatch(xFinalLayer.DevicePointer, gpu.OutNormWeight, finalNormOut.DevicePointer, seqLen, HiddenDim, _weights.RmsNormEps);
+
+            var swLoss = Stopwatch.StartNew();
+            using var dFinalNormOut = gpu.AllocateResident(seqLen, HiddenDim);
+            float loss = gpu.ComputeTiledLmHeadLossAndGradientsResident(
+                _weights.OutType,
+                finalNormOut,
+                dFinalNormOut,
+                targetTokens,
+                HiddenDim,
+                VocabSize,
+                seqLen,
+                FusedCrossEntropyLoss.VocabTileSize,
+                lossScale);
+            swLoss.Stop();
+
+            using var dXFinalLayer = gpu.AllocateResident(seqLen, HiddenDim);
+            gpu.LaunchRmsNormBwd(dFinalNormOut.DevicePointer, xFinalLayer.DevicePointer, gpu.OutNormWeight, dXFinalLayer.DevicePointer, seqLen, HiddenDim, _weights.RmsNormEps);
+
+            var swRecompute = new Stopwatch();
+            var swBwd = new Stopwatch();
+            currentDX = dXFinalLayer;
+
+            for (int l = _blocks.Count - 1; l >= 0; l--)
+            {
+                var xIn = layerInputs[l]!;
+                ResidentBlockActivationState state;
+
+                if (checkpointActivations)
+                {
+                    swRecompute.Start();
+                    using var recomputedOut = _blocks[l].ForwardResident(gpu, xIn, seqLen, saveActivations: true, out var st);
+                    swRecompute.Stop();
+                    state = st!;
+                }
+                else
+                {
+                    state = layerStates[l]!;
+                    layerStates[l] = null;
+                }
+
+                try
+                {
+                    swBwd.Start();
+                    var dXPrev = _blocks[l].BackwardResident(gpu, currentDX, state, xIn, seqLen);
+                    swBwd.Stop();
+
+                    if (!ReferenceEquals(currentDX, dXFinalLayer))
+                    {
+                        currentDX.Dispose();
+                    }
+                    currentDX = dXPrev;
+                }
+                finally
+                {
+                    state.Dispose();
+                }
+            }
+
+            gpu.EndResidentStep(EnumerateAdapters());
+            GlacierDiagnostics.LogDebug($"[PROFILE GPU RESIDENT] Fwd: {swFwd.ElapsedMilliseconds} ms | Loss: {swLoss.ElapsedMilliseconds} ms | Recompute: {(checkpointActivations ? swRecompute.ElapsedMilliseconds : 0)} ms | Bwd: {swBwd.ElapsedMilliseconds} ms");
+            return loss;
+        }
+        finally
+        {
+            for (int l = 0; l < layerStates.Length; l++)
+            {
+                layerStates[l]?.Dispose();
+            }
+            for (int l = 0; l < layerInputs.Length; l++)
+            {
+                layerInputs[l]?.Dispose();
+            }
+            xFinalLayer?.Dispose();
+            currentDX?.Dispose();
+        }
     }
 
     public (long TrainableParams, long TotalParams, double TrainablePercent) GetParameterStats()
@@ -626,7 +939,13 @@ public sealed unsafe class GgufLoraModel : IDisposable
             Directory.CreateDirectory(outputDir);
         }
 
-        WriteAdapterConfigJson(Path.Combine(outputDir, "adapter_config.json"));
+        foreach (var p in _trainableParameters)
+        {
+            LoraBinaryFormat.ValidateFinite(p.AsSpan(), "SaveAdapter trainable parameters");
+        }
+
+        string configPath = Path.Combine(outputDir, "adapter_config.json");
+        WriteAdapterConfigJson(configPath);
 
         int enabledTensorCount = 0;
         for (int l = 0; l < _layerBlocks.Count; l++)
@@ -634,59 +953,97 @@ public sealed unsafe class GgufLoraModel : IDisposable
             enabledTensorCount += _layerBlocks[l].CountEnabledTensors();
         }
 
-        using (var fs = File.Create(binPath))
-        using (var bw = new BinaryWriter(fs))
+        string binTmp = LoraBinaryFormat.CreateTempSiblingPath(binPath);
+        try
         {
-            // Magic 0x41524F4C ('LORA'), Version 1
-            bw.Write((uint)0x41524F4C);
-            bw.Write((uint)1);
-            bw.Write(_layerBlocks.Count);
-            bw.Write(_config.Rank);
-            bw.Write(_config.Alpha);
-            bw.Write(enabledTensorCount);
-
-            for (int l = 0; l < _layerBlocks.Count; l++)
+            using (var fs = File.Create(binTmp))
+            using (var bw = new BinaryWriter(fs))
             {
-                _layerBlocks[l].WriteAdapterTensors(bw);
+                // Magic 0x41524F4C ('LORA'), Version 1
+                bw.Write(LoraBinaryFormat.Magic);
+                bw.Write(LoraBinaryFormat.Version);
+                bw.Write(_layerBlocks.Count);
+                bw.Write(_config.Rank);
+                bw.Write(_config.Alpha);
+                bw.Write(enabledTensorCount);
+
+                for (int l = 0; l < _layerBlocks.Count; l++)
+                {
+                    _layerBlocks[l].WriteAdapterTensors(bw);
+                }
+                bw.Flush();
+                fs.Flush(true);
             }
+            File.Move(binTmp, binPath, overwrite: true);
+        }
+        catch
+        {
+            try { if (File.Exists(binTmp)) File.Delete(binTmp); } catch { }
+            throw;
         }
 
         string manifestPath = Path.Combine(outputDir, "adapter_manifest.txt");
-        using var writer = new StreamWriter(manifestPath);
-        writer.WriteLine($"# Glacier.Tune LoRA Adapter Manifest");
-        writer.WriteLine($"# Total Layers: {_layerBlocks.Count}");
-        writer.WriteLine($"# Total Trainable Tensors: {_trainableParameters.Count}");
-        writer.WriteLine($"# Binary Weights: {Path.GetFileName(binPath)}");
-        for (int l = 0; l < _layerBlocks.Count; l++)
+        string manifestTmp = LoraBinaryFormat.CreateTempSiblingPath(manifestPath);
+        try
         {
-            _layerBlocks[l].WriteManifestEntries(writer);
+            using (var writer = new StreamWriter(manifestTmp))
+            {
+                writer.WriteLine($"# Glacier.Tune LoRA Adapter Manifest");
+                writer.WriteLine($"# Total Layers: {_layerBlocks.Count}");
+                writer.WriteLine($"# Total Trainable Tensors: {_trainableParameters.Count}");
+                writer.WriteLine($"# Binary Weights: {Path.GetFileName(binPath)}");
+                for (int l = 0; l < _layerBlocks.Count; l++)
+                {
+                    _layerBlocks[l].WriteManifestEntries(writer);
+                }
+                writer.Flush();
+            }
+            File.Move(manifestTmp, manifestPath, overwrite: true);
+        }
+        catch
+        {
+            try { if (File.Exists(manifestTmp)) File.Delete(manifestTmp); } catch { }
+            throw;
         }
     }
 
     private void WriteAdapterConfigJson(string path)
     {
-        using var fs = File.Create(path);
-        using var json = new Utf8JsonWriter(fs, new JsonWriterOptions { Indented = true });
-        json.WriteStartObject();
-        json.WriteString("base_model_name_or_path", _gguf.Architecture);
-        json.WriteNumber("r", _config.Rank);
-        json.WriteNumber("lora_alpha", _config.Alpha);
-        json.WriteNumber("lora_dropout", _config.Dropout);
-        json.WritePropertyName("target_modules");
-        json.WriteStartArray();
-        if (_config.TargetModules != null)
+        string tmp = LoraBinaryFormat.CreateTempSiblingPath(path);
+        try
         {
-            foreach (string module in _config.TargetModules)
+            using (var fs = File.Create(tmp))
+            using (var json = new Utf8JsonWriter(fs, new JsonWriterOptions { Indented = true }))
             {
-                json.WriteStringValue(module);
+                json.WriteStartObject();
+                json.WriteString("base_model_name_or_path", _gguf.Architecture);
+                json.WriteNumber("r", _config.Rank);
+                json.WriteNumber("lora_alpha", _config.Alpha);
+                json.WriteNumber("lora_dropout", _config.Dropout);
+                json.WritePropertyName("target_modules");
+                json.WriteStartArray();
+                if (_config.TargetModules != null)
+                {
+                    foreach (string module in _config.TargetModules)
+                    {
+                        json.WriteStringValue(module);
+                    }
+                }
+                json.WriteEndArray();
+                json.WriteString("bias", _config.Bias);
+                json.WriteString("peft_type", "LORA");
+                json.WriteString("task_type", "CAUSAL_LM");
+                json.WriteEndObject();
+                json.Flush();
+                fs.Flush(true);
             }
+            File.Move(tmp, path, overwrite: true);
         }
-        json.WriteEndArray();
-        json.WriteString("bias", _config.Bias);
-        json.WriteString("peft_type", "LORA");
-        json.WriteString("task_type", "CAUSAL_LM");
-        json.WriteEndObject();
-        json.Flush();
+        catch
+        {
+            try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }
+            throw;
+        }
     }
 
     /// <summary>
@@ -715,59 +1072,68 @@ public sealed unsafe class GgufLoraModel : IDisposable
         using var fs = File.OpenRead(binPath);
         using var br = new BinaryReader(fs);
 
-        uint magic = br.ReadUInt32();
-        if (magic != 0x41524F4C)
-            throw new InvalidDataException($"Invalid LoRA magic header: 0x{magic:X8} (expected 0x41524F4C 'LORA')");
-
-        uint version = br.ReadUInt32();
-        if (version != 1)
-            throw new InvalidDataException($"Unsupported LoRA adapter version: {version}");
-
-        int layerCount = br.ReadInt32();
-        int rank = br.ReadInt32();
-        float alpha = br.ReadSingle();
-        int tensorCount = br.ReadInt32();
-        if (tensorCount < 0)
-            throw new InvalidDataException($"Invalid negative LoRA tensor count: {tensorCount}");
+        LoraBinaryFormat.ValidateAndReadHeader(fs, br, out int layerCount, out int rank, out float alpha, out int tensorCount);
+        if (tensorCount > 0 && layerCount > _layerBlocks.Count)
+        {
+            throw new InvalidDataException($"LoRA adapter layer count ({layerCount}) exceeds model layer count ({_layerBlocks.Count}).");
+        }
         if (rank != _config.Rank)
             throw new InvalidDataException($"LoRA adapter rank mismatch: file specifies rank {rank}, model is configured with rank {_config.Rank}.");
-        if (rank > 0 && (!float.IsFinite(alpha) || alpha <= 0f))
-            throw new InvalidDataException($"Invalid LoRA adapter alpha value: {alpha}.");
 
         int loadedCount = 0;
 
         for (int t = 0; t < tensorCount; t++)
         {
-            string name = br.ReadString();
+            string name = LoraBinaryFormat.ReadBoundedString(fs);
+            if (fs.Length - fs.Position < 8)
+                throw new InvalidDataException($"Truncated LoRA tensor header for '{name}'.");
+
             int dim0 = br.ReadInt32();
             int dim1 = br.ReadInt32();
             if (dim0 <= 0 || dim1 <= 0)
                 throw new InvalidDataException($"Invalid LoRA tensor dimensions [{dim0}, {dim1}] for '{name}'.");
 
-            long byteCount = (long)dim0 * dim1 * sizeof(float);
+            long elemCount = (long)dim0 * dim1;
+            if (elemCount > int.MaxValue / sizeof(float))
+                throw new InvalidDataException($"LoRA tensor '{name}' element count {elemCount} exceeds maximum supported buffer size.");
+
+            long byteCount = elemCount * sizeof(float);
             if (byteCount > fs.Length - fs.Position)
                 throw new InvalidDataException($"Truncated LoRA binary payload for '{name}': expected {byteCount} bytes, only {fs.Length - fs.Position} remaining.");
 
             Tensor<float>? targetTensor = FindTargetTensor(name, dim0, dim1, out bool needsTranspose);
             if (targetTensor != null)
             {
-                if (!needsTranspose)
+                if (elemCount != targetTensor.ElementCount)
+                    throw new InvalidDataException($"LoRA tensor '{name}' element count {elemCount} does not match target {targetTensor.ElementCount}.");
+
+                int countInt = checked((int)elemCount);
+                float[] temp = System.Buffers.ArrayPool<float>.Shared.Rent(countInt);
+                try
                 {
-                    var span = targetTensor.AsSpan();
-                    fs.ReadExactly(MemoryMarshal.AsBytes(span));
-                }
-                else
-                {
-                    float[] temp = new float[dim0 * dim1];
-                    fs.ReadExactly(MemoryMarshal.AsBytes(temp.AsSpan()));
+                    Span<float> tempSpan = temp.AsSpan(0, countInt);
+                    fs.ReadExactly(MemoryMarshal.AsBytes(tempSpan));
+                    LoraBinaryFormat.ValidateFinite(tempSpan, name);
+
                     var dst = targetTensor.AsSpan();
-                    for (int r = 0; r < dim0; r++)
+                    if (!needsTranspose)
                     {
-                        for (int c = 0; c < dim1; c++)
+                        tempSpan.CopyTo(dst);
+                    }
+                    else
+                    {
+                        for (int r = 0; r < dim0; r++)
                         {
-                            dst[c * dim0 + r] = temp[r * dim1 + c];
+                            for (int c = 0; c < dim1; c++)
+                            {
+                                dst[c * dim0 + r] = tempSpan[r * dim1 + c];
+                            }
                         }
                     }
+                }
+                finally
+                {
+                    System.Buffers.ArrayPool<float>.Shared.Return(temp);
                 }
                 loadedCount++;
             }
@@ -775,6 +1141,11 @@ public sealed unsafe class GgufLoraModel : IDisposable
             {
                 fs.Seek(byteCount, SeekOrigin.Current);
             }
+        }
+
+        if (fs.Position != fs.Length)
+        {
+            throw new InvalidDataException($"Unexpected {fs.Length - fs.Position} trailing byte(s) after reading {tensorCount} tensor(s) in '{binPath}'.");
         }
 
         if (tensorCount > 0 && loadedCount == 0)
