@@ -67,16 +67,16 @@ public sealed unsafe class GgufLoraModel : IDisposable
 
         if (target is GpuTarget.Nvidia or GpuTarget.NvidiaTensorCore)
         {
-            if (!Glacier.Inference.Gpu.GpuContext.IsSupported)
-            {
-                throw new PlatformNotSupportedException(
-                    $"Explicit GPU target '{target}' was requested, but no CUDA-capable NVIDIA GPU or driver is available.");
-            }
-
             if (!SupportsGpuEngine(weights, out string unsupportedReason))
             {
                 throw new NotSupportedException(
                     $"Explicit GPU target '{target}' does not support this model architecture ({unsupportedReason}). Use device=\"auto\" or \"cpu\" for CPU execution.");
+            }
+
+            if (!Glacier.Inference.Gpu.GpuContext.IsSupported)
+            {
+                throw new PlatformNotSupportedException(
+                    $"Explicit GPU target '{target}' was requested, but no CUDA-capable NVIDIA GPU or driver is available.");
             }
 
             _target = target;
