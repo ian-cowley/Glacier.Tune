@@ -1,262 +1,112 @@
-# 🎯 Glacier.Tune
+![Glacier.Tune Banner](assets/banner.jpg)
+
+# Glacier.Tune
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![.NET 10](https://img.shields.io/badge/.NET-10.0-purple.svg)](https://dotnet.microsoft.com/)
 [![Native AOT](https://img.shields.io/badge/Native%20AOT-Ready-brightgreen.svg)](https://learn.microsoft.com/dotnet/core/deploying/native-aot/)
 [![NuGet Version](https://img.shields.io/nuget/v/Glacier.Tune.svg)](https://www.nuget.org/packages/Glacier.Tune/)
-[![NVIDIA CUDA](https://img.shields.io/badge/NVIDIA-RTX%204060%20Accelerated-green.svg)](https://developer.nvidia.com/cuda-toolkit)
-[![Ecosystem](https://img.shields.io/badge/Glacier-Ecosystem-blue)](https://github.com/ian-cowley)
-[![Website](https://img.shields.io/badge/Website-glaciersoftware.dev-66fcf1.svg)](https://glaciersoftware.dev/)
-[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-Support-orange.svg?logo=buy-me-a-coffee)](https://buymeacoffee.com/glaciersoftware)
 
-![Glacier.Tune Banner](assets/banner.jpg)
+`Glacier.Tune` is a LoRA fine-tuning, Direct Preference Optimization (DPO), and GGUF model-merging library written in pure C# for .NET 10.
 
-# ⚡ GPU VRAM-Resident & AVX-512 LLM Fine-Tuning in Pure .NET 10
-> **Zero-Copy Base Weights in GPU VRAM & AVX-512 SIMD LoRA Backpropagation. 100% Pure C# .NET 10. Zero Python, Zero PyTorch, Zero External Tooling.**
+It memory-maps quantized GGUF base models directly onto CPU SIMD or NVIDIA CUDA VRAM without Python, PyTorch, or the CUDA Toolkit, trains low-rank adapters with checkpointed reverse-mode backpropagation, and exports fused standalone GGUF weights or binary adapters.
 
-```text
-========================================================================================================
-  7B LLM ENTERPRISE FINE-TUNING PIPELINE (QWEN 2.5 7B - 533 SAMPLES - 512 MAX TOKENS)
-========================================================================================================
-  Physical Hardware                                    :  NVIDIA GeForce RTX 4060 Laptop GPU (8GB VRAM)
-                                                          AMD Ryzen AI 9 HX 370 (24 Threads AVX-512)
-  Base Model (Frozen in Unmanaged VRAM)                :  Qwen2.5-7B-Instruct-1M-Q4_K_M.gguf (4.36 GB)
-  Trainable Parameters                                 :  40,370,176 (LoRA r=16, alpha=32 — 0.61% trainable)
---------------------------------------------------------------------------------------------------------
-  ⚡ 10-STEP PHYSICAL RUN (Empirical Hardware Telemetry) :  6.96 Seconds / Step (46.0 Tokens/Sec) | 70.4s Total
-  ⚡ STEP 1 INITIAL COLD LATENCY                        :  15.98 Seconds / Step (32.0 Tokens/Sec)
-  ⚡ FULL 533-SAMPLE DATASET CONVERGENCE EPOCH          :  Untested (Full run not executed)
-  ⚡ VRAM WEIGHT RESIDENCY UPLOAD                       :  4.42 Seconds (4.36 GB resident in VRAM)
-  ⚡ COLD MODEL INGESTION (OS MMap)                     :  < 350 ms
-  ⚡ EXACT STEP 1 EMPIRICAL LOSS                        :  21.8704 (Zero numerical divergence)
-  ⚡ STANDALONE GGUF ADAPTER FUSION                     :  6.82 Seconds (Lossless bitwise FP16 matches)
-  ⚡ RUNTIME DEPENDENCIES                               :  Zero CUDA Toolkit Installs, Zero Python Envs
-========================================================================================================
+## Install
+
+```bash
+dotnet add package Glacier.Tune
 ```
 
-`Glacier.Tune` is a high-performance, pure C# .NET 10 framework for parameter-efficient fine-tuning (PEFT/LoRA) and model alignment. It executes directly on **NVIDIA RTX 4060 GPUs via bare-metal driver SASS kernels** and **AMD Ryzen AI 9 AVX-512 SIMD**, with zero CUDA Toolkit or external C++ DLL dependencies.
-
----
-
-## 1. Why Glacier.Tune? Replacing Python SFTTrainer & bitsandbytes
-
-In Python, fine-tuning large models requires complex, heavy stacks: Hugging Face `transformers`, `peft`, `accelerate`, `bitsandbytes`, and PyTorch. On consumer or workstation GPUs (e.g. 8 GB VRAM), this stack suffers from severe production bottlenecks:
-
-1. **Massive Memory Fragmentation**: PyTorch's caching allocator fragments VRAM when handling dynamic sequence lengths, forcing developers to use `empty_cache()` and throttling throughput.
-2. **Dynamic 4-Bit Dequantization Overhead**: `bitsandbytes` NF4 repeatedly decompresses quantized weights into temporary FP16 buffers every step (1,568 dequantizations per step on 7B models).
-3. **Severe Thermal Throttling**: High allocations cause VRM voltage spikes, requiring arbitrary sleep cooldowns (e.g. 3.5s pause per step in `modelTrain`).
-4. **Vocabulary Scale Explosion**: Materializing logits over 152,064 vocabulary classes consumes 311+ MB per sequence, causing out-of-memory crashes during backpropagation.
-5. **Huge Deployment Bloat**: Merging adapters back into base models in Python requires 16+ GB of system RAM and minutes of serialization time.
-
-**Glacier.Tune** eliminates all five bottlenecks:
-- **Direct GGUF Ingestion**: Maps 4.36 GB GGUF models into memory in **< 350 ms** via zero-copy OS paging.
-- **Decoupled LoRA Architecture**: Base model weights remain frozen in unmanaged memory/VRAM, while only 40.3M trainable adapter parameters ($r=16$) are trained.
-- **Sub-2MB Streaming Fused Cross-Entropy**: Streams vocabulary dot products tile-by-tile online, computing exact loss and gradients with zero large logit allocations.
-- **Activation Checkpointing**: Only layer input checkpoints $X_l$ are preserved, recomputing sublayer activations on the fly during backward traversal.
-- **In-VRAM GPU Projections**: Projections execute via custom 2D-tiled CUDA kernels with frozen weights resident in GPU VRAM.
-
----
-
-## 2. Architecture & Pipeline
-
-```mermaid
-graph TD
-    A["GGUF File (4.36 GB)<br/>Memory-Mapped Paging (&lt;350ms)"] --> B["Base Model Weights<br/>FROZEN in Unmanaged VRAM (1.98s Upload)"]
-    B --> C["TransformerBlock (x28 Layers)"]
-    D["Trainable LoRA Adapters<br/>(40.3M Params, r=16)"] --> C
-    C --> E["Online Streaming Fused Cross-Entropy<br/>(152,064 Vocab, &lt;2 MB RAM)"]
-    E -->|dX_final| F["Reverse-Mode Backpropagation<br/>(Base + LoRA Transpose-GEMMs &amp; Checkpointing)"]
-    F -->|dA, dB| G["In-Place AdamW Optimizer<br/>(Cosine LR Decay)"]
-    G --> H["Adapter Export &amp; Standalone GGUF Merger<br/>(adapter_model.bin / Fused .gguf)"]
-```
-
-### Full 28-Layer Transformer Backpropagation Pipeline
-1. **RoPE Inversion**: Exact orthogonal reverse rotation ($\sin(-\theta) = -\sin\theta$) with zero memory allocations.
-2. **Causal Attention Gradient**: Exact reverse multi-head GQA self-attention propagating upstream gradient $dO$ into $dQ, dK, dV$.
-3. **SwiGLU Analytical Derivatives**: Exact gradients $\frac{\partial Y}{\partial \text{Gate}}$ and $\frac{\partial Y}{\partial \text{Up}}$ derived through the Sigmoid Linear Unit.
-4. **Fused Cross-Entropy**: Direct 64-bit online Log-Sum-Exp loss and unbiased $\nabla_{X_{final}}$ calculation across 152,064 classes in tiled VRAM / unmanaged memory without materializing full logits.
-5. **Frozen Base-Weight Transpose-GEMM Backpropagation**: Exact chain-rule input gradient propagation ($dX += dY \cdot W_{\text{base}}$) across all 7 projections (`Q`, `K`, `V`, `O`, `Gate`, `Up`, `Down`) in CUDA VRAM (`Q4_K`, `Q6_K`, `Q8_0`, `Q4_0`, `F32`) and AVX-512/AVX2 SIMD.
-
----
-
-## 3. Measured Physical Hardware Benchmarks (Qwen 2.5 7B LoRA Fine-Tuning)
-
-*Hardware: AMD Ryzen AI 9 HX 370 + NVIDIA GeForce RTX 4060 Laptop GPU (8 GB VRAM)*  
-*Workload: Qwen2.5-7B-Instruct (28 layers, 3,584 dim, 18,944 FFN, LoRA r=16, alpha=32, 533 enterprise samples, 512 max seq length)*
-
-### Physical 10-Step Training Telemetry (Physical NVIDIA RTX 4060 Laptop GPU)
-
-A complete 10-step gradient descent sequence was physically executed using `Glacier.Tune.Demo`:
-
-| Measurement Parameter | Physical Hardware Value |
-| :--- | :--- |
-| **Model** | `Qwen2.5-7B-Instruct-1M-Q4_K_M.gguf` (4.36 GB frozen base weights) |
-| **LoRA Configuration** | Rank $r=16$, Alpha $\alpha=32$, Targets: attention & FFN projections |
-| **Total 10-Step Duration** | **70.4 Seconds** |
-| **Average Step Latency** | **6,960.9 ms (~6.96 Seconds / Step)** |
-| **Microbatch Forward Latency** | **2,585 ms** |
-| **Microbatch Backward Latency** | **675 ms** |
-| **Training Throughput** | **46.0 tokens/second** (320 tokens / step) |
-| **VRAM Weight Upload** | **4,421 ms (4.42 s)** |
-| **GGUF Adapter Weight Baking** | **6.82 Seconds** (Bitwise FP16 matches, 0.000000e+00 error) |
-| **Managed Allocations** | **0 B (Zero managed GC allocations)** |
-
-> ⚠️ **TRAINING RUN STATUS & CONVERGENCE DISCLOSURE**:  
-> **Full 533-Sample Epoch Status: Untested (Full run not executed)**. While 10 physical gradient backpropagation steps were executed to capture hardware execution telemetry, a complete multi-hundred step epoch traversing all 533 samples to final convergence was not executed in its entirety. Note: Historical v1.0.5–v1.0.6 telemetry above reflects pre-v1.0.7 adapter-only backward timing; v1.0.7 adds full frozen base-weight transpose-GEMM backpropagation (`dX += dY * W_base`) across all 7 projections per block plus tiled VRAM LM-head backpropagation.
-
-### Historical Step 1 Optimization Progression
-*(Microbenchmark latency progression during initial kernel development)*
-
-| Optimization Milestone | Forward (ms) | Loss (ms) | Recompute (ms) | Backward (ms) | Total Step Latency | Throughput | Exact Loss |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **1. Unoptimized Baseline** | 13,320 | 486 | 12,498 | 15,325 | **41,972 ms (42.0s)** | 12.2 tok/s | `21.8704` |
-| **2. Lock-Free Attention Backward** | 13,100 | 460 | 12,200 | 7,842 | **33,881 ms (33.9s)** | 15.1 tok/s | `21.8704` |
-| **3. In-VRAM FFN & QKV Fusing** | 11,100 | 450 | 11,800 | 7,800 | **31,947 ms (31.9s)** | 16.0 tok/s | `21.8704` |
-| **4. 2D-Tiled Grid Parallel GEMM** | 7,420 | 445 | 8,500 | 7,650 | **24,269 ms (24.3s)** | 21.1 tok/s | `21.8704` |
-| **5. In-VRAM Attention & RoPE** | 5,914 | 440 | 7,543 | 4,303 | **18,258 ms (18.3s)** | 28.0 tok/s | `21.8704` |
-| **6. 2D Fused SwiGLU Batch GEMM** | 5,075 | 442 | 7,430 | 4,200 | **18,053 ms (18.1s)** | 28.4 tok/s | `21.8704` |
-| **7. SIMD LoRA Backward Kernels** | 5,820 | 483 | 8,595 | 3,052 | **18,613 ms (18.6s)** | 27.5 tok/s | `21.8704` |
-| **8. Vectorized `ApplyLoraDelta`** | **4,976** | **456** | **6,630** | **3,328** | **15,977 ms (16.0s)** | **32.0 tok/s** | **`21.8704`** |
-
-### Verified Exact Convergence Metrics
-- **Dataset**: `enterprise_dev_train.jsonl` (ChatML format, 533 enterprise development conversations)
-- **Step 1 Loss**: `21.8704` (Identical across all 8 optimization stages, confirming zero loss divergence)
-- **Trainable Parameters**: 40,370,176 parameters (0.61% trainable)
-- **Base Model Parameters**: 6,525,288,448 parameters (100% frozen in unmanaged memory/VRAM)
-- **VRAM Utilization**: ~4.95 GB total (3.0 GB headroom on 8GB GPU)
-
-
----
-
-## 4. Quickstart API
+## Quick Start
 
 ```csharp
 using Glacier.Tune.Config;
 using Glacier.Tune.Data;
+using Glacier.Tune.Export;
 using Glacier.Tune.Model;
 using Glacier.Tune.Trainer;
 
-// 1. Load GGUF model in < 350 ms via zero-copy memory mapping (with GPU target)
-using var model = GgufLoraModel.Load("qwen2.5-coder-7b-q8_0.gguf", new LoraConfig 
-{ 
-    Rank = 16, 
-    Alpha = 32f,
-    TargetModules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"] 
-}, device: "gpu");
+// 1. Memory-map a base GGUF model with LoRA adapters
+using var model = GgufLoraModel.Load(
+    "models/Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf",
+    new LoraConfig
+    {
+        Rank = 16,
+        Alpha = 32f,
+        TargetModules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    },
+    device: "auto");
 
-// 2. Ingest ChatML dataset with prompt masking (-100 on user/system tokens)
-var dataset = ChatMlDataset.FromFile("enterprise_train.jsonl", model.Tokenizer, maxSeqLength: 512);
+// 2. Load ChatML training pairs with prompt token masking (-100)
+var dataset = ChatMlDataset.FromFile("train.jsonl", model.Tokenizer, maxSeqLength: 512);
 
-// 3. Fine-tune with AutogradTape & AdamW on NVIDIA RTX 4060 GPU
+// 3. Train with gradient accumulation and cosine LR decay
 var args = new TrainingArguments
 {
-    Device = "gpu",
+    Device = "auto",
     LearningRate = 2e-4f,
-    Epochs = 3,
+    Epochs = 1,
     GradientAccumulationSteps = 8,
+    CheckpointActivations = true,
     OutputDir = "./fine_tuned_lora"
 };
 
 using var trainer = new LoraTrainer(model, args);
 trainer.Train(dataset);
 
-// 4. Standalone GGUF Export (Zero Python / Zero llama.cpp)
-// Fuses all adapted projections into standalone Q4_K / Q4_0 / Q8_0 / F32 GGUF weights:
-Glacier.Tune.Export.GgufMerger.Merge(
-    baseGgufPath: "qwen2.5-coder-7b-q4_k_m.gguf",
-    adapterBinPath: "./fine_tuned_lora/adapter_model.bin",
-    outputGgufPath: "./qwen2.5-coder-7b-enterprise-q8_0.gguf",
-    options: new Glacier.Tune.Export.GgufMerger.MergeOptions
-    {
-        TargetQuantization = Glacier.Tune.Export.TargetQuantization.Q8_0
-    }
-);
+// 4. Fuse trained LoRA deltas into a standalone GGUF
+GgufMerger.Merge(
+    "models/Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf",
+    "./fine_tuned_lora/adapter_model.bin",
+    "./qwen2.5-coder-7b-tuned-q8_0.gguf",
+    new GgufMerger.MergeOptions { TargetQuantization = TargetQuantization.Q8_0 });
 ```
 
----
-
-## 5. Standalone Model Export CLI
-
-You can also run the high-performance GGUF merger directly from the command line:
+Or run the sample trainer/merger/evaluator directly:
 
 ```bash
-dotnet run -c Release --project samples/Glacier.Tune.Demo -- --merge \
-    "path/to/base_model.gguf" \
-    "path/to/adapter_model.bin" \
-    "path/to/standalone_output.gguf"
+dotnet run -c Release --project samples/Glacier.Tune.Demo -- --merge base.gguf adapter_model.bin merged.gguf
 ```
 
----
+## What You Can Do
 
-## 6. Ecosystem Cross-References
+| Capability | Description | Key Types |
+| :--- | :--- | :--- |
+| **LoRA SFT & Hybrid GDN Training** | Fine-tune standard transformer and hybrid Gated DeltaNet GGUF models with frozen base-weight backprop and activation checkpointing | `GgufLoraModel`, `LoraTrainer`, `TransformerBlock`, `GdnBlock`, `LoraConfig`, `TrainingArguments` |
+| **DPO & cDPO Alignment** | Train directly on chosen/rejected JSONL preference pairs with reference log-prob caching and SFT anchoring | `DpoTrainer`, `DpoDataset`, `DpoLoss`, `DpoTrainingArguments` |
+| **Tiled Cross-Entropy & Evaluation** | Online tiled Log-Sum-Exp cross-entropy across full vocabularies plus exact-match and F1 post-tune evaluation | `FusedCrossEntropyLoss`, `PostTuneEvaluator`, `StatefulAdamW` |
+| **Sleep Consolidation & MoE Growth** | Pre-allocated MoE expansion bank, SIMD dream filtering, and GKD consolidation trainer | `SleepConsolidationTrainer`, `PreallocatedMoeExpansionBank`, `DreamQualityFilter` |
+| **Standalone GGUF Fusion** | Merge `.bin` adapters directly back into quantized GGUF (`Auto`, `Q4_K`, `Q6_K`, `Q8_0`, `F16`, `BF16`, `F32`) | `GgufMerger` |
 
-- **[Glacier.Inference](https://github.com/ian-cowley/Glacier.Inference)**: Sub-millisecond GGUF model loading, SIMD AVX-512 GEMV kernels, and embedded BPE tokenization.
-- **[Glacier.Tensor](https://github.com/ian-cowley/Glacier.Tensor)**: Strided tensor representations, `LoraLinear` layers, AutogradTape, and AdamW optimizer.
-- **[Glacier.Gpu](https://github.com/ian-cowley/Glacier.Gpu)**: Bare-metal CUDA driver bindings, device memory management, and cross-platform GPU acceleration primitives.
+## Platform & Compatibility
 
----
+- Targets `.NET 10` (`<IsAotCompatible>true</IsAotCompatible>`, `<TreatWarningsAsErrors>true</TreatWarningsAsErrors>`).
+- Supports CPU SIMD (`AVX-512` / `AVX2` / `AdvSimd`) and bare-metal NVIDIA CUDA driver execution (`nvcuda.dll` / `libcuda.so.1`) for `Q4_K`, `Q6_K`, `Q8_0`, `Q4_0`, and `F32` weights.
 
-## 🆕 What's New in v1.7.0
+## Benchmarks
 
-- **Native C# Direct Preference Optimization (`DpoTrainer` / `DpoLoss` / `DpoDataset`)** — Numerically stable DPO & conservative cDPO alignment trainer in `Glacier.Tune.Trainer` with JSONL preference loading, exact reward margins, cached initial reference log-probabilities, `AdamW` gradient clipping, and Native AOT `DpoJsonContext` support.
+Measured with `dotnet run --project benchmarks/Glacier.Tune.Benchmarks/Glacier.Tune.Benchmarks.csproj -c Release` on an AMD Ryzen AI 9 HX 370 (`.NET 10.0.15`, Windows 11):
 
----
+| Kernel Benchmark | Scope | Measured Latency |
+| :--- | :--- | ---: |
+| `LoraKernels.ApplyLoraDelta` / `Backward` | `T=512, D=3584, R=16` | **1.434 ms** fwd / **7.957 ms** bwd |
+| `RoPEKernel.ForwardSequence` / `BackwardSequence` | `T=128, Hq=28, Hkv=4, D=128` | **89.0 us** fwd / **88.8 us** bwd |
+| `SwiGluKernel.Forward` / `Backward` | `T=128, Dffn=18944` (`2.42M` elem) | **0.416 ms** fwd / **1.009 ms** bwd |
+| `FusedCrossEntropyLoss.ComputeLossAndGradients` | `T=128, D=3584, V=32000` (`F32`) | **705.042 ms** |
+| `DpoLoss.Compute` | Single pair (`1M` iterations) | **29.65 ns / call** |
+| `DreamQualityFilter.ComputeScore` | Cosine (`D=1024`) + Levenshtein | **0.273 us / call** |
 
-## 🆕 What's New in v1.1.0
+See [docs/benchmarks.md](docs/benchmarks.md) for all sweep sizes and the 10-step RTX 4060 hardware telemetry run.
 
-- **Sleep Consolidation Framework & MoE Parameter Expansion (arXiv:2606.03979)** — Added biological 3-phase offline memory consolidation pipeline:
-  - `PreallocatedMoeExpansionBank`: Pre-allocated 64-byte unmanaged aligned parameter bank (`MoeExpertSlotDescriptor`) enabling zero-perturbation unlocking of low-rank MoE experts and SIMD Top-$k$ gating during sleep.
-  - `DreamQualityFilter`: Vectorized AVX2 Levenshtein edit distance and cosine embedding similarity scoring to filter on-policy self-generated synthetic dream trajectories.
-  - `SleepConsolidationTrainer`: Generalized Knowledge Distillation (GKD) with configurable forward/reverse KL $\beta$-divergence, transferring volatile fast memory representations into unlocked slow MoE experts, followed by synaptic pruning of fast buffers.
-- **Dependency Upgrades**: Upgraded `Glacier.Inference` to `v1.5.0` (HOPE Continuum Memory) and `Glacier.Tensor` to `v1.1.0`.
+## Documentation
 
----
+- [User Manual](docs/manual.md) — LoRA SFT, dataset formatting, checkpoint resume, DPO alignment, sleep consolidation, GGUF export, and evaluation
+- [Architecture](docs/architecture.md) — GGUF mmap loading, activation checkpointing, scratch workspaces, CUDA backward kernels, and adapter binary layout
+- [Benchmarks](docs/benchmarks.md) — microbenchmark sweeps and historical RTX 4060 7B run telemetry
+- [Changelog](CHANGELOG.md) — release history
 
-## 🆕 What's New in v1.0.7
-
-- **Full Frozen Base-Weight Backpropagation (CUDA VRAM & AVX-512/AVX2 SIMD)** — Added transposed quantized & FP32 backward GEMM kernels (`tune_bwd.cubin`: `Q4_K`, `Q6_K`, `Q8_0`, `Q4_0`, `F32`) and tiled SIMD CPU `LoraKernels.AccumulateBaseBackward` (`dX += dY * W_base`), propagating exact chain-rule gradients through all 7 projections (`Q`, `K`, `V`, `O`, `Gate`, `Up`, `Down`) across every transformer layer from step 0 ($B = 0$) onward.
-- **Arbitrary-`head_dim` CUDA Causal GQA Training Attention** — Added warp-aligned FlashAttention-2 training forward and backward kernels (`tune_attn_causal_gqa_fwd`, `tune_attn_causal_gqa_bwd_dq_ds`, `tune_attn_causal_gqa_bwd_dk_dv`) supporting any head dimension (`32`–`1024`) with instance-isolated multi-model GPU context binding.
-- **Exact Unbiased Tiled Cross-Entropy Backpropagation** — Upgraded `FusedCrossEntropyLoss` to 64-bit online Log-Sum-Exp accumulation with tiled VRAM & SIMD transpose-GEMM gradient propagation (`< 16 MB` bounded tile memory) and eliminated `-16.0f` tail-logit truncation bias.
-- **ChatML Assistant Header Masking, Gradient Accumulation & `TargetModules`** — `ChatMlDataset` masks `<|im_start|>assistant\n` role headers and trailing newlines; `LoraTrainer` averages microbatch gradients (`1 / accumSteps`) prior to norm clipping and supports periodic `SaveSteps` checkpoints; `TransformerBlock` honors `LoraConfig.TargetModules` with distinct deterministic per-(layer, projection) initialization seeds.
-- **Native AOT & Hardened Standalone `GgufMerger`** — Enabled `<IsAotCompatible>true</IsAotCompatible>` with reflection-free `Utf8JsonWriter` config serialization, added `TargetQuantization.F32` and `GgufLoraModel.ForwardLogits`, automatic Glacier/PEFT adapter layout resolution, upfront dimension/truncation validation, and in-place base GGUF overwrite protection.
-- **65 unit, finite-difference oracle, and GPU/CPU parity tests** passing (100% green, 0 warnings).
-
----
-
-## 🆕 What's New in v1.0.6
-
-- **Zero-Dependency Pluggable Logging (`GlacierDiagnostics`)** — Ambient logging subsystem (`LogLevel`, `IGlacierLogger`, `ConsoleGlacierLogger`, `DelegateGlacierLogger`, `NullGlacierLogger`) eliminating all 30 hardcoded `Console.*` calls across core library classes.
-- **`GpuLoraEngine` Modularization** — Partitioned monolithic 962-line class into 4 cohesive partial classes (`GpuLoraEngine.cs`, `GpuLoraEngine.Forward.cs`, `GpuLoraEngine.Backward.cs`, and `GpuLoraEngine.Memory.cs`), with all source files strictly $\le 414$ lines.
-- **`Glacier.Tune.Benchmarks` Microbenchmark Suite** — BenchmarkDotNet suite profiling hot LoRA training kernels (`LoraKernels`, `FusedCrossEntropyLoss`, `RoPEKernel`, `SwiGluKernel`).
-- **22 unit tests** passing (100% green).
-
----
-
-## 🆕 What's New in v1.0.5
-
-- **`AutogradScratchWorkspace`** — eliminates 26 GB/step gradient buffer allocation churn by reusing a single pre-allocated scratch arena across all backward passes.
-- **2D tiled softmax** — peak activation memory reduced from **622 MB → 16 KB** per forward pass via tiled online softmax that computes in O(1) extra memory.
-- **15 tests** passing (100 %).
-
----
-
-## Credits
-
-Developed by **Ian Cowley** and **Antigravity (Google DeepMind)**.
-
----
-
-## License
+## License & Credits
 
 Licensed under the [MIT License](LICENSE). Copyright (c) 2026 Ian Cowley.
 
----
-
-## ❄️ Glacier Ecosystem & Support
-
-Part of the **[Glacier Ecosystem](https://glaciersoftware.dev/)** — high-performance, zero-allocation developer tooling and data engines natively built for modern C# and .NET 10.
-
-* 🌐 **Website & Documentation**: [glaciersoftware.dev](https://glaciersoftware.dev/)
-* ☕ **Buy Me a Coffee**: [buymeacoffee.com/glaciersoftware](https://buymeacoffee.com/glaciersoftware)
-* ❤️ **GitHub Sponsors**: [github.com/sponsors/ian-cowley](https://github.com/sponsors/ian-cowley)
-* 🐙 **All Repositories**: [github.com/ian-cowley](https://github.com/ian-cowley)
+Developed by Ian Cowley, Antigravity (Google DeepMind) and Claude.
